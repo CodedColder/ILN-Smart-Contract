@@ -774,11 +774,91 @@ fails the build before any on-chain run.
 6. Verify: counts match the snapshot, new fields carry their defaults, and v2-only
    calls (e.g. `get_invoice_count(&Some(status))`) succeed.
 
-> The on-chain `migrate` entrypoint applies exactly the transform validated by
-> `--simulate`; keep the two in lockstep when the schema evolves further.
+---
+
+## Upgrade Migration Sequencing & State Versioning (Issue #1086)
+
+### 1. Overview & Baseline Context
+
+When upgrading the `invoice_liquidity` contract via WASM hash replacement, persistent storage state is preserved by the host environment. However, evolving data layouts (such as schema bumps, new fields, or the transition from monolithic `Invoice(u64)` storage to the hot/cold split `InvoiceCore(u64)` + `InvoiceMetadata(u64)`) require a deterministic, fail-closed operational procedure.
+
+Without documented migration sequencing, operators risk:
+1. Executing user transactions against incomplete or unmigrated schema layouts.
+2. Race conditions between post-upgrade calls and schema migration.
+3. Inadvertent double-migrations or partial state overwrites.
+4. Silent fallback or authorization bypass during intermediate migration states.
+
+### 2. The 6-Step Migration Sequencing Procedure
+
+Every contract upgrade requiring state or schema migration must follow this exact sequential order:
+
+```text
+[1. Pre-Upgrade Snapshot & Pause]
+            │
+            ▼
+[2. WASM Replacement (upgrade)]
+            │
+            ▼
+[3. Schema Migration (migrate)]
+            │
+            ▼
+[4. Dual-Format & Schema Validation]
+            │
+            ▼
+[5. Operational Resumption (unpause)]
+            │
+            ▼
+[6. Post-Upgrade Verification & Monitoring]
+```
+
+#### Step 1: Pre-Upgrade State Snapshot & Protocol Pause
+- Admin calls `pause()` on the `invoice_liquidity` contract.
+- Verified on-chain: `is_paused() == true` and `LastPauseTimestamp` is recorded.
+- An off-chain state dump captures:
+  - Current storage schema version: `get_storage_version()` (e.g. `1`).
+  - Total invoice count: `get_total_invoices()`.
+  - Token allowlist and decimal configurations.
+
+#### Step 2: Contract WASM Upgrade
+- The admin (or multi-sig / governance DAO proposal) invokes `upgrade(new_wasm_hash)`.
+- The Soroban host replaces the bytecode while keeping instance and persistent storage untouched.
+- At this stage, the protocol remains paused, preventing any non-admin interaction.
+
+#### Step 3: Atomic Schema Migration (`migrate()`)
+- The admin invokes the `migrate()` entrypoint:
+  - Gated by `require_admin(&env)` — unauthorized callers fail with `ContractError::Unauthorized`.
+  - Exemption from economic rate limiting (Issue #859): migration is an emergency/maintenance operation that must execute immediately post-upgrade.
+  - Permitted while protocol is paused (verified by `test_upgrade_migration_sequencing_while_paused`).
+- Idempotency Guarantee:
+  - If `StorageVersion >= CURRENT_STORAGE_VERSION`, `migrate()` safely returns `Ok(current)` as a no-op without re-migrating or altering storage.
+  - If `StorageVersion < CURRENT_STORAGE_VERSION`, incremental migration steps execute, `StorageVersion` is updated to `CURRENT_STORAGE_VERSION`, and a `migrated` event `(old_version, new_version, timestamp)` is emitted.
+
+#### Step 4: Dual-Format Decoding & State Validation
+- Verify backward compatibility for pre-upgrade data:
+  - Legacy monolithic records stored under `DataKey::Invoice(id)` are decoded transparently by `load_invoice(env, id)` and `try_load_invoice_core(env, id)` using the built-in fallback path.
+  - New records written post-upgrade via `save_invoice(env, invoice)` are partitioned into `DataKey::InvoiceCore(id)` (hot path) and `DataKey::InvoiceMetadata(id)` (cold path) with persistent TTL extensions (1,000,000 threshold / 2,000,000 extend-to ledgers).
+- Verify `get_storage_version() == CURRENT_STORAGE_VERSION` (version `2`).
+
+#### Step 5: Protocol Unpause & Operations Resume
+- Admin invokes `unpause()`.
+- Protocol state transitions to active: `is_paused() == false`.
+- Normal operations (submitting, funding, settling invoices) resume.
+
+#### Step 6: Rollback & Failure Contingency
+- If `migrate()` encounters an unrecoverable failure prior to completion:
+  - The contract remains paused.
+  - Admin executes a rollback by invoking `upgrade(previous_wasm_hash)`.
+  - Because `migrate()` operates atomically and updates `StorageVersion` only upon completion, partial corrupted states are avoided.
+  - Legacy records remain readable under previous WASM bytecode due to strict backward compatibility.
+
+### 3. Audited Security & Economic Guarantees
+
+- **No Authorization Bypass:** Both `upgrade()` and `migrate()` require strict admin authentication (`require_admin(&env)`). Non-admin attempts fail closed with `ContractError::Unauthorized`.
+- **No Unbounded State Growth:** Migration relies on lazy on-write migration combined with backward-compatible reads, avoiding block-gas-limit-exhausting batch loops over historical storage.
+- **Fail-Closed Compatibility:** Invoices with missing or corrupt fields trigger typed contract errors (`ContractError::InvoiceNotFound`, `ContractError::StorageError`) and never silently return zeroed or malformed values.
 
 ---
 
 **Document Prepared By:** DevOps & Security Team  
-**Last Updated:** May 2024 (migration script added — Issue #114)  
+**Last Updated:** October 2026 (upgrade migration sequencing added — Issue #1086)  
 **Next Review:** Upon next upgrade
