@@ -24,6 +24,9 @@ proptest = { workspace = true }
 rand = { workspace = true }
 serde_json = "1.0.149"
 soroban-sdk = { workspace = true, features = ["testutils"] }
+# `testutils` gates `InvocationResourceLimits` (used by
+# tests_resource_limit_failure.rs, Issue #1067) in soroban-env-host itself.
+soroban-env-host = { workspace = true, features = ["testutils"] }
 
 [[test]]
 name = "multi_token_test"

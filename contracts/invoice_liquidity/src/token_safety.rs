@@ -15,6 +15,7 @@
 //!   verifies the contract and admin are authorized holders.
 
 use soroban_sdk::{
+    contracttype,
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env, Symbol,
 };
@@ -65,6 +66,57 @@ pub fn registered_token_decimals(env: &Env, token: &Address) -> Result<u32, Cont
         .persistent()
         .get(&DataKey::TokenDecimals(token.clone()))
         .ok_or(ContractError::TokenDecimalsNotConfigured)
+}
+
+/// Issue #1069: a comparison between what this contract has registered for
+/// `token` and what the token itself reports *right now*.
+///
+/// `initialize`'s three bootstrap tokens (USDC, EURC, XLM) are registered
+/// with fixed decimals (6, 6, 7) that were never checked against the token
+/// — unlike `add_token`, which always calls `validate_token_decimals`. See
+/// docs/token-safety.md's "Known limitations": on Stellar Mainnet, classic-
+/// asset SACs (including real USDC/EURC) report **7** decimals, so a
+/// bootstrap deployment using the real SACs is very likely already
+/// recording the wrong value for USDC/EURC specifically. This struct makes
+/// that divergence observable on-chain instead of silently assumed away.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenDecimalsAudit {
+    /// Decimals currently registered for `token` via `TokenDecimals`, if
+    /// the token has ever been approved (`initialize` or `add_token`).
+    pub registered: Option<u32>,
+    /// `token`'s own `decimals()` report right now, if it successfully
+    /// answers. `None` if the token doesn't implement `decimals()`, or
+    /// there is no deployed contract at that address at all (e.g. a test
+    /// placeholder passed for `eurc_token` at `initialize` time).
+    pub on_chain: Option<u32>,
+}
+
+impl TokenDecimalsAudit {
+    /// `true` only when both sides are known and agree. A token that can't
+    /// report `decimals()` right now (`on_chain: None`) is *not* reported
+    /// as mismatched — there's nothing to compare against, not evidence of
+    /// a problem.
+    pub fn matches(&self) -> bool {
+        matches!((self.registered, self.on_chain), (Some(r), Some(o)) if r == o)
+    }
+}
+
+/// Audit `token`'s registered decimals against its current on-chain
+/// `decimals()`. Read-only, performs no storage write.
+pub fn audit_token_decimals(env: &Env, token: &Address) -> TokenDecimalsAudit {
+    let registered = env
+        .storage()
+        .persistent()
+        .get(&DataKey::TokenDecimals(token.clone()));
+    let on_chain = match TokenClient::new(env, token).try_decimals() {
+        Ok(Ok(d)) => Some(d),
+        _ => None,
+    };
+    TokenDecimalsAudit {
+        registered,
+        on_chain,
+    }
 }
 
 // ----------------------------------------------------------------

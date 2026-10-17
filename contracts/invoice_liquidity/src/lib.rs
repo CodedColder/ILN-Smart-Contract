@@ -949,6 +949,78 @@ pub fn remove_token(env: Env, token: Address) -> Result<(), ContractError> {
             .get(&crate::storage::DataKey::TokenDecimals(token))
     }
 
+    /// Issue #1069: compare `token`'s registered decimals against what it
+    /// reports via `decimals()` right now. `initialize`'s bootstrap tokens
+    /// (USDC, EURC at 6; XLM at 7) are registered without ever being
+    /// checked against the token itself — unlike `add_token`, which always
+    /// validates. On Stellar Mainnet, classic-asset SACs (including real
+    /// USDC/EURC) report 7 decimals, so a real deployment is likely already
+    /// diverged for USDC/EURC specifically; see docs/token-safety.md's
+    /// "Known limitations". This lets any off-chain monitor detect that
+    /// divergence instead of it being silently assumed away. A `None` in
+    /// either field of the result means that side couldn't be determined
+    /// (not approved yet, or the token can't currently answer `decimals()`)
+    /// — it does not by itself indicate a mismatch.
+    ///
+    /// Access: Anyone
+    pub fn audit_token_decimals(env: Env, token: Address) -> token_safety::TokenDecimalsAudit {
+        token_safety::audit_token_decimals(&env, &token)
+    }
+
+    /// Issue #1069: correct an *already-approved* token's registered
+    /// decimals to match a value re-validated against the token's own
+    /// `decimals()` — the same check `add_token` applies when a token is
+    /// first approved. Exists for tokens approved before that validation
+    /// existed, most notably `initialize`'s bootstrap tokens (see
+    /// `audit_token_decimals` above for why those are likely wrong on a
+    /// real deployment). Does not approve a new token, move any funds, or
+    /// retroactively change any existing invoice's stored `amount` — it
+    /// only changes the minimum-amount validation applied to invoices
+    /// submitted *after* this call, in `token`.
+    ///
+    /// # Errors
+    /// * `Unauthorized` if caller is not admin, or if `token` is not
+    ///   currently approved.
+    /// * `TokenDecimalsUnavailable` / `InvalidTokenDecimals` if `decimals`
+    ///   does not match what the token itself reports.
+    ///
+    /// Access: Admin only
+    pub fn correct_token_decimals(
+        env: Env,
+        token: Address,
+        decimals: u32,
+    ) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        if !is_approved_token(&env, &token) {
+            return Err(ContractError::Unauthorized);
+        }
+        check_rate_limit(&env, "correct_token_decimals", DEFAULT_RATE_LIMIT_LEDGERS)?;
+        token_safety::validate_token_decimals(&env, &token, decimals)?;
+
+        let old_decimals = env
+            .storage()
+            .persistent()
+            .get(&crate::storage::DataKey::TokenDecimals(token.clone()));
+
+        record_admin_action(&env, "correct_token_decimals");
+        env.storage().persistent().set(
+            &crate::storage::DataKey::TokenDecimals(token.clone()),
+            &decimals,
+        );
+
+        let updated_by = get_admin(&env).ok_or(ContractError::Unauthorized)?;
+        env.events().publish(
+            (Symbol::new(&env, "token_decimals_corrected"), token.clone()),
+            TokenDecimalsCorrected {
+                token,
+                old_decimals: old_decimals.unwrap_or(decimals),
+                new_decimals: decimals,
+                updated_by,
+            },
+        );
+        Ok(())
+    }
+
     /// Issue #1072: amount of `token` escrowed for `recipient` because their
     /// trustline was frozen when a payout or refund was due.
     ///
@@ -4361,6 +4433,13 @@ mod tests_queue_renewal_proptest;
 // Issue #1017: resolve_fund_queue must not finalize a queue's unresolved
 // economic state once the invoice has already been cancelled/expired/etc.
 mod tests_queue_status_gate;
+// Issue #76 / #1066: execution-cost benchmarks + absolute WASM/instruction
+// thresholds. Previously present but never registered, so it never ran and
+// had drifted out of sync with the current contract API.
+mod tests_benchmarks;
+// Issue #1067: a trapped resource-limit invocation must roll back
+// atomically (no partial storage writes, no stranded token transfer).
+mod tests_resource_limit_failure;
 // Issue #invoice-count: get_invoice_count underflow safety
 mod tests_invoice_count;
 // Issue #batch-reputation: batch_submit increments invoices_submitted

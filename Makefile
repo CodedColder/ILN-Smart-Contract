@@ -120,7 +120,8 @@ help:
 	@echo ""
 .PHONY: help install build build-rust build-sdk test test-rust test-e2e fuzz test-fuzz test-formal lint \
         fmt fmt-check clippy deploy-testnet seed reset reset-testnet docs spec \
-        changelog soroban-optimize health test-insurance test-invoice test-governance test-distribution
+        changelog soroban-optimize health test-insurance test-invoice test-governance test-distribution \
+        check-wasm-size check-benchmarks check-no-unwrap event-coverage
 
 
 # Package manager for the TypeScript workspaces (sdk, indexer, notifications,
@@ -190,7 +191,7 @@ test-fuzz: ## Run fuzz tests for the iln_fuzz crate
 test-formal: ## Gate on formal counterexamples + proof obligations (#1100, #1101)
 	bash scripts/run-formal-verification.sh
 
-lint: fmt-check clippy check-no-unwrap event-coverage ## Lint everything (rustfmt check + clippy + panic-path gate + event coverage)
+lint: fmt-check clippy check-no-unwrap event-coverage check-wasm-size ## Lint everything (rustfmt check + clippy + panic-path gate + event coverage + WASM size gate)
 
 fmt: ## Format all Rust code in place
 	cargo fmt --all
@@ -207,6 +208,12 @@ check-no-unwrap: ## Gate: fail if unwrap()/expect() appears in non-test contract
 event-coverage: ## Gate: every state-mutating entrypoint emits an event or is an approved exemption (#858)
 	npx --no-install tsx --test scripts/check-event-coverage.test.ts
 	npx --no-install tsx scripts/check-event-coverage.ts --check
+
+check-wasm-size: ## Gate: fail if any contract's optimized WASM exceeds the size threshold (#1066)
+	bash scripts/check_wasm_size.sh
+
+check-benchmarks: ## Run execution-cost benchmarks and report against the recorded baseline (#76, warning-only)
+	bash scripts/check_benchmark_regression.sh
 
 deploy-testnet: ## Deploy all contracts to Stellar testnet
 	bash scripts/deploy-testnet.sh

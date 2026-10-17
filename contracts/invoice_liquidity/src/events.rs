@@ -172,6 +172,22 @@ pub struct TokenAdded {
     pub decimals: u32,
 }
 
+/// Issue #1069: an already-approved token's registered decimals were
+/// corrected to match a value the admin re-validated against the token's
+/// own `decimals()`. Distinct from `TokenAdded` — this does not approve a
+/// new token, it corrects one that was already approved (most notably one
+/// of `initialize`'s bootstrap tokens, which — see docs/token-safety.md
+/// "Known limitations" — are set to a fixed value without ever being
+/// checked against the token itself).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenDecimalsCorrected {
+    pub token: Address,
+    pub old_decimals: u32,
+    pub new_decimals: u32,
+    pub updated_by: Address,
+}
+
 /// Issue #1072: a payout to a frozen recipient was escrowed instead of
 /// transferred.
 #[contracttype]
