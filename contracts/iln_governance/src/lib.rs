@@ -103,29 +103,20 @@ pub enum GovernanceError {
     DepositAlreadySettled = 27,
     /// #844: contract called before `initialize()`.
     NotInitialized = 28,
-    /// Issue #805: the voter has no balance checkpoint predating this
-    /// proposal by at least `MIN_VOTE_HOLD_LEDGERS`. Call
-    /// `checkpoint_balance` and wait out the holding period (or vote on a
-    /// later proposal) before voting.
-    InsufficientHoldingPeriod = 29,
-    /// Issue #985: Execution delay violates production minimum or maximum bounds.
-    ExecutionDelayOutOfBounds = 35,
-    /// Issue #989: Invalid transition in veto state machine.
-    InvalidVetoTransition = 36,
-    /// Issue #990: Admin veto power has already been permanently disabled.
-    VetoPowerAlreadyDisabled = 37,
-    /// Issue #990: Consent reason hash is required and cannot be empty.
-    ConsentRequired = 38,
-    /// Issue #992: the proposal (or stored delay) predates the timelock and
-    /// carries no usable eta; call `rebase_legacy_proposal_eta` /
-    /// `migrate_legacy_execution_delay` before it can be executed.
-    LegacyDelayMigrationRequired = 39,
-    /// Issue #998: the proposer recorded on the proposal does not match the
-    /// proposer bound at creation time; the lifecycle transition is refused.
-    ProposerIdentityMismatch = 40,
-    /// Issue #1001: the proposal has no recorded snapshot ledger, so no
-    /// checkpoint can be bound to it (fail-closed, no fallback to "now").
-    SnapshotLedgerMissing = 41,
+    /// #1000: the proposal was vetoed (cancelled) and can never execute.
+    ProposalCancelled = 29,
+    /// #1000: a later proposal of the same action kind already executed, so
+    /// this stale passed proposal must not overwrite the newer outcome.
+    ProposalSuperseded = 30,
+    /// #1003: the quorum denominator (token total supply) or quorum bps is
+    /// missing / non-positive — finalization fails closed instead of
+    /// treating the quorum as zero.
+    QuorumDataMissing = 31,
+    /// #1004: stored vote tallies are inconsistent (negative or overflowing).
+    InvalidVoteAccounting = 32,
+    /// #1006: the id is within `ProposalCount` but its storage entry is
+    /// missing (expired/archived) or does not match the requested id.
+    ProposalStorageCorrupt = 33,
 }
 
 // ================================================================
@@ -547,50 +538,10 @@ pub enum StorageKey {
     /// Issue #814: `true` once a proposal's deposit has been settled
     /// (refunded or forfeited) — guards against double-refund.
     ProposalDepositSettled(u64),
-    /// Issue #805: last proven balance checkpoint per voter (see
-    /// `BalanceCheckpoint`). Written by `checkpoint_balance` and (when
-    /// absent) for the proposer at `create_proposal`.
-    BalanceCheckpoint(Address),
-    /// Issue #805: ledger sequence at which a proposal was created. The
-    /// reference point for the `MIN_VOTE_HOLD_LEDGERS` eligibility rule in
-    /// `cast_vote`. Stored beside `Proposal` (rather than inside it) so the
-    /// `GovernanceProposal` XDR schema — and every persisted proposal —
-    /// stays byte-compatible.
-    ProposalCreatedLedger(u64),
-    /// Issue #1098: reverse delegation adjacency — the set of addresses whose
-    /// forward `Delegation` pointer currently targets this address. Required to
-    /// enforce invariant DEL2 (delegation chain depth ≤ `MaxDelegationDepth`)
-    /// for *every* insertion order, including chains grown by appending at the
-    /// leaf. A forward-only check cannot observe how deep a *delegator* already
-    /// sits inside an inbound chain, so this adjacency closes that gap.
-    Delegators(Address),
-    /// Issue #1099: fail-closed persistent mirror of the `HasVoted` +
-    /// `AppliedVoteWeight` temporary vote receipt. Temporary entries can be
-    /// archived by the host, which would resurrect the "already voted" guard
-    /// and allow a double vote. This persistent record stores the applied
-    /// weight (0 is never written, so presence means "voted") and is the
-    /// authoritative guard; the temporary entry is retained for fast reads and
-    /// backwards compatibility.
-    VoteReceipt(u64, Address),
-    /// Issue #1099: per-signer persistent mirror of `VetoApprovals`. Because a
-    /// single temporary `Vec` can be archived, the veto threshold tally is
-    /// derived from these durable per-signer flags so an archived approval list
-    /// cannot reset a partially-collected veto multisig.
-    VetoApprovalReceipt(u64, Address),
-    /// Issue #989: Veto state machine record for a proposal.
-    VetoState(u64),
-    /// Issue #990: Record of veto power disable authorization and reason.
-    VetoDisableRecord,
-    /// Issue #992: audit record of `migrate_legacy_execution_delay`.
-    LegacyDelayMigration,
-    /// Issue #998: proposer bound at `create_proposal`, immutable thereafter.
-    /// Stored beside `Proposal` so the `GovernanceProposal` schema is unchanged.
-    ProposalProposer(u64),
-    /// Issue #1001: the checkpoint a voter's latest `checkpoint_balance`
-    /// replaced. Together with `BalanceCheckpoint` this bounds history to two
-    /// slots per voter while letting a refresh after a proposal's snapshot
-    /// ledger leave the older, eligible checkpoint usable for that proposal.
-    PriorBalanceCheckpoint(Address),
+    /// #1000: `(action kind) -> (created_at, proposal id)` of the most
+    /// recently created proposal of that kind that has executed. One entry
+    /// per action kind, so state stays bounded.
+    LastExecuted(u32),
 }
 
 // ================================================================
@@ -633,6 +584,55 @@ impl GovContract {
             .instance()
             .get(&StorageKey::ReputationBonusContract)
             .ok_or(GovernanceError::NotInitialized)
+    }
+
+    /// #1006: load a proposal, failing closed. Ids that were never issued
+    /// return `ProposalNotFound`; ids that were issued (<= `ProposalCount`)
+    /// but whose entry is missing or carries a different id return
+    /// `ProposalStorageCorrupt` rather than being treated as nonexistent.
+    fn load_proposal(env: &Env, proposal_id: u64) -> Result<GovernanceProposal, GovernanceError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ProposalCount)
+            .unwrap_or(0);
+        if proposal_id == 0 || proposal_id > count {
+            return Err(GovernanceError::ProposalNotFound);
+        }
+        let proposal: GovernanceProposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .ok_or(GovernanceError::ProposalStorageCorrupt)?;
+        if proposal.id != proposal_id {
+            return Err(GovernanceError::ProposalStorageCorrupt);
+        }
+        Ok(proposal)
+    }
+
+    /// #1000: stable discriminant per action kind (ignores payload).
+    fn action_kind(action: &ProposalAction) -> u32 {
+        match action {
+            ProposalAction::UpdateFeeRate(_) => 0,
+            ProposalAction::AddToken(..) => 1,
+            ProposalAction::RemoveToken(_) => 2,
+            ProposalAction::UpdateMaxDiscountRate(_) => 3,
+            ProposalAction::UpdateDecayParams(..) => 4,
+            ProposalAction::UpdateDistributionRewardParams(..) => 5,
+            ProposalAction::UpdateFeeTiers(_) => 6,
+            ProposalAction::Upgrade(_) => 7,
+            ProposalAction::UpdateLpRewardRate(_) => 8,
+            ProposalAction::UpdateFreelancerRewardRate(_) => 9,
+            ProposalAction::UpdatePayerRewardRate(_) => 10,
+            ProposalAction::UpdateInsuranceCoverageCap(_) => 11,
+            ProposalAction::UpdateInsurancePremiumRate(_) => 12,
+            ProposalAction::RegisterOracle(..) => 13,
+            ProposalAction::RemoveOracle(_) => 14,
+            ProposalAction::RegisterTokenOracle(..) => 15,
+            ProposalAction::UpdateReputationBonusParams(..) => 16,
+            ProposalAction::UpdateMaxInvoiceAmount(_) => 17,
+            ProposalAction::UpdateTokenVolumeCap(..) => 18,
+        }
     }
 
     // ── Initialise ────────────────────────────────────────────────
@@ -1197,11 +1197,7 @@ pub fn get_proposal_created_ledger(env: Env, proposal_id: u64) -> Option<u32> {
     /// call after settlement is a no-op returning `false` (no second
     /// transfer), which is what prevents double-refunds on the
     /// `Passed -> Executed` second `execute_proposal` call.
-    fn refund_proposal_deposit(
-        env: &Env,
-        proposal_id: u64,
-        proposer: &Address,
-    ) -> Result<bool, GovernanceError> {
+    fn refund_proposal_deposit(env: &Env, proposal_id: u64, proposer: &Address) -> Result<bool, GovernanceError> {
         if env
             .storage()
             .persistent()
@@ -1248,11 +1244,7 @@ pub fn get_proposal_created_ledger(env: Env, proposal_id: u64) -> Option<u32> {
 
     /// Forfeit the escrowed deposit to the configured sink (or lock it in
     /// this contract when no sink is set). Idempotent like the refund path.
-    fn forfeit_proposal_deposit(
-        env: &Env,
-        proposal_id: u64,
-        proposer: &Address,
-    ) -> Result<bool, GovernanceError> {
+    fn forfeit_proposal_deposit(env: &Env, proposal_id: u64, proposer: &Address) -> Result<bool, GovernanceError> {
         if env
             .storage()
             .persistent()
@@ -1614,11 +1606,7 @@ pub fn cast_vote(
     ) -> Result<(), GovernanceError> {
         voter.require_auth();
 
-        let mut proposal: GovernanceProposal = env
-            .storage()
-            .persistent()
-            .get(&StorageKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+        let mut proposal: GovernanceProposal = Self::load_proposal(&env, proposal_id)?;
 
         let now = env.ledger().timestamp();
         if now >= proposal.voting_end {
@@ -1843,18 +1831,13 @@ pub fn get_execution_delay(env: Env) -> u32 {
 
     // ── execute_proposal ─────────────────────────────────────────
 
-    /// `execute_proposal` contract entry point.
-///
-/// Access: Anyone
-pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
-        let mut proposal: GovernanceProposal = env
-            .storage()
-            .persistent()
-            .get(&StorageKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
-        // Issue #998: refuse any transition on a proposal whose proposer
-        // no longer matches the identity bound at creation.
-        Self::verified_proposer(&env, &proposal)?;
+    pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+        let mut proposal: GovernanceProposal = Self::load_proposal(&env, proposal_id)?;
+
+        // #1000: a vetoed (cancelled) proposal is dead regardless of timing.
+        if proposal.status == ProposalStatus::Vetoed {
+            return Err(GovernanceError::ProposalCancelled);
+        }
 
         let now = env.ledger().timestamp();
         if now < proposal.voting_end {
@@ -1862,12 +1845,19 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
         }
 
         if proposal.status == ProposalStatus::Active {
-            let total_votes = proposal.votes_for.saturating_add(proposal.votes_against);
+            // #1004: validate vote-weight accounting before using the tallies.
+            if proposal.votes_for < 0 || proposal.votes_against < 0 {
+                return Err(GovernanceError::InvalidVoteAccounting);
+            }
+            let total_votes = proposal
+                .votes_for
+                .checked_add(proposal.votes_against)
+                .ok_or(GovernanceError::InvalidVoteAccounting)?;
             let min_quorum_bps: u32 = env
                 .storage()
                 .instance()
                 .get(&StorageKey::MinQuorumBps)
-                .unwrap_or(DEFAULT_MIN_QUORUM_BPS);
+                .ok_or(GovernanceError::QuorumDataMissing)?;
 
             // Issue #622: total_supply used to be a caller-supplied argument,
             // letting a caller inflate it (lowering the effective quorum) or
@@ -1875,36 +1865,37 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
             // value instead (seeded at initialize, only updatable via the
             // ILN-contract-gated set_gov_token_total_supply) — it can no
             // longer be chosen by whoever happens to call execute_proposal.
+            //
+            // #1003: a missing or non-positive supply used to yield
+            // `quorum = 0`, so any proposal with one vote passed. Fail closed.
             let total_supply: i128 = env
                 .storage()
                 .instance()
                 .get(&StorageKey::GovTokenTotalSupply)
                 .unwrap_or(0);
-
-            let quorum = if total_supply <= 0 {
-                0_i128
-            } else {
-                total_supply.saturating_mul(min_quorum_bps as i128) / 10_000_i128
-            };
+            if total_supply <= 0 || min_quorum_bps == 0 || min_quorum_bps > 10_000 {
+                return Err(GovernanceError::QuorumDataMissing);
+            }
+            let quorum = total_supply.saturating_mul(min_quorum_bps as i128) / 10_000_i128;
 
             if total_votes < quorum {
-                Self::reject_proposal(
-                    &env,
-                    &mut proposal,
-                    RejectionReason::QuorumNotReached,
-                    quorum,
-                )?;
-                return Ok(());
+                proposal.status = ProposalStatus::Rejected;
+                env.storage()
+                    .persistent()
+                    .set(&StorageKey::Proposal(proposal_id), &proposal);
+                // Issue #814: expired without quorum — forfeit the deposit.
+                Self::forfeit_proposal_deposit(&env, proposal_id, &proposal.proposer)?;
+                return Err(GovernanceError::QuorumNotReached);
             }
 
             if proposal.votes_for <= proposal.votes_against {
-                Self::reject_proposal(
-                    &env,
-                    &mut proposal,
-                    RejectionReason::MajorityAgainst,
-                    quorum,
-                )?;
-                return Ok(());
+                proposal.status = ProposalStatus::Rejected;
+                env.storage()
+                    .persistent()
+                    .set(&StorageKey::Proposal(proposal_id), &proposal);
+                // Issue #814: rejected — forfeit the deposit.
+                Self::forfeit_proposal_deposit(&env, proposal_id, &proposal.proposer)?;
+                return Err(GovernanceError::ProposalRejected);
             }
 
             proposal.status = ProposalStatus::Passed;
@@ -1927,11 +1918,16 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
         }
 
         if proposal.status == ProposalStatus::Passed {
-            // Issue #992: a Passed proposal with no eta predates the timelock.
-            // It may only skip the wait while the delay regime is still the
-            // legacy zero-delay one; otherwise it must be rebased first.
-            if proposal.eta_ledger == 0 && Self::effective_execution_delay(&env) > 0 {
-                return Err(GovernanceError::LegacyDelayMigrationRequired);
+            // #1000: a later proposal of the same kind already executed.
+            let kind = Self::action_kind(&proposal.action_type);
+            if let Some((last_created, _)) = env
+                .storage()
+                .persistent()
+                .get::<StorageKey, (u64, u64)>(&StorageKey::LastExecuted(kind))
+            {
+                if last_created > proposal.created_at {
+                    return Err(GovernanceError::ProposalSuperseded);
+                }
             }
             let current_ledger = env.ledger().sequence();
             // Issue #987: Verify eta comparison across ledger rollover.
@@ -2095,6 +2091,10 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
             env.storage()
                 .persistent()
                 .set(&StorageKey::Proposal(proposal_id), &proposal);
+            env.storage().persistent().set(
+                &StorageKey::LastExecuted(kind),
+                &(proposal.created_at, proposal_id),
+            );
 
             // Issue #814: executed — ensure refund (no-op if already
             // refunded at Passed time; covers zero-deposit proposals).
@@ -2114,6 +2114,10 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
             return Ok(());
         }
 
+        // #1000: distinguish cancelled (vetoed) from other terminal states.
+        if proposal.status == ProposalStatus::Vetoed {
+            return Err(GovernanceError::ProposalCancelled);
+        }
         Err(GovernanceError::AlreadyResolved)
     }
 
@@ -2280,11 +2284,7 @@ pub fn veto_proposal(
             .unwrap_or(0);
 
         // ── Load proposal ─────────────────────────────────────────
-        let mut proposal: GovernanceProposal = env
-            .storage()
-            .persistent()
-            .get(&StorageKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+        let mut proposal: GovernanceProposal = Self::load_proposal(&env, proposal_id)?;
 
         // Issue #998: proposer identity must match the creation-time binding.
         Self::verified_proposer(&env, &proposal)?;
@@ -2564,14 +2564,8 @@ pub fn is_veto_power_enabled(env: Env) -> bool {
 
     // ── Getters ──────────────────────────────────────────────────
 
-    /// `get_proposal` contract entry point.
-///
-/// Access: Anyone
-pub fn get_proposal(env: Env, proposal_id: u64) -> Result<GovernanceProposal, GovernanceError> {
-        env.storage()
-            .persistent()
-            .get(&StorageKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<GovernanceProposal, GovernanceError> {
+        Self::load_proposal(&env, proposal_id)
     }
 
     /// `list_proposals` contract entry point.

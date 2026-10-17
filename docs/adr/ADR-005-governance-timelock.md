@@ -86,8 +86,14 @@ Threat model: [`docs/timelock-threat-model.md`](../timelock-threat-model.md).
 - **Action required:** A timelock must be implemented and activated via a
   governance upgrade before `disable_veto_power()` is called. Failure to do
   so leaves the protocol without any execution delay after full decentralisation.
-- **Update (Issues #991/#993/#996/#997):** `TimelockNotExpired` is enforced via
-  `set_execution_delay`; the veto-disabled handoff is tested end to end and
-  `get_timelock_status` / `get_proposal_eta` expose the state. See
-  `docs/governance.md`. The delay still defaults to `0`, so the pre-mainnet
-  checklist item is to set it before `disable_veto_power()`.
+- The `TimelockNotExpired` error is reserved but unimplemented; contributors
+  must not assume it is enforced.
+
+## Addendum (#1000/#1003/#1004/#1006): execution is fail-closed
+
+Although there is no timelock, `execute_proposal` now rejects cancelled
+(`ProposalCancelled`) and superseded (`ProposalSuperseded`) proposals, refuses
+to finalize without quorum data (`QuorumDataMissing`) or with corrupt tallies
+(`InvalidVoteAccounting`), and distinguishes missing proposal storage
+(`ProposalStorageCorrupt`) from never-issued ids. See
+`docs/governance-security-summary.md` §6.
