@@ -104,56 +104,65 @@ insurance twice for one invoice.
 
 ---
 
-## 7. Invariant X6 — Allowlisted tokens always carry decimals (fail closed)
+---
 
-**Property:** Every token for which `is_approved_token` is true has a
-`TokenDecimals` entry (USDC=6, EURC=6, XLM=7 after `initialize`; any
-`add_token` token whose declared decimals match its own `decimals()` and are
-`<= MAX_TOKEN_DECIMALS`, see `token_safety.rs` / Issue #1070). If an entry is
-absent, `submit_invoice` returns `TokenDecimalsNotConfigured` and consumes no
-invoice id — there is no silent 6-decimal fallback.
+## 7. Invariant X6 — Governance execution strictly not before ETA timelock (Issue #1087)
 
-**Why cross-contract:** the minimum-amount floor and every downstream token
-transfer in distribution / insurance are denominated in the token's own
-precision; assuming 6 for a 7-decimal asset under-enforces the floor 10×.
+**Property:** A passed governance proposal targeting downstream contracts (`invoice_liquidity`, `iln_distribution`, `insurance_pool`, or `reputation_bonus`) cannot execute before both `now >= voting_end` (voting window guard) and `current_ledger >= eta_ledger` (timelock guard) are satisfied in order:
+```text
+execute_proposal(id) -> Executed  iff  (now >= voting_end) ∧ (status == Passed) ∧ (current_ledger >= eta_ledger)
+```
+At any ledger sequence `current_ledger < eta_ledger` (including boundary `eta_ledger - 1`), execution is rejected with `TimelockNotExpired` and no downstream cross-contract calls are dispatched.
 
-**Verified by:** `c1_*` in `contracts/tests/audit_regression_test.rs`
-(registration/bounds paths: `tests_token_safety.rs`)
+**Why cross-contract:** The timelock is tracked in `iln_governance` storage, but its guarantee protects parameter integrity across the target contracts. If governance could bypass `eta_ledger`, timelocked protections on economic parameters (such as `update_fee_rate`, `update_max_discount`, or `upgrade`) would be void.
+
+**Verified by:** `x6_governance_execution_not_before_eta_invariant`
 
 ---
 
-## 8. Invariant X7 — Fund queue state is bounded
+## 8. Invariant X7 — Model veto transition safety (Issue #1088)
 
-**Property:** For every invoice, `|FundQueue(invoice_id)| <= MAX_FUND_QUEUE_LEN`.
-At capacity a joiner is admitted only if its score strictly exceeds the
-lowest queued score (displacing that entry and emitting
-`fund_queue_displaced`); otherwise `QueueFull`. Resolution remains O(1)
-(`queue[0]`) and picks the highest score.
+**Property:** While `VetoPowerEnabled == true`, authorized veto signers (`VetoSigners`) can transition an `Active` or `Passed` proposal directly to `Vetoed`. Once in `Vetoed`:
+1. The status is permanently terminal: subsequent votes fail (`ProposalNotActive`) and execution fails (`AlreadyResolved`).
+2. Downstream cross-contract actions are never dispatched, even if the proposal previously passed and its timelock elapsed.
+3. Terminal states (`Executed`, `Rejected`, `Vetoed`) reject veto calls (`NotVetoable`).
+4. Once `disable_veto_power` is executed via the `iln_contract`, subsequent veto attempts fail closed with `VetoPowerDisabled`.
 
-**Verified by:** `c3_*` in `contracts/tests/audit_regression_test.rs`
+**Why cross-contract:** Veto power acts as an emergency stop for malicious or flawed proposals targeting downstream protocol contracts. Veto safety guarantees that once a proposal is blocked, its actions can never reach the downstream contracts regardless of subsequent ledger progression.
+
+**Verified by:** `x7_governance_veto_transition_safety`
 
 ---
 
-## 9. Residual risks
+## 9. Invariant X8 — Proposal lifecycle authorization (Issue #1089)
 
-- Distribution rates of zero trivially satisfy X1/X2 with “no increase”; tests
-  use positive default rates after `initialize`.
-- X4 is harness-level conservation for the payment token mock/SAC used in
-  tests, not a consensus proof over every possible token implementation.
-- Governance and `reputation_bonus` are out of scope here (covered by the
-  full-protocol lifecycle test and Part II of `formal-verification.md`).
+**Property:** Every proposal lifecycle state mutation strictly enforces its required authorization predicate:
+1. `create_proposal`: Caller requires `proposer.require_auth()` and `proposer_balance >= min_proposal_balance`; otherwise rejected with `InsufficientProposerBalance`.
+2. `cast_vote`: Caller requires `voter.require_auth()`, has not already voted on `proposal_id` (rejects with `AlreadyVoted`), and holds an aged balance checkpoint predating the proposal creation by at least `MIN_VOTE_HOLD_LEDGERS` (rejects with `InsufficientHoldingPeriod`).
+3. Gated configuration entrypoints (`set_min_quorum_bps`, `set_min_proposal_balance`, `disable_veto_power`): Require `iln_contract.require_auth()` and validate parameter bounds (`1 <= min_quorum_bps <= 10_000`); unauthorized callers cannot tamper with governance parameters.
+4. `veto_proposal`: Only authorized signers registered in `VetoSigners` can submit veto approvals.
 
-## 10. Coverage
+**Why cross-contract:** Governance parameters and proposal execution govern the configuration of all five protocol contracts. Enforcing authorization across each lifecycle transition ensures malicious external callers cannot trigger unauthorized cross-contract configuration mutations.
 
-| Invariant | Verified by |
-|-----------|-------------|
-| X1 Funding → LP accrual | `x1_funding_increases_lp_distribution_accrual` |
-| X2 Settlement → freelancer accrual | `x2_settlement_increases_freelancer_distribution_accrual` |
-| X3 Default claim vs pool balance | `x3_default_claim_reduces_insurance_pool_by_payout` |
-| X4 Token conservation | `x4_payment_token_conserved_across_iln_and_insurance` |
-| X5 No double insurance pay | `x5_insurance_compensation_not_paid_twice_for_same_invoice` |
-| X6 Token decimals present / bounded | `c1_*` (`audit_regression_test`) |
-| X7 Bounded fund queue | `c3_*` (`audit_regression_test`) |
+**Verified by:** `x8_governance_proposal_lifecycle_authorization`
 
-See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md)
-for the evidence → control → test mapping.
+---
+
+## 10. Residual risks
+
+- Distribution rates of zero trivially satisfy X1/X2 with “no increase”; tests use positive default rates after `initialize`.
+- X4 is harness-level conservation for the payment token mock/SAC used in tests, not a consensus proof over every possible token implementation.
+- X6/X7/X8 model governance lifecycle invariants and cross-contract parameter execution against `invoice_liquidity`, composing with Part II of `formal-verification.md`.
+
+## 11. Coverage
+
+| Invariant | Verified by | Issue |
+|-----------|-------------|-------|
+| X1 Funding → LP accrual | `x1_funding_increases_lp_distribution_accrual` | #855 |
+| X2 Settlement → freelancer accrual | `x2_settlement_increases_freelancer_distribution_accrual` | #855 |
+| X3 Default claim vs pool balance | `x3_default_claim_reduces_insurance_pool_by_payout` | #855 |
+| X4 Token conservation | `x4_payment_token_conserved_across_iln_and_insurance` | #855 |
+| X5 No double insurance pay | `x5_insurance_compensation_not_paid_twice_for_same_invoice` | #855 |
+| X6 Governance execution not before ETA | `x6_governance_execution_not_before_eta_invariant` | #1087 |
+| X7 Model veto transition safety | `x7_governance_veto_transition_safety` | #1088 |
+| X8 Proposal lifecycle authorization | `x8_governance_proposal_lifecycle_authorization` | #1089 |

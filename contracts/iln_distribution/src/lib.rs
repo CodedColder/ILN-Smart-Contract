@@ -141,6 +141,8 @@ impl IlnDistribution {
                 gov_token,
             },
         );
+
+        Ok(())
     }
 
     /// Re-check the governance-token mint authority invariant (Issue #861).

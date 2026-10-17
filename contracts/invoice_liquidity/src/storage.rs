@@ -1,4 +1,5 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::testutils::storage::Persistent as _;
 
 use crate::config::Config;
 use crate::invoice::{AppealRecord, Invoice, InvoiceCore, InvoiceMetadata, ReputationScore};
@@ -17,6 +18,10 @@ pub enum DataKey {
     /// Minimum payer reputation required to fund an invoice (Issue #28). Default 0.
     MinPayerReputation,
     NextInvoiceId,
+    /// Issue #645: monotonically increasing count of admin actions ever
+    /// recorded in the admin action audit log (never decreases, even as
+    /// older ring-buffer entries are overwritten).
+    AdminActionCount,
     /// Issue #655: governance-configurable cap on a single invoice's `amount`,
     /// for a staged mainnet rollout. `0` = uncapped (default).
     MaxInvoiceAmount,
@@ -44,6 +49,9 @@ pub enum DataKey {
     /// Used to enforce a minimum maturity delay before `resolve_fund_queue` may
     /// be called, preventing MEV / front-running (Issue #MEV-1).
     FundQueueOpenedAt(u64),
+    /// Ledger sequence at which `resolve_fund_queue` locked in the winner
+    /// (Issue #1020). Anchors the stalled-winner recovery grace period.
+    QueueResolvedAt(u64),
     /// Issue #645: ring-buffer slot for the admin action audit log, indexed
     /// by `seq % ADMIN_ACTION_LOG_CAPACITY`.
     AdminActionLog(u32),
@@ -444,6 +452,133 @@ pub fn set_lp_score(env: &Env, lp: &Address, score: u32) {
 // change landing in the unused half again. See `docs/storage-layout.md` §
 // "Queued-entry retention guarantees" for the full before/after history.
 // ----------------------------------------------------------------
+
+/// Extend `key`'s TTL if (and only if) it exists. `extend_ttl` on a missing
+/// key traps, so every queue-entry bump goes through this guard.
+fn bump_queue_entry(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        env.storage().persistent().extend_ttl(
+            key,
+            crate::constants::QUEUE_TTL_THRESHOLD_LEDGERS,
+            crate::constants::QUEUE_TTL_EXTEND_TO_LEDGERS,
+        );
+    }
+}
+
+/// Issues #1009 / #1010: keep every record that belongs to an invoice's fund
+/// queue alive together. The queue, its `FundQueueOpenedAt` marker and the
+/// `QueueResolution` record are read at different times (join, resolve,
+/// and a deferred `fund_invoice`), so they must not age out independently:
+/// an expired `QueueResolution` silently re-opens funding to every LP, and an
+/// expired queue/marker silently drops the MEV maturity delay.
+pub fn extend_fund_queue_ttl(env: &Env, invoice_id: u64) {
+    bump_queue_entry(env, &DataKey::FundQueue(invoice_id));
+    bump_queue_entry(env, &DataKey::FundQueueOpenedAt(invoice_id));
+    bump_queue_entry(env, &DataKey::QueueResolution(invoice_id));
+}
+
+pub fn get_fund_queue(env: &Env, invoice_id: u64) -> soroban_sdk::Vec<LpFundRequest> {
+    let key = DataKey::FundQueue(invoice_id);
+    let queue = env.storage().persistent().get(&key);
+    if queue.is_some() {
+        extend_fund_queue_ttl(env, invoice_id);
+    }
+    queue.unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+pub fn save_fund_queue(env: &Env, invoice_id: u64, queue: &soroban_sdk::Vec<LpFundRequest>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::FundQueue(invoice_id), queue);
+    extend_fund_queue_ttl(env, invoice_id);
+}
+
+/// Return the resolved (approved) funder for an invoice, if any.
+///
+/// Reading the record extends it (and its sibling queue entries): the
+/// resolution is consulted by `join_fund_queue`, `resolve_fund_queue` and
+/// `fund_invoice`, the last of which may run long after resolution.
+pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
+    let resolution = env
+        .storage()
+        .persistent()
+        .get(&DataKey::QueueResolution(invoice_id));
+    if resolution.is_some() {
+        extend_fund_queue_ttl(env, invoice_id);
+    }
+    resolution
+}
+
+pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::QueueResolution(invoice_id), approved_lp);
+    env.storage()
+        .persistent()
+        .set(&DataKey::QueueResolvedAt(invoice_id), &env.ledger().sequence());
+}
+
+/// Ledger sequence at which the queue winner was locked in, if resolved.
+pub fn get_queue_resolved_at(env: &Env, invoice_id: u64) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::QueueResolvedAt(invoice_id))
+}
+
+/// Remove every queue-related entry for `invoice_id` (queue, resolution,
+/// resolution ledger, opened-at ledger). Idempotent.
+pub fn clear_fund_queue_state(env: &Env, invoice_id: u64) {
+    let p = env.storage().persistent();
+    p.remove(&DataKey::FundQueue(invoice_id));
+    p.remove(&DataKey::QueueResolution(invoice_id));
+    p.remove(&DataKey::QueueResolvedAt(invoice_id));
+    p.remove(&DataKey::FundQueueOpenedAt(invoice_id));
+}
+
+/// Reopen the queue after evicting a stalled winner: drop the resolution and
+/// restart the maturity window for the remaining LPs (or clear it if empty).
+pub fn reopen_fund_queue(
+    env: &Env,
+    invoice_id: u64,
+    remaining: &soroban_sdk::Vec<LpFundRequest>,
+) {
+    let p = env.storage().persistent();
+    p.remove(&DataKey::QueueResolution(invoice_id));
+    p.remove(&DataKey::QueueResolvedAt(invoice_id));
+    if remaining.is_empty() {
+        p.remove(&DataKey::FundQueue(invoice_id));
+        p.remove(&DataKey::FundQueueOpenedAt(invoice_id));
+    } else {
+        p.set(&DataKey::FundQueue(invoice_id), remaining);
+        p.set(&DataKey::FundQueueOpenedAt(invoice_id), &env.ledger().sequence());
+    }
+}
+
+/// Record the ledger sequence when the first LP joined the fund queue.
+/// Must only be called once per invoice (when the queue transitions from empty
+/// to non-empty).  Subsequent joins do not overwrite this timestamp.
+pub fn try_set_fund_queue_opened_at(env: &Env, invoice_id: u64) {
+    let key = DataKey::FundQueueOpenedAt(invoice_id);
+    if !env.storage().persistent().has(&key) {
+        env.storage()
+            .persistent()
+            .set(&key, &env.ledger().sequence());
+    }
+    extend_fund_queue_ttl(env, invoice_id);
+}
+
+/// Return the ledger sequence when the fund queue for `invoice_id` was first
+/// opened (i.e. the first LP join), or `None` if the queue is still empty.
+pub fn get_fund_queue_opened_at(env: &Env, invoice_id: u64) -> Option<u32> {
+    let opened_at = env
+        .storage()
+        .persistent()
+        .get(&DataKey::FundQueueOpenedAt(invoice_id));
+    if opened_at.is_some() {
+        extend_fund_queue_ttl(env, invoice_id);
+    }
+    opened_at
+}
 
 // ----------------------------------------------------------------
 // Appeal Helpers

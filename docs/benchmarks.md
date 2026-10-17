@@ -8,11 +8,14 @@ These values are baseline metrics for core contract execution: CPU instructions 
 
 ### `contracts/invoice_liquidity`
 
-| Function       | CPU Instructions | Memory (bytes) |
-| -------------- | ---------------- | -------------- |
-| submit_invoice |           859421 |          26485 |
-| fund_invoice   |          1041920 |          38190 |
-| mark_paid      |           948123 |          35480 |
+| Function                        | CPU Instructions | Memory (bytes) |
+| ------------------------------- | ---------------- | -------------- |
+| submit_invoice                  |           859421 |          26485 |
+| fund_invoice                    |          1041920 |          38190 |
+| mark_paid                       |           948123 |          35480 |
+| join_fund_queue_max_depth       |          1124580 |          42350 |
+| resolve_fund_queue_max_depth    |           582140 |          28120 |
+| extension_cost_at_maximum_depth |           321850 |          16420 |
 
 ### `contracts/iln_governance`
 

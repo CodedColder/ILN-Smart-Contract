@@ -47,7 +47,14 @@ Every mitigation available *today* against a compromised admin is an **off-chain
 
 These are known, documented, and consciously carried into mainnet. They are listed here so a reviewer does not have to reconstruct them from six sources.
 
-### 3.1 No execution timelock
+### 3.1 Execution timelock (partially implemented)
+
+> **Update (#995/#999/#1002/#1005):** the contract now enforces an `eta_ledger` timelock and monotonic proposal states — see the [ADR-005 addendum](adr/ADR-005-governance-timelock.md#addendum-995-999-1002-1005-implemented-timelock-invariants). The default `ExecutionDelay` is still `0`, so mainnet must set a non-zero delay (admin `set_execution_delay`, capped at 518,400 ledgers) before the veto is retired. **Rollout:** no storage migration (no struct changes; new error codes 29–31 are additive). **Recovery:** if a bad delay is set, lower it with `set_execution_delay`; already-`Passed` proposals keep their original eta, and any `Passed` proposal can still be vetoed while the veto is enabled.
+>
+> **Known follow-ups, not fixed here:** (a) `execute_proposal` returns `Err` for quorum/majority rejection, and Soroban rolls back state on `Err`, so `Rejected` status and the deposit forfeit do not persist on-chain (tests bypass this with `as_contract`); (b) `delegate_votes` after voting can let the same balance be counted by the delegate; (c) the delay is admin-key controlled.
+
+Original accepted-risk text (pre-timelock):
+
 
 `execute_proposal` runs in the same transaction as the call that triggers it, immediately after the voting window closes ([ADR-005](adr/ADR-005-governance-timelock.md), [`governance.md` §7](governance.md#7-execution-mechanics)). The stated substitute is the admin veto, which can block any `Active`/`Passed` proposal. **Accepted because:** at launch the token distribution is concentrated enough that a long timelock would slow necessary parameter tuning without a real decentralization benefit, and the veto covers the "malicious proposal" case. **Exit:** ADR-012 Phase 3 implements and activates a real timelock via governance upgrade *before* the veto is retired.
 
@@ -64,6 +71,26 @@ See [§2, finding 5](#2-findings-by-governance-hardening-area). **Fixed (Issue #
 Per [§2, finding 6](#2-findings-by-governance-hardening-area) and [ADR-012](adr/ADR-012-governance-multisig-handoff.md): the contract-level multisig (ADR-008) is designed but not wired into `lib.rs`; there is no on-chain break-glass recovery key ([disaster-recovery-multisig-signers.md §2](disaster-recovery-multisig-signers.md)); the production admin's Stellar-account signer list is empty. **Accepted for testnet.** For mainnet these are prerequisites, not a checklist to run the day something breaks — a majority-loss lockout with no prior preparation is unrecoverable on the deployed contract.
 
 ---
+
+## 4a. Rejected-transition events and cross-contract auth (Issues #1007 / #1008)
+
+* `execute_proposal` commits `Rejected` and emits `proposal_rejected` (reason:
+  `QuorumNotReached` / `MajorityAgainst`) instead of returning an `Err` that
+  Soroban rolls back; a failed cross-contract execution commits
+  `proposal_execution_failed` and leaves the proposal `Passed`.
+* A rejection is terminal: re-calling returns `AlreadyResolved`, the deposit is
+  forfeited exactly once, and a rejected proposal can no longer be voted on or
+  vetoed. No new storage keys; no unbounded growth.
+* `contracts/tests/governance_cross_contract_auth_test.rs` proves, with no
+  mocked auths on the execution path, that only a governance contract that is
+  ILN's `Admin` can drive ILN's admin setters, that a mis-wired deployment fails
+  closed, and that the timelock boundary (`eta - 1` refused, `eta` accepted)
+  holds across the contract boundary.
+* **Rollout:** deploy the new governance wasm, then update indexers/alerts to
+  consume `proposal_rejected` / `proposal_execution_failed`. **Recovery:** the
+  change is wasm-only (no storage migration); rolling back restores the old
+  `Err` returns. Proposals already `Active` past their window are rejected with
+  the new behaviour on the next `execute_proposal` call.
 
 ## 5. Adversarial Test Coverage (Issue #813)
 
@@ -89,49 +116,24 @@ A dedicated test suite combines all governance attack vectors to verify the syst
 
 ---
 
-## 6. Quadratic Sybil-plus-flash-loan cost model (Issue #809)
+## 6. Execution & finalization hardening (Issues #1000, #1003, #1004, #1006)
 
-ADR-009 introduced quadratic voting (`weight = isqrt(own + delegated)`) to
-compress whale dominance; #735 audited it against realistic distributions.
-The open question here is the adaptive attacker: split a flash-loaned balance
-`B` across `N` fresh addresses and vote from each, approximating linear power
-under the quadratic curve — and interacting with the (now fixed, §3.2)
-first-vote snapshot gap.
+Audit path: `contracts/iln_governance/src/lib.rs` (`execute_proposal`, `cast_vote`, `veto_proposal`, `get_proposal`); ADR-005 (no-timelock v1 execution model).
 
-### 6.1 The math: splitting gains ~sqrt(N)
+| Issue | Before | After (fail-closed) |
+|-------|--------|---------------------|
+| #1000 | A `Vetoed` proposal returned the generic `AlreadyResolved` (or `VotingOngoing` pre-deadline). A stale `Passed` proposal could still execute after a newer same-kind proposal had executed, overwriting the newer outcome. | `Vetoed` -> `ProposalCancelled` at any time. `Passed` proposal created before the last executed same-kind proposal -> `ProposalSuperseded`. One `LastExecuted(kind)` entry per action kind (19 max) — bounded state. |
+| #1003 | Missing/zero `GovTokenTotalSupply` made `quorum = 0`, so any single vote passed; missing `MinQuorumBps` silently defaulted. | Unset/non-positive supply or unset/out-of-range bps -> `QuorumDataMissing`; no status change. |
+| #1004 | Tallies were combined with `saturating_add`; negative/overflowing tallies were not detected. | Negative or overflowing `votes_for`/`votes_against` -> `InvalidVoteAccounting`. (A `tally <= total_supply` check was deliberately **not** added: supply is a static seed and legitimate mints exceed it.) |
+| #1006 | A missing proposal entry was indistinguishable from a never-created id (`ProposalNotFound`). | Ids `1..=ProposalCount` with a missing entry or mismatched `id` -> `ProposalStorageCorrupt`. Never-issued ids (0, > count) stay `ProposalNotFound`. Applies to `get_proposal`, `cast_vote`, `execute_proposal`, `veto_proposal`. `list_proposals` still skips missing entries (read-only view). |
 
-Under `isqrt`, one address voting `B` carries `sqrt(B)`. Split evenly across
-`N` addresses, each carries `sqrt(B/N)`, for a combined `N·sqrt(B/N) =
-sqrt(B)·sqrt(N)` — a `sqrt(N)` influence multiplier (e.g. `N = 100` → 10×).
-This is inherent to any concave weight function and is *not* introduced by
-our `isqrt` implementation; summing before the root (ADR-009) already removes
-the delegate-chain variant of the same trick.
+**Rollout / upgrade.** Additive: new error codes 29-33 and one new storage key; no existing storage layout changes. Existing `Passed` proposals remain executable unless a newer same-kind proposal has executed. Before upgrading, confirm `get_gov_token_total_supply() > 0` and `get_min_quorum_bps()` in 1..=10,000 on the live deployment, otherwise active proposals will not finalize.
 
-### 6.2 What each Sybil costs after the Issue #805 fix
+**Recovery.** `QuorumDataMissing`: restore the value through the ILN-gated setters, then re-call `execute_proposal` (proposal remains `Active`). `ProposalStorageCorrupt` / `InvalidVoteAccounting`: the proposal is frozen (cannot execute); restore the entry from the persistent-storage archive/TTL restore, or re-propose. `ProposalSuperseded`: re-propose.
 
-| Cost per Sybil | Magnitude | Notes |
-|----------------|-----------|-------|
-| Aged pre-proposal checkpoint | ≥ 10 ledgers of lead time | `checkpoint.ledger + 10 <= proposal_created_ledger`, else `InsufficientHoldingPeriod` — a flash-funded swarm cannot materialise in one transaction |
-| Real aged funds at checkpoint time | `min(checkpoint, current)` caps weight | Flash-inflated checkpoints repay to dust before the vote; only funds that survive checkpoint→vote count |
-| Account + transaction fees | ~Stellar base reserve + fee × N | Sublinear `sqrt(N)` gain vs linear cost; break-even requires large `N`, each needing its own aged funding |
-| Delegation depth / cycle guards | Max depth 10, cycle-checked | Accumulator-funnelling variants are bounded |
+**Tests.** `test_1000_*`, `test_1003_*`, `test_1004_*`, `test_1006_*` in `contracts/iln_governance/src/test.rs`.
 
-Net: the split still yields `sqrt(N)` *if* the attacker pre-funds and ages `N`
-addresses with real capital — at which point it is no longer a flash loan but
-a costly, slow, on-chain-visible Sybil farm whose per-address weight is capped
-by surviving funds. The first-vote timing gap that made this atomic is closed
-(§3.2; regression test `test_quadratic_sybil_split_needs_aged_checkpoint_per_address`).
-
-### 6.3 Decision: no additional per-transaction/per-block cap
-
-The issue asked us to implement a new-address voting cap *if net-beneficial*.
-It is not: a cap adds consensus-critical complexity (what counts as
-"new"? per-tx vs per-ledger accounting, griefing via address rotation) to
-deter an attack whose atomic form is already rejected and whose slow form is
-economically dominated by simply buying and holding. The checkpoint-aging
-rule *is* the rate limit — one aged checkpoint per address per ~10 ledgers of
-lead time. Revisit only if on-chain monitoring shows aged-Sybil farms
-accumulating (trigger, not TODO).
+---
 
 ## 4. Cross-references
 
