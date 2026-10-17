@@ -48,6 +48,13 @@ protocol on Stellar. Key highlights for users and integrators:
 
 ## [Unreleased]
 
+### Security
+
+- governance: enforce proposal lifecycle monotonicity via a single `transition_status` writer; terminal states are immutable (#999)
+- governance: central `assert_executable` invariant — no execution before `eta_ledger`; `eta_ledger` computed with `checked_add`; execution delay capped at 518,400 ledgers (#995)
+- governance: `set_execution_delay` no longer installs the first caller as admin before `initialize()` (#1005)
+- governance: fix test-build break in deposit settlement helpers (now `Result<bool, _>`) and pin vote-receipt TTL > voting window at compile time (#1002)
+
 ### Features
 
 - Wire full EURC token support into fund and pay instructions

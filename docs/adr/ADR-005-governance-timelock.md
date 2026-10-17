@@ -79,3 +79,30 @@ A timelock **must be introduced before the admin veto power is disabled**
   so leaves the protocol without any execution delay after full decentralisation.
 - The `TimelockNotExpired` error is reserved but unimplemented; contributors
   must not assume it is enforced.
+
+## Addendum (#995, #999, #1002, #1005): implemented timelock invariants
+
+The "reserved but unimplemented" wording above is superseded for the current
+`iln_governance` contract. `execute_proposal` is a two-step flow and
+`TimelockNotExpired` is enforced:
+
+1. Call 1 (`Active -> Passed`) sets `eta_ledger = ledger.sequence + ExecutionDelay`
+   (`checked_add`; overflow returns `InvalidTimelock`). `ExecutionDelay`
+   defaults to `0`, so default behaviour is unchanged.
+2. Call 2 (`Passed -> Executed`) goes through `assert_executable`, which fails
+   closed unless status is `Passed`, the voting window has closed **and**
+   `ledger.sequence >= eta_ledger`.
+
+Invariants (all covered by `contracts/iln_governance/src/test.rs`):
+
+| # | Invariant |
+|---|-----------|
+| I1 | A proposal is never `Executed` at a ledger below its `eta_ledger`. |
+| I2 | `eta_ledger` is frozen when the proposal becomes `Passed`; later `set_execution_delay` calls cannot shorten or extend it. |
+| I3 | Status only moves forward: `Active -> {Passed, Rejected, Vetoed}`, `Passed -> {Executed, Vetoed}`. `Rejected`, `Executed`, `Vetoed` are terminal. Enforced by the single writer `transition_status`. |
+| I4 | A vote receipt outlives the voting window (compile-time assertion), tallies are immutable once the window closes, and each deposit is settled exactly once (refund xor forfeit). |
+| I5 | `set_execution_delay` requires the stored admin's auth, fails with `NotInitialized` before `initialize()`, and rejects delays above 518,400 ledgers (~30 days). |
+
+Operational note: the delay is an admin-key parameter, not a governance-gated
+one. Moving it behind the ILN-contract authority is the remaining step before
+`disable_veto_power()` (see ADR-012).
