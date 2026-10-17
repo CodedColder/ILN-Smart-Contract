@@ -23,7 +23,7 @@ use access::{check_rate_limit, lock_reentrancy, unlock_reentrancy};
 pub mod constants;
 use constants::{
     ADMIN_CHANGE_COOLDOWN_LEDGERS, DEFAULT_RATE_LIMIT_LEDGERS, ECONOMIC_PARAM_COOLDOWN_LEDGERS,
-    QUEUE_DELAY_LEDGERS, UPGRADE_COOLDOWN_LEDGERS,
+    MAX_FEE_TIERS, QUEUE_DELAY_LEDGERS, UPGRADE_COOLDOWN_LEDGERS,
 };
 pub mod oracle_interface;
 pub mod oracle_registry;
@@ -1753,6 +1753,14 @@ pub fn get_storage_version(env: Env) -> u32 {
 /// Access: Admin only
 pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), ContractError> {
         require_admin(&env)?;
+        // Issue #1061: reject a tier configuration larger than the declared
+        // budget before it is stored. `effective_fee_rate` walks the whole list
+        // on every settlement, so this keeps `mark_paid`'s per-invocation cost
+        // bounded regardless of what governance supplies. Checked after
+        // `require_admin` so authorization still takes precedence.
+        if tiers.len() > MAX_FEE_TIERS {
+            return Err(ContractError::TooManyFeeTiers);
+        }
         check_rate_limit(&env, "update_fee_tiers", ECONOMIC_PARAM_COOLDOWN_LEDGERS)?;
         record_admin_action(&env, "update_fee_tiers");
         let admin = get_admin(&env).ok_or(ContractError::Unauthorized)?;
@@ -2417,8 +2425,13 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
     /// Can be called by anyone once at least one LP has joined the queue.
     ///
     /// **Optimization Note**: The queue is maintained in sorted order (descending score)
-    /// by `join_fund_queue`, so this operation is O(1) — just returning the first element.
-    /// Access: Anyone
+    /// by `join_fund_queue`, so the winning score is always at index 0. The cost is
+    /// O(tied_count) rather than O(1), however: Issue #708's fairness fix scans the
+    /// contiguous top-score prefix (`queue[0..tied_count]`) to pick uniformly among
+    /// ties. That loop is bounded by the queue length — worst case (every entry tied)
+    /// it reads all `MAX_FUND_QUEUE_LEN` entries — which the
+    /// `queue_resolution_tie_fanout` entry in `storage::RESOURCE_ENVELOPE` declares
+    /// and `tests_benchmarks.rs` measures (Issue #1058). Access: Anyone
     pub fn resolve_fund_queue(env: Env, invoice_id: u64) -> Result<Address, ContractError> {
         if !invoice_exists(&env, invoice_id) {
             return Err(ContractError::InvoiceNotFound);

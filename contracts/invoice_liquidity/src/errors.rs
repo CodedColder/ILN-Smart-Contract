@@ -198,4 +198,9 @@ pub enum ContractError {
     /// `MAX_IDENTITY_ORACLES_PER_FEED` (more agreement than the list can ever
     /// hold). A valid quorum is in `[1, MAX_IDENTITY_ORACLES_PER_FEED]`.
     InvalidIdentityQuorum = 80,
+    /// Issue #1061: `update_fee_tiers` rejected because the supplied tier list
+    /// exceeds `MAX_FEE_TIERS`. `effective_fee_rate` walks the whole tier list
+    /// on every settlement, so an unbounded list would make `mark_paid`'s
+    /// per-invocation cost unbounded. Bounding the list bounds that walk.
+    TooManyFeeTiers = 81,
 }

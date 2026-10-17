@@ -68,7 +68,7 @@ use soroban_sdk::{
 };
 use crate::access::ADMIN_ACTION_LOG_CAPACITY;
 use crate::constants::{
-    DEFAULT_RATE_LIMIT_LEDGERS, FUND_QUEUE_TTL_EXTEND_TO, FUND_QUEUE_TTL_THRESHOLD,
+    DEFAULT_RATE_LIMIT_LEDGERS, FUND_QUEUE_TTL_EXTEND_TO, FUND_QUEUE_TTL_THRESHOLD, MAX_FEE_TIERS,
     MAX_FUND_QUEUE_LEN, MAX_IDENTITY_ORACLES_PER_FEED, MAX_PRICE_SOURCES_PER_FEED,
     TOP_PAYERS_CAPACITY,
 };
@@ -891,6 +891,344 @@ fn benchmark_worst_case_queue_insertion() {
     for (label, cpu, mem) in &rows {
         std::println!("| {label} | {cpu} | {mem} |");
     }
+}
+
+// ================================================================
+// Issue #1058: bound queue resolution CPU cost
+// ================================================================
+//
+// `resolve_fund_queue` loads the queue, scans the contiguous top-score tie
+// prefix (`queue[0..tied_count]`, Issue #708's fair tie-break) to pick
+// uniformly among ties, then writes the resolution and extends its TTL. The
+// scan's length is the only part of that cost that varies with queue
+// *contents* — everything else is fixed by the 50-entry bound. This section
+// measures both extremes of the scan at the cap.
+//
+// **Before:** the #1062 `benchmark_resolve_fund_queue_at_max_queue_size`
+// resolved an all-tied full queue (its `setup_queue_of_len` gives every LP the
+// default score), which happens to be the maximum-fan-out case, but never
+// labelled it the worst case and never measured the fan-out-1 case — so the tie
+// scan's contribution to resolution cost was not isolated, and its bound was
+// not tied to any declared envelope entry.
+//
+// **After:** `benchmark_queue_resolution_cpu_cost_at_cap` measures resolution at
+// the cap for an all-tied queue (scan reads all `MAX_FUND_QUEUE_LEN` entries)
+// and a distinct-score queue (scan reads 1), printing both rows so the delta is
+// attributable to the tie scan. Both are bounded by the
+// `queue_resolution_tie_fanout` envelope entry (== `MAX_FUND_QUEUE_LEN`).
+
+#[test]
+fn benchmark_queue_resolution_cpu_cost_at_cap() {
+    // Worst case: every entry ties at the top score, so the tie scan reads the
+    // whole queue (fan-out == MAX_FUND_QUEUE_LEN) before selecting a winner.
+    let (tied, tied_id) = setup_queue_of_len(MAX_FUND_QUEUE_LEN);
+    advance_ledgers(&tied.env, QUEUE_DELAY_LEDGERS);
+    let tied_cost = measure(&tied.env, "resolve_fund_queue_all_tied_at_cap", || {
+        tied.contract.resolve_fund_queue(&tied_id);
+    });
+    assert_within_resource_budget(
+        "resolve_fund_queue_all_tied_at_cap",
+        tied_cost.0,
+        tied_cost.1,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+
+    // Best case: distinct descending scores, so the top-score prefix is a single
+    // entry (fan-out 1) and the scan stops immediately.
+    let distinct = setup_benchmark_env();
+    let distinct_id = setup_bench_queue_distinct(&distinct);
+    advance_ledgers(&distinct.env, QUEUE_DELAY_LEDGERS);
+    let distinct_cost = measure(&distinct.env, "resolve_fund_queue_distinct_at_cap", || {
+        distinct.contract.resolve_fund_queue(&distinct_id);
+    });
+    assert_within_resource_budget(
+        "resolve_fund_queue_distinct_at_cap",
+        distinct_cost.0,
+        distinct_cost.1,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+
+    std::println!(
+        "\n| Queue resolution at cap (Issue #1058) | Tie fan-out | CPU Instructions | Memory (bytes) |"
+    );
+    std::println!(
+        "| ------------------------------------- | ----------- | ---------------- | -------------- |"
+    );
+    std::println!(
+        "| resolve_fund_queue_all_tied_at_cap | {MAX_FUND_QUEUE_LEN} | {} | {} |",
+        tied_cost.0,
+        tied_cost.1
+    );
+    std::println!(
+        "| resolve_fund_queue_distinct_at_cap | 1 | {} | {} |",
+        distinct_cost.0,
+        distinct_cost.1
+    );
+}
+
+// ================================================================
+// Issue #1059: bound unresolved request storage growth
+// ================================================================
+//
+// An *unresolved* fund request retains its `DataKey::FundQueue(u64)` entry
+// (up to `MAX_FUND_QUEUE_LEN` `LpFundRequest` records) plus
+// `DataKey::FundQueueOpenedAt(u64)` in persistent storage; neither
+// `resolve_fund_queue` nor `cancel_invoice`/`expire_invoice` deletes them
+// (see `tests_storage.rs`'s `test_1059_*` suite), so the only thing that keeps
+// that retained footprint finite is the queue cap. Touching the retained entry
+// loads and re-serializes the whole vector, so a per-invocation measurement of
+// a full-queue join tracks the retained footprint directly.
+//
+// **Before:** `MAX_FUND_QUEUE_LEN` was declared only as a *live-length* bound
+// (`fund_queue_entries`), and nothing measured the *retained* footprint as
+// such — nor showed that churning a full unresolved queue cannot grow it.
+//
+// **After:** `benchmark_unresolved_queue_storage_footprint` drives one
+// unresolved queue to the cap and then churns it (repeated displacing joins,
+// each loading + rewriting the full retained vector) and resolves it, printing
+// the retained entry count at each step. The per-invocation cost stays flat at
+// the cap across churn — evidence the footprint is bounded by the cap, not by
+// join volume — and every step is asserted against the absolute ceilings. The
+// bound itself is declared as `unresolved_queue_retained_entries` in
+// `storage::RESOURCE_ENVELOPE`.
+
+#[test]
+fn benchmark_unresolved_queue_storage_footprint() {
+    let (bench, id) = setup_queue_of_len(MAX_FUND_QUEUE_LEN);
+
+    // A displacing join into the full queue loads the whole retained vector,
+    // rewrites it, then extends its TTL — so the measured cost is the cost of
+    // touching the retained footprint at its bound.
+    let mut rows: std::vec::Vec<(u32, u64, u64)> = std::vec::Vec::new();
+    for k in 0..3u32 {
+        let joiner = Address::generate(&bench.env);
+        set_lp_score_bench(&bench, &joiner, 100 + k);
+        let name = std::format!("unresolved_queue_churn_join_{k}");
+        let (cpu, mem) = measure(&bench.env, &name, || {
+            bench.contract.join_fund_queue(&joiner, &id);
+        });
+        assert_within_resource_budget(&name, cpu, mem, MAX_CPU_INSTRUCTIONS, MAX_MEMORY_BYTES);
+        rows.push((k, cpu, mem));
+    }
+
+    // Resolution touches the same retained footprint (loads it, scans the tie
+    // prefix, writes the resolution) and — per `test_1059_*` — leaves it in
+    // place, so it is the same bounded cost, not a drain.
+    advance_ledgers(&bench.env, QUEUE_DELAY_LEDGERS);
+    let (resolve_cpu, resolve_mem) = measure(&bench.env, "unresolved_queue_resolve_at_cap", || {
+        bench.contract.resolve_fund_queue(&id);
+    });
+    assert_within_resource_budget(
+        "unresolved_queue_resolve_at_cap",
+        resolve_cpu,
+        resolve_mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+
+    std::println!(
+        "\n| Retained unresolved-queue footprint (Issue #1059) | Retained entries | CPU Instructions | Memory (bytes) |"
+    );
+    std::println!(
+        "| ------------------------------------------------- | ---------------- | ---------------- | -------------- |"
+    );
+    for (k, cpu, mem) in &rows {
+        std::println!("| churn join #{k} (displacing, full queue) | {MAX_FUND_QUEUE_LEN} | {cpu} | {mem} |");
+    }
+    std::println!(
+        "| resolve after maturity | {MAX_FUND_QUEUE_LEN} | {resolve_cpu} | {resolve_mem} |"
+    );
+}
+
+// ================================================================
+// Issue #1060: test governance ledger-entry budget
+// ================================================================
+//
+// Every governance (admin) entry point appends to the `AdminActionLog(u32)`
+// ring buffer via `access::record_admin_action`, and `get_recent_admin_actions`
+// reads it back. The *stored* slots are bounded by `ADMIN_ACTION_LOG_CAPACITY`
+// (declared as `admin_action_log_entries`), but two per-invocation figures were
+// unmeasured: the *write* budget of a single governance action (does appending
+// into a full ring buffer stay O(1)?) and the *read* fan-out when a caller
+// passes an oversized `limit`.
+//
+// **Before:** the governance log's read-loop bound was neither declared nor
+// measured; a reader could pass `limit = u32::MAX` and nothing pinned the read
+// cost to the cap.
+//
+// **After:** `benchmark_governance_ledger_entry_budget` measures (a) a
+// governance action writing into an empty log vs. into a full one — showing the
+// per-action write budget is O(1) and flat, and (b) a `get_recent_admin_actions`
+// call with `limit = u32::MAX` — showing the read fan-out is clamped to
+// `ADMIN_ACTION_LOG_CAPACITY`. Every row is budget-checked. The bound itself is
+// declared as `governance_log_read_fanout` in `storage::RESOURCE_ENVELOPE`.
+
+#[test]
+fn benchmark_governance_ledger_entry_budget() {
+    // (a) Per-action ledger-entry write budget: first action into an empty log.
+    let bench_empty = setup_benchmark_env();
+    let write_empty = measure(
+        &bench_empty.env,
+        "governance_action_write_empty_log",
+        || {
+            bench_empty.env.as_contract(&bench_empty.contract.address, || {
+                crate::access::record_admin_action(&bench_empty.env, "gov");
+            });
+        },
+    );
+    assert_within_resource_budget(
+        "governance_action_write_empty_log",
+        write_empty.0,
+        write_empty.1,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+
+    // (a) Same action with the ring buffer already at its cap — still O(1).
+    let bench_full = setup_benchmark_env();
+    fill_admin_action_log(&bench_full);
+    let write_full = measure(&bench_full.env, "governance_action_write_full_log", || {
+        bench_full.env.as_contract(&bench_full.contract.address, || {
+            crate::access::record_admin_action(&bench_full.env, "gov");
+        });
+    });
+    assert_within_resource_budget(
+        "governance_action_write_full_log",
+        write_full.0,
+        write_full.1,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+
+    // (b) Read fan-out budget: an oversized `limit` is clamped to the cap, so a
+    // single read touches at most `ADMIN_ACTION_LOG_CAPACITY` ledger entries.
+    let read_oversized = measure(
+        &bench_full.env,
+        "governance_log_read_oversized_limit",
+        || {
+            let _ = bench_full.contract.get_recent_admin_actions(&u32::MAX);
+        },
+    );
+    assert_within_resource_budget(
+        "governance_log_read_oversized_limit",
+        read_oversized.0,
+        read_oversized.1,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+
+    std::println!(
+        "\n| Governance ledger-entry budget (Issue #1060) | Ledger entries | CPU Instructions | Memory (bytes) |"
+    );
+    std::println!(
+        "| -------------------------------------------- | -------------- | ---------------- | -------------- |"
+    );
+    std::println!(
+        "| action write, empty log (1st action) | 1 | {} | {} |",
+        write_empty.0,
+        write_empty.1
+    );
+    std::println!(
+        "| action write, full log (at cap) | 1 | {} | {} |",
+        write_full.0,
+        write_full.1
+    );
+    std::println!(
+        "| read with limit = u32::MAX (clamped) | {ADMIN_ACTION_LOG_CAPACITY} | {} | {} |",
+        read_oversized.0,
+        read_oversized.1
+    );
+}
+
+// ================================================================
+// Issue #1061: reject operations exceeding resource budgets
+// ================================================================
+//
+// `update_fee_tiers` stores a `Vec<(i128, u32)>` in `FeeTiers`, and
+// `effective_fee_rate` walks that whole list on every settlement. The list is
+// now bounded by `MAX_FEE_TIERS` (declared as the `fee_tiers_entries` envelope
+// entry), so this benchmark records the cost of the write at the cap and of the
+// settlement tier-walk at the cap, against a settlement with no tiers
+// configured.
+//
+// **Before:** the tier list was unbounded and neither the write nor the
+// settlement tier-walk was measured, so nothing pinned the cost of a
+// governance-controlled configuration to the settlement path.
+//
+// **After:** both are measured and asserted against the same absolute ceilings
+// as the rest of this file.
+
+/// Build a well-formed (ascending `min_amount`) fee-tier list of length `n`.
+fn bench_fee_tiers(bench: &BaseBenchEnv, n: u32) -> soroban_sdk::Vec<(i128, u32)> {
+    let mut tiers = soroban_sdk::Vec::new(&bench.env);
+    for i in 0..n {
+        tiers.push_back(((i as i128 + 1) * 1_000_000, 100 + i));
+    }
+    tiers
+}
+
+#[test]
+fn benchmark_fee_tier_budget() {
+    // (a) Write budget: store a full (cap-sized) tier list.
+    let write_bench = setup_benchmark_env();
+    let tiers = bench_fee_tiers(&write_bench, MAX_FEE_TIERS);
+    let (write_cpu, write_mem) = measure(&write_bench.env, "fee_tiers_write_at_cap", || {
+        let _ = write_bench.contract.update_fee_tiers(&tiers);
+    });
+    assert_within_resource_budget(
+        "fee_tiers_write_at_cap",
+        write_cpu,
+        write_mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+
+    // (b) Settlement with no tiers configured (baseline).
+    let no_tier = setup_benchmark_env();
+    let id_none = submit_invoice_bench(&no_tier);
+    let _ = no_tier
+        .contract
+        .fund_invoice(&no_tier.lp, &id_none, &BENCH_INVOICE_AMOUNT, &false);
+    let (cpu_none, mem_none) = measure(&no_tier.env, "settle_without_fee_tiers", || {
+        let _ = no_tier.contract.mark_paid(&id_none, &BENCH_INVOICE_AMOUNT);
+    });
+    assert_within_resource_budget(
+        "settle_without_fee_tiers",
+        cpu_none,
+        mem_none,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+
+    // (c) Settlement with the fee-tier list at its cap (worst-case walk).
+    let full = setup_benchmark_env();
+    let id_full = submit_invoice_bench(&full);
+    let _ = full
+        .contract
+        .fund_invoice(&full.lp, &id_full, &BENCH_INVOICE_AMOUNT, &false);
+    let _ = full
+        .contract
+        .update_fee_tiers(&bench_fee_tiers(&full, MAX_FEE_TIERS));
+    let (cpu_full, mem_full) = measure(&full.env, "settle_at_fee_tier_cap", || {
+        let _ = full.contract.mark_paid(&id_full, &BENCH_INVOICE_AMOUNT);
+    });
+    assert_within_resource_budget(
+        "settle_at_fee_tier_cap",
+        cpu_full,
+        mem_full,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+
+    std::println!(
+        "\n| Fee-tier budget (Issue #1061) | Tiers | CPU Instructions | Memory (bytes) |"
+    );
+    std::println!("| ---------------------------- | ----- | ---------------- | -------------- |");
+    std::println!("| update_fee_tiers write | {MAX_FEE_TIERS} | {write_cpu} | {write_mem} |");
+    std::println!("| settle, no tiers | 0 | {cpu_none} | {mem_none} |");
+    std::println!("| settle, tiers at cap | {MAX_FEE_TIERS} | {cpu_full} | {mem_full} |");
 }
 
 // ================================================================

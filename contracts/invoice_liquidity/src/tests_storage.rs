@@ -4,10 +4,10 @@ use super::*;
 use crate::access::ADMIN_ACTION_LOG_CAPACITY;
 use crate::config::Config;
 use crate::constants::{
-    DEFAULT_RATE_LIMIT_LEDGERS, FUND_QUEUE_TTL_EXTEND_TO, FUND_QUEUE_TTL_THRESHOLD,
-    MAX_FUND_QUEUE_LEN, MAX_IDENTITY_ORACLES_PER_FEED, MAX_PRICE_SOURCES_PER_FEED,
-    ROLLBACK_SAMPLE_SIZE, TOP_PAYERS_CAPACITY, TTL_MIN_LEDGERS_BEFORE_UPGRADE,
-    TTL_UPGRADE_SAMPLE_SIZE,
+    DEFAULT_LP_SCORE, DEFAULT_RATE_LIMIT_LEDGERS, FUND_QUEUE_TTL_EXTEND_TO,
+    FUND_QUEUE_TTL_THRESHOLD, MAX_FUND_QUEUE_LEN, MAX_IDENTITY_ORACLES_PER_FEED,
+    MAX_PRICE_SOURCES_PER_FEED, QUEUE_DELAY_LEDGERS, ROLLBACK_SAMPLE_SIZE, TOP_PAYERS_CAPACITY,
+    TTL_MIN_LEDGERS_BEFORE_UPGRADE, TTL_UPGRADE_SAMPLE_SIZE,
 };
 use crate::invoice::InvoiceStatus;
 use crate::oracle_registry::OracleFeedType;
@@ -704,6 +704,383 @@ fn test_1057_displacing_insert_does_not_reset_queue_opened_at() {
 }
 
 // ================================================================
+// Issue #1058 — bound queue resolution CPU cost
+// ================================================================
+//
+// **Before:** `resolve_fund_queue` is not the O(1) operation its "Optimization
+// Note" claimed. Issue #708's fairness fix added a scan of the contiguous
+// top-score tie prefix (`queue[0..tied_count]`) so ties are broken uniformly at
+// random instead of by join order, making resolution read O(tied_count)
+// entries — worst case (every entry tied) the whole queue. Nothing declared or
+// measured that loop's bound: the #1065 resource envelope declares *stored
+// collections*, not this per-invocation loop, and the #1062 benchmark resolved
+// an all-tied full queue only incidentally (its LPs all carry the default
+// score) without labelling it the worst case or contrasting it against a queue
+// with no ties at all.
+//
+// **After:** the tie-scan bound is declared in `storage::RESOURCE_ENVELOPE`
+// (`queue_resolution_tie_fanout` → `MAX_FUND_QUEUE_LEN`) and asserted here; the
+// resolution outcomes (all-tied vs unique top score, idempotency, empty queue,
+// maturity boundary, permissionless call) are pinned; and
+// `tests_benchmarks.rs`'s `benchmark_queue_resolution_cpu_cost_at_cap` measures
+// both extremes (all-tied = max fan-out, distinct = fan-out 1) against the
+// absolute ceilings.
+
+/// Advance the ledger past the maturity delay (#MEV-1) and resolve `id`'s fund
+/// queue, returning the winning LP.
+fn resolve_after_delay(t: &TestEnv, id: u64) -> Address {
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    t.contract.resolve_fund_queue(&id)
+}
+
+// ── Success: the winner is chosen from the top-score prefix ────────────────
+
+#[test]
+fn test_1058_full_all_tied_queue_resolves_to_a_tied_member() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+
+    // Every LP carries the default score, so the top-score prefix is the whole
+    // queue — the maximum tie fan-out the resolution loop can face.
+    fill_fund_queue_to_max(&t, id);
+    let entries = queue_entries(&t, id);
+    assert_eq!(entries.len() as u32, MAX_FUND_QUEUE_LEN);
+    assert!(
+        entries.iter().all(|(_, s)| *s == DEFAULT_LP_SCORE),
+        "the fixture must produce an all-tied queue"
+    );
+
+    let winner = resolve_after_delay(&t, id);
+    assert!(
+        entries.iter().any(|(lp, _)| *lp == winner),
+        "an all-tied queue must resolve to one of its tied members"
+    );
+}
+
+#[test]
+fn test_1058_full_distinct_queue_resolves_to_the_unique_top_score() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+
+    // Distinct, strictly descending scores → the top-score prefix is a single
+    // entry (fan-out 1), so resolution is deterministic.
+    let lps = fill_fund_queue_distinct_descending(&t, id);
+    let expected_top = lps[0].clone();
+
+    assert_eq!(resolve_after_delay(&t, id), expected_top);
+}
+
+#[test]
+fn test_1058_resolution_is_idempotent() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    fill_fund_queue_to_max(&t, id);
+
+    let first = resolve_after_delay(&t, id);
+    // A second call returns the already-recorded winner (no re-selection, no
+    // further scan) rather than resolving afresh.
+    assert_eq!(t.contract.resolve_fund_queue(&id), first);
+}
+
+// ── Failure: no queue, and not-yet-mature, both fail closed ────────────────
+
+#[test]
+fn test_1058_empty_queue_resolution_fails_not_funded() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+
+    let res = t.contract.try_resolve_fund_queue(&id);
+    assert_eq!(res, Err(Ok(ContractError::NotFunded)));
+}
+
+// ── Ledger boundary: the maturity delay is exact ───────────────────────────
+
+#[test]
+fn test_1058_resolution_maturity_ledger_boundary() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let lp = Address::generate(&t.env);
+    t.contract.join_fund_queue(&lp, &id);
+
+    // One ledger short of the delay: fail closed.
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS - 1);
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotMature))
+    );
+
+    // Exactly at the boundary: resolves to the sole LP.
+    advance_ledgers(&t.env, 1);
+    assert_eq!(t.contract.resolve_fund_queue(&id), lp);
+}
+
+// ── Authorization: resolution is permissionless ────────────────────────────
+
+#[test]
+fn test_1058_resolution_is_permissionless() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let lp = Address::generate(&t.env);
+    t.contract.join_fund_queue(&lp, &id);
+
+    // Resolution guards no privileged action, so with every authorization
+    // stripped it still succeeds — anyone may trigger it.
+    t.env.mock_auths(&[]);
+    assert_eq!(resolve_after_delay(&t, id), lp);
+}
+
+// ── Bound: the tie-scan loop equals the declared envelope cap ──────────────
+
+#[test]
+fn test_1058_tie_fanout_bounded_by_declared_envelope() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+
+    let declared = envelope_cap("queue_resolution_tie_fanout")
+        .expect("the resolution tie-scan bound must be declared");
+    assert_eq!(declared, MAX_FUND_QUEUE_LEN);
+
+    // Worst case for the loop: a full queue whose every entry ties at the top
+    // score, so the scan reads all `declared` entries — never more.
+    fill_fund_queue_to_max(&t, id);
+    let entries = queue_entries(&t, id);
+    let fanout = entries
+        .iter()
+        .take_while(|(_, s)| *s == DEFAULT_LP_SCORE)
+        .count() as u32;
+    assert_eq!(
+        fanout, declared,
+        "the maximum tie fan-out must equal the declared loop bound"
+    );
+}
+
+// ================================================================
+// Issue #1059 — bound unresolved request storage growth
+// ================================================================
+//
+// **Before:** an unresolved fund request's on-chain footprint is the
+// `DataKey::FundQueue(u64)` entry (up to `MAX_FUND_QUEUE_LEN` `LpFundRequest`
+// records) plus `DataKey::FundQueueOpenedAt(u64)`. Nothing removes either key
+// on the terminal paths: `resolve_fund_queue` writes a `QueueResolution`, and
+// `cancel_invoice`/`expire_invoice` only rewrite the invoice — none of them
+// deletes the queue. The retained footprint therefore only ever shrinks via
+// TTL expiry, yet `docs/audit-evidence-remediation-map.md` §3 claimed "queues
+// drain as invoices resolve, are funded or are cancelled". The live queue is
+// capped (`MAX_FUND_QUEUE_LEN = 50`, Issues #1091/#1095), but that cap was
+// declared only as a *live-length* bound (`fund_queue_entries` in
+// `storage::RESOURCE_ENVELOPE`), never as the *retained* bound it actually is,
+// and nothing measured or pinned the retention.
+//
+// **After:** the retained unresolved-queue footprint is declared as its own
+// envelope entry (`unresolved_queue_retained_entries` → `MAX_FUND_QUEUE_LEN`)
+// and asserted here; the tests below prove the retained `FundQueue` entry can
+// never exceed that cap (success), that a full queue rejects rather than grows
+// (failure), that an unauthorized join cannot inflate it (authorization), and
+// that resolution/cancellation at the maturity ledger boundary retain — not
+// drain — the entry (ledger boundary). The footprint cost at the bound is
+// measured in `tests_benchmarks.rs`
+// (`benchmark_unresolved_queue_storage_footprint`).
+
+/// Whether a `QueueResolution` has been recorded for `id`.
+fn queue_resolution_present(t: &TestEnv, id: u64) -> bool {
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .has(&StorageKey::QueueResolution(id))
+    })
+}
+
+// ── Success: the retained footprint sits at the declared cap ───────────────
+
+#[test]
+fn test_1059_unresolved_queue_retained_footprint_is_capped() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+
+    fill_fund_queue_to_max(&t, id);
+
+    let declared = envelope_cap("unresolved_queue_retained_entries")
+        .expect("the retained unresolved-queue bound must be declared");
+    assert_eq!(
+        declared, MAX_FUND_QUEUE_LEN,
+        "the retention bound must reference the enforcing queue cap"
+    );
+    assert!(
+        fund_queue_present(&t, id),
+        "an unresolved queue must be retained on-chain"
+    );
+    assert_eq!(
+        fund_queue_len(&t, id),
+        declared,
+        "the retained footprint must sit exactly at the declared cap"
+    );
+}
+
+#[test]
+fn test_1059_retained_footprint_does_not_grow_under_churn() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    fill_fund_queue_distinct_descending(&t, id);
+
+    // Repeated displacing joins (each strictly outscores the whole queue) keep
+    // the entry at the cap — growth is bounded by the cap, not by churn.
+    for k in 0..5u32 {
+        let joiner = Address::generate(&t.env);
+        set_lp_score_direct(&t, &joiner, 200 + k);
+        t.contract.join_fund_queue(&joiner, &id);
+        assert_eq!(
+            fund_queue_len(&t, id),
+            MAX_FUND_QUEUE_LEN,
+            "churn must never push the retained footprint past the cap"
+        );
+    }
+}
+
+#[test]
+fn test_1059_resolution_does_not_drain_the_retained_footprint() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    fill_fund_queue_to_max(&t, id);
+
+    let _winner = resolve_after_delay(&t, id);
+
+    // Resolution records the winner but leaves the queue in place: the
+    // footprint is retained (TTL-reclaimed), not drained.
+    assert!(
+        queue_resolution_present(&t, id),
+        "resolution must record a QueueResolution"
+    );
+    assert!(
+        fund_queue_present(&t, id),
+        "resolve_fund_queue must not delete the retained fund queue"
+    );
+    assert_eq!(
+        fund_queue_len(&t, id),
+        MAX_FUND_QUEUE_LEN,
+        "resolution must leave the retained footprint at the cap"
+    );
+}
+
+#[test]
+fn test_1059_cancellation_does_not_drain_the_retained_footprint() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    fill_fund_queue_to_max(&t, id);
+
+    t.contract.cancel_invoice(&id);
+
+    assert!(
+        fund_queue_present(&t, id),
+        "cancel_invoice must not delete the retained fund queue"
+    );
+    assert_eq!(
+        fund_queue_len(&t, id),
+        MAX_FUND_QUEUE_LEN,
+        "cancellation must leave the retained footprint at the cap"
+    );
+}
+
+// ── Failure: a full queue rejects rather than grows ────────────────────────
+
+#[test]
+fn test_1059_full_queue_rejects_beyond_the_bound_without_growth() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    fill_fund_queue_distinct_descending(&t, id);
+    let before = queue_entries(&t, id);
+
+    // Equal-to-tail score cannot displace, so the join must be rejected.
+    let joiner = Address::generate(&t.env);
+    set_lp_score_direct(&t, &joiner, before.last().unwrap().1);
+    assert_eq!(
+        t.contract.try_join_fund_queue(&joiner, &id),
+        Err(Ok(ContractError::QueueFull))
+    );
+
+    let after = queue_entries(&t, id);
+    assert_eq!(
+        after.len() as u32,
+        MAX_FUND_QUEUE_LEN,
+        "a rejected join must not grow the retained footprint"
+    );
+    assert_eq!(
+        after[0].0, before[0].0,
+        "a rejected join must leave the retained queue untouched"
+    );
+    assert_eq!(
+        after.last().unwrap().0,
+        before.last().unwrap().0,
+        "a rejected join must not displace the tail"
+    );
+}
+
+#[test]
+fn test_1059_rejoin_of_an_existing_lp_is_rejected_without_growth() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let lp = Address::generate(&t.env);
+    t.contract.join_fund_queue(&lp, &id);
+    assert_eq!(fund_queue_len(&t, id), 1);
+
+    // A duplicate join is rejected, so a single LP cannot inflate the retained
+    // footprint by re-joining.
+    assert_eq!(
+        t.contract.try_join_fund_queue(&lp, &id),
+        Err(Ok(ContractError::AlreadyInQueue))
+    );
+    assert_eq!(fund_queue_len(&t, id), 1);
+}
+
+// ── Authorization: an unauthorized join cannot grow the footprint ──────────
+
+#[test]
+fn test_1059_join_requires_lp_auth_so_footprint_cannot_be_inflated() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+
+    let lp = Address::generate(&t.env);
+    // Strip all authorization so `require_lp` -> `lp.require_auth()` fails.
+    t.env.mock_auths(&[]);
+
+    assert!(
+        t.contract.try_join_fund_queue(&lp, &id).is_err(),
+        "an unauthorized join must fail"
+    );
+    assert!(
+        !fund_queue_present(&t, id),
+        "an unauthorized join must not create retained storage"
+    );
+    assert_eq!(fund_queue_len(&t, id), 0);
+}
+
+// ── Ledger boundary: retention survives the maturity boundary ──────────────
+
+#[test]
+fn test_1059_retention_survives_the_maturity_boundary() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let lp = Address::generate(&t.env);
+    t.contract.join_fund_queue(&lp, &id);
+
+    // One ledger short of the maturity delay: fail closed, entry retained.
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS - 1);
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotMature))
+    );
+    assert!(fund_queue_present(&t, id));
+    assert_eq!(fund_queue_len(&t, id), 1);
+
+    // Exactly at the boundary: resolves, but the entry is still retained.
+    advance_ledgers(&t.env, 1);
+    assert_eq!(t.contract.resolve_fund_queue(&id), lp);
+    assert!(fund_queue_present(&t, id));
+    assert_eq!(fund_queue_len(&t, id), 1);
+}
+
+// ================================================================
 // Issue #1063 — stress concurrent invoice settlements
 // ================================================================
 //
@@ -1287,6 +1664,16 @@ fn envelope_cap(name: &str) -> Option<u32> {
 fn test_resource_envelope_declares_every_bounded_collection() {
     assert_eq!(envelope_cap("fund_queue_entries"), Some(MAX_FUND_QUEUE_LEN));
     assert_eq!(
+        envelope_cap("queue_resolution_tie_fanout"),
+        Some(MAX_FUND_QUEUE_LEN),
+        "the resolution tie-scan loop is bounded by the same queue cap (Issue #1058)"
+    );
+    assert_eq!(
+        envelope_cap("unresolved_queue_retained_entries"),
+        Some(MAX_FUND_QUEUE_LEN),
+        "the retained unresolved-queue footprint is bounded by the same queue cap (Issue #1059)"
+    );
+    assert_eq!(
         envelope_cap("price_sources_per_feed"),
         Some(MAX_PRICE_SOURCES_PER_FEED)
     );
@@ -1295,8 +1682,18 @@ fn test_resource_envelope_declares_every_bounded_collection() {
         Some(MAX_IDENTITY_ORACLES_PER_FEED)
     );
     assert_eq!(
+        envelope_cap("fee_tiers_entries"),
+        Some(MAX_FEE_TIERS),
+        "the fee-tier list is bounded by MAX_FEE_TIERS (Issue #1061)"
+    );
+    assert_eq!(
         envelope_cap("admin_action_log_entries"),
         Some(ADMIN_ACTION_LOG_CAPACITY)
+    );
+    assert_eq!(
+        envelope_cap("governance_log_read_fanout"),
+        Some(ADMIN_ACTION_LOG_CAPACITY),
+        "the governance-log read loop is bounded by the same log cap (Issue #1060)"
     );
     assert_eq!(
         envelope_cap("top_payers_entries"),
@@ -1387,5 +1784,390 @@ fn test_envelope_cap_holds_even_with_all_auths() {
             .get_price_sources(&OracleFeedType::Price)
             .len(),
         envelope_cap("price_sources_per_feed").unwrap()
+    );
+}
+
+// ================================================================
+// Issue #1060 — test governance ledger-entry budget
+// ================================================================
+//
+// # Before / after
+//
+// **Before:** every governance (admin) entry point calls
+// `access::record_admin_action`, which appends to the `AdminActionLog(u32)`
+// ring buffer. The *stored* slots were bounded by `ADMIN_ACTION_LOG_CAPACITY`
+// (declared as `admin_action_log_entries` in `storage::RESOURCE_ENVELOPE`), but
+// two things were untested and one was undeclared: (1) nothing proved the
+// retained slot count actually saturates at the cap however many governance
+// actions execute, (2) nothing proved the caller-supplied `limit` on
+// `get_recent_admin_actions` is clamped so a single read cannot fan out past
+// the cap, and (3) the *read loop* bound — `get_recent_admin_actions` touches
+// at most one ledger entry per retained slot — was not declared as a
+// per-invocation budget, even though a caller can pass an arbitrarily large
+// `limit`.
+//
+// **After:** the governance audit log's ledger-entry budget is declared as the
+// `governance_log_read_fanout` entry in `storage::RESOURCE_ENVELOPE` (referencing
+// `access::ADMIN_ACTION_LOG_CAPACITY`) and pinned by the tests below: the
+// retained slot count saturates at exactly the cap and never grows with action
+// volume; the read fan-out is clamped to the cap no matter how large a `limit`
+// is passed; reads are newest-first; the wrap-boundary window is correct;
+// records capture the ledger sequence across a ledger boundary; and an
+// unauthorized caller consumes none of the budget. The per-action write and the
+// clamped read cost are measured in `tests_benchmarks.rs`
+// (`benchmark_governance_ledger_entry_budget`).
+
+/// Append `n` synthetic governance actions to the admin-action ring buffer,
+/// exactly as a governance entry point would via `access::record_admin_action`.
+fn record_governance_actions(t: &TestEnv, n: u32) {
+    t.env.as_contract(&t.contract.address, || {
+        for _ in 0..n {
+            crate::access::record_admin_action(&t.env, "gov");
+        }
+    });
+}
+
+/// Whether the ring-buffer slot `slot` currently holds a record.
+fn admin_log_slot_present(t: &TestEnv, slot: u32) -> bool {
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .has(&StorageKey::AdminActionLog(slot))
+    })
+}
+
+/// The number of `AdminActionLog(u32)` ledger entries currently retained. This
+/// is the governance ledger-entry budget actually consumed — it must never
+/// exceed `ADMIN_ACTION_LOG_CAPACITY` however many actions have executed.
+fn admin_log_retained_slots(t: &TestEnv) -> u32 {
+    let mut present = 0;
+    for slot in 0..ADMIN_ACTION_LOG_CAPACITY {
+        if admin_log_slot_present(t, slot) {
+            present += 1;
+        }
+    }
+    present
+}
+
+/// The monotonic total action count (`AdminActionCount`), which grows without
+/// bound even though the retained slots do not.
+fn admin_action_count(t: &TestEnv) -> u64 {
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .instance()
+            .get::<StorageKey, u64>(&StorageKey::AdminActionCount)
+            .unwrap_or(0)
+    })
+}
+
+// ── Success: the per-action write budget and the retained-slot budget ──────
+
+#[test]
+fn test_1060_one_governance_action_spends_exactly_one_log_entry() {
+    let t = setup();
+    assert_eq!(admin_log_retained_slots(&t), 0, "log starts empty");
+
+    record_governance_actions(&t, 1);
+
+    assert_eq!(
+        admin_log_retained_slots(&t),
+        1,
+        "one governance action writes exactly one retained log entry"
+    );
+    assert_eq!(admin_action_count(&t), 1);
+    let log = t.contract.get_recent_admin_actions(&1);
+    assert_eq!(log.len(), 1);
+    assert_eq!(log.get(0).unwrap().seq, 0);
+}
+
+#[test]
+fn test_1060_retained_log_entries_saturate_at_the_declared_budget() {
+    let t = setup();
+    let cap = ADMIN_ACTION_LOG_CAPACITY;
+
+    // Exactly at the budget: `cap` actions, `cap` retained entries.
+    record_governance_actions(&t, cap);
+    assert_eq!(admin_log_retained_slots(&t), cap);
+    assert_eq!(admin_action_count(&t), cap as u64);
+
+    // Past the budget: 25 more actions overwrite the oldest slots, so the
+    // retained count stays pinned at the cap — it never grows with volume.
+    record_governance_actions(&t, 25);
+    assert_eq!(
+        admin_log_retained_slots(&t),
+        cap,
+        "the governance log's ledger-entry budget must not grow past the cap"
+    );
+    assert_eq!(admin_action_count(&t), (cap + 25) as u64);
+}
+
+#[test]
+fn test_1060_read_returns_newest_first_within_the_budget() {
+    let t = setup();
+    record_governance_actions(&t, 5);
+
+    let log = t.contract.get_recent_admin_actions(&5);
+    assert_eq!(log.len(), 5);
+    for i in 0..5u32 {
+        assert_eq!(
+            log.get(i).unwrap().seq,
+            (4 - i) as u64,
+            "entries must be newest-first"
+        );
+    }
+}
+
+#[test]
+fn test_1060_records_capture_the_ledger_sequence_across_a_boundary() {
+    let t = setup();
+
+    record_governance_actions(&t, 1);
+    advance_ledgers(&t.env, DEFAULT_RATE_LIMIT_LEDGERS as u32);
+    record_governance_actions(&t, 1);
+
+    let log = t.contract.get_recent_admin_actions(&2);
+    let newest = log.get(0).unwrap();
+    let oldest = log.get(1).unwrap();
+    assert_eq!(newest.seq, 1);
+    assert_eq!(oldest.seq, 0);
+    assert!(
+        newest.ledger > oldest.ledger,
+        "records recorded across a ledger boundary must carry the distinct ledger sequences"
+    );
+}
+
+// ── Failure: the read fan-out is clamped to the budget ─────────────────────
+
+#[test]
+fn test_1060_read_fanout_is_clamped_to_the_budget() {
+    let t = setup();
+    // Fill the log and then wrap it, so `total` exceeds the cap.
+    record_governance_actions(&t, ADMIN_ACTION_LOG_CAPACITY + 3);
+
+    // An oversized `limit` cannot make a single read touch more than the cap.
+    let oversized = t.contract.get_recent_admin_actions(&u32::MAX);
+    assert_eq!(
+        oversized.len(),
+        ADMIN_ACTION_LOG_CAPACITY,
+        "a read must never fan out past the declared budget, whatever `limit` is passed"
+    );
+
+    // A limit just above the cap is clamped identically.
+    let just_over = t.contract.get_recent_admin_actions(&(ADMIN_ACTION_LOG_CAPACITY + 10));
+    assert_eq!(just_over.len(), ADMIN_ACTION_LOG_CAPACITY);
+
+    // A limit below the cap is honoured exactly (no over-read).
+    let small = t.contract.get_recent_admin_actions(&7);
+    assert_eq!(small.len(), 7);
+}
+
+#[test]
+fn test_1060_wrap_boundary_window_is_correct() {
+    let t = setup();
+    let cap = ADMIN_ACTION_LOG_CAPACITY;
+
+    // One past the budget: seq 0's slot has been overwritten by seq `cap`, so
+    // the full window runs `cap` down to 1 (seq 0 is gone).
+    record_governance_actions(&t, cap + 1);
+
+    let log = t.contract.get_recent_admin_actions(&cap);
+    assert_eq!(log.len(), cap);
+    assert_eq!(log.get(0).unwrap().seq, cap as u64, "newest is seq = cap");
+    assert_eq!(
+        log.get(cap - 1).unwrap().seq,
+        1,
+        "the oldest surviving entry is seq 1 — seq 0's slot was overwritten"
+    );
+}
+
+#[test]
+fn test_1060_empty_log_reads_nothing_and_spends_no_budget() {
+    let t = setup();
+
+    let log = t.contract.get_recent_admin_actions(&ADMIN_ACTION_LOG_CAPACITY);
+    assert_eq!(log.len(), 0, "an empty log returns nothing");
+    assert_eq!(admin_log_retained_slots(&t), 0);
+    assert_eq!(admin_action_count(&t), 0);
+}
+
+// ── Authorization: an unauthorized caller spends no budget ─────────────────
+
+#[test]
+fn test_1060_unauthorized_governance_action_consumes_no_budget() {
+    let t = setup();
+    // Strip all authorization: the admin-gated entry point must fail, and a
+    // failed governance action must not append to the audit log.
+    t.env.mock_auths(&[]);
+
+    assert!(
+        t.contract.try_update_fee_rate(&100).is_err(),
+        "an unauthorized governance action must fail"
+    );
+    assert_eq!(
+        admin_log_retained_slots(&t),
+        0,
+        "a rejected governance action must consume none of the ledger-entry budget"
+    );
+    assert_eq!(admin_action_count(&t), 0);
+}
+
+// ================================================================
+// Issue #1061 — reject operations exceeding resource budgets
+// ================================================================
+//
+// # Before / after
+//
+// **Before:** `update_fee_tiers` stored an arbitrary-length `Vec<(i128, u32)>`
+// in `StorageKey::FeeTiers` and `effective_fee_rate` walked that whole vector
+// on every settlement (`mark_paid`) to find the applicable bracket. Nothing
+// bounded the list, and it was not declared in `storage::RESOURCE_ENVELOPE`, so
+// an unbounded tier configuration made the per-invocation cost of an
+// *unrelated* entry point — settlement — unbounded: governance (or a
+// compromised admin key) could grow the list until `mark_paid` exceeded
+// Soroban's per-transaction resource limits and settlement failed for every
+// invoice.
+//
+// **After:** the tier list is bounded by `constants::MAX_FEE_TIERS`, declared
+// as the `fee_tiers_entries` entry in `storage::RESOURCE_ENVELOPE`, and
+// `update_fee_tiers` rejects a configuration larger than the budget with
+// `TooManyFeeTiers` (checked after `require_admin`, before the rate-limit
+// gate). The tests below pin the boundary (exactly at the budget is accepted,
+// one over is rejected without overwriting the stored configuration),
+// authorization, error precedence, and the rate-limit ledger boundary, and
+// prove a full tier list still settles. The cost of the write and of the
+// settlement tier-walk at the cap is measured in `tests_benchmarks.rs`
+// (`benchmark_fee_tier_budget`).
+
+/// Build a well-formed (ascending `min_amount`) fee-tier list of length `n`.
+fn fee_tiers(t: &TestEnv, n: u32) -> soroban_sdk::Vec<(i128, u32)> {
+    let mut tiers = soroban_sdk::Vec::new(&t.env);
+    for i in 0..n {
+        tiers.push_back(((i as i128 + 1) * 1_000_000, 100 + i));
+    }
+    tiers
+}
+
+// ── Success / boundary: exactly at the budget is accepted ──────────────────
+
+#[test]
+fn test_1061_fee_tiers_at_the_declared_budget_are_accepted() {
+    let t = setup();
+    let cap = MAX_FEE_TIERS;
+
+    t.contract.update_fee_tiers(&fee_tiers(&t, cap));
+
+    assert_eq!(
+        t.contract.get_fee_tiers().len(),
+        cap,
+        "a configuration exactly at the declared budget must be accepted and stored"
+    );
+}
+
+// ── Failure / boundary: one over the budget is rejected ────────────────────
+
+#[test]
+fn test_1061_fee_tiers_one_over_the_budget_are_rejected() {
+    let t = setup();
+    let cap = MAX_FEE_TIERS;
+
+    // Seed a valid configuration so a rejected write can be shown to leave it
+    // intact.
+    t.contract.update_fee_tiers(&fee_tiers(&t, 3));
+    assert_eq!(t.contract.get_fee_tiers().len(), 3);
+
+    assert_eq!(
+        t.contract.try_update_fee_tiers(&fee_tiers(&t, cap + 1)),
+        Err(Ok(ContractError::TooManyFeeTiers)),
+        "a tier list one over the declared budget must be rejected"
+    );
+    assert_eq!(
+        t.contract.get_fee_tiers().len(),
+        3,
+        "a rejected configuration must not overwrite the stored tiers"
+    );
+}
+
+// ── Authorization: a non-admin cannot reach the write ──────────────────────
+
+#[test]
+fn test_1061_unauthorized_write_consumes_no_config() {
+    let t = setup();
+    t.env.mock_auths(&[]);
+
+    assert!(
+        t.contract.try_update_fee_tiers(&fee_tiers(&t, 3)).is_err(),
+        "a non-admin caller must not be able to write the fee tiers"
+    );
+    assert_eq!(
+        t.contract.get_fee_tiers().len(),
+        0,
+        "an unauthorized governance action must not store a configuration"
+    );
+}
+
+// ── Error precedence: the budget check runs before the rate limit ──────────
+
+#[test]
+fn test_1061_budget_check_precedes_the_rate_limit() {
+    let t = setup();
+
+    // A valid write consumes the rate-limit window.
+    t.contract.update_fee_tiers(&fee_tiers(&t, 2));
+
+    // Within the cooldown a *valid* write is rate-limited...
+    assert_eq!(
+        t.contract.try_update_fee_tiers(&fee_tiers(&t, 2)),
+        Err(Ok(ContractError::RateLimited))
+    );
+
+    // ...but an oversized write is still reported as `TooManyFeeTiers`, because
+    // structural validation precedes the state-affecting rate-limit gate.
+    assert_eq!(
+        t.contract.try_update_fee_tiers(&fee_tiers(&t, MAX_FEE_TIERS + 1)),
+        Err(Ok(ContractError::TooManyFeeTiers))
+    );
+}
+
+// ── Ledger boundary: the rate-limit budget reopens at the exact cooldown ────
+
+#[test]
+fn test_1061_rate_limit_reopens_across_the_ledger_boundary() {
+    let t = setup();
+
+    t.contract.update_fee_tiers(&fee_tiers(&t, 2));
+
+    // One ledger short of the economic-parameter cooldown: still rate-limited.
+    advance_ledgers(&t.env, ECONOMIC_PARAM_COOLDOWN_LEDGERS as u32 - 1);
+    assert_eq!(
+        t.contract.try_update_fee_tiers(&fee_tiers(&t, 2)),
+        Err(Ok(ContractError::RateLimited))
+    );
+
+    // Exactly at the boundary: the next valid configuration is accepted.
+    advance_ledgers(&t.env, 1);
+    t.contract.update_fee_tiers(&fee_tiers(&t, 3));
+    assert_eq!(t.contract.get_fee_tiers().len(), 3);
+}
+
+// ── Success on the hot path: a full tier list still settles ────────────────
+
+#[test]
+fn test_1061_settlement_tier_walk_is_bounded_at_the_cap() {
+    let t = setup();
+
+    // A full tier list must not break the settlement path it feeds.
+    t.contract.update_fee_tiers(&fee_tiers(&t, MAX_FEE_TIERS));
+
+    let id = submit_standard_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &false);
+    t.contract.mark_paid(&id, &INVOICE_AMOUNT);
+
+    assert_eq!(
+        t.contract.get_invoice(&id).status,
+        InvoiceStatus::Paid,
+        "settlement must still succeed with the fee-tier list at its declared budget"
     );
 }

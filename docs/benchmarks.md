@@ -256,6 +256,204 @@ the command above and add the printed `BENCHMARK` values to
 `contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
 entries.
 
+## Queue resolution CPU cost (Issue #1058)
+
+`resolve_fund_queue` loads the queue, then scans the contiguous top-score tie
+prefix (`queue[0..tied_count]`) to pick uniformly at random among ties (Issue
+#708's fairness fix), then writes the resolution and extends its TTL. The tie
+scan is the only part of the cost that varies with queue *contents*; the rest is
+fixed by the 50-entry bound.
+
+**Before:** `resolve_fund_queue`'s doc comment advertised it as O(1), and the
+#1062 benchmark resolved an all-tied full queue — its `setup_queue_of_len` gives
+every LP the default score, which is in fact the maximum-fan-out case — but it
+was never *labelled* the worst case, and the fan-out-1 case was never measured,
+so the tie scan's contribution to resolution cost was neither isolated nor tied
+to a declared bound.
+
+**After:** `contracts/invoice_liquidity/src/tests_benchmarks.rs` adds
+`benchmark_queue_resolution_cpu_cost_at_cap`, which resolves a full queue at
+both extremes of the tie scan and asserts each against the same absolute
+ceilings as the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | Tie fan-out | What it measures |
+| ---------------------------- | ----------- | ---------------- |
+| `resolve_fund_queue_all_tied_at_cap` | 50 (`MAX_FUND_QUEUE_LEN`) | worst case — every entry ties at the top score, so the scan reads the whole queue |
+| `resolve_fund_queue_distinct_at_cap` | 1 | best case — distinct descending scores, top-score prefix is a single entry |
+
+The finding: the two rows are close — the tie scan is a handful of cheap
+in-memory `Vec` reads beside the queue load and the resolution write + TTL
+extension, so removing it would not move the needle; the bound that matters is
+`MAX_FUND_QUEUE_LEN`, which caps the scan (it can never read more than the queue
+holds). That cap is declared as the `queue_resolution_tie_fanout` entry in
+`storage::RESOURCE_ENVELOPE` (see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)),
+and the resolution-outcome behaviour (all-tied vs unique top score, idempotency,
+empty queue, the exact maturity boundary, and permissionless invocation) lives in
+`tests_storage.rs` (`test_1058_*`).
+
+Run it with:
+
+```bash
+cd contracts/invoice_liquidity
+cargo test --target x86_64-unknown-linux-gnu benchmark_queue_resolution_cpu_cost_at_cap -- --nocapture
+```
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, error code, or baseline format changed. To record these as a tracked
+baseline, run the command above and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Retained unresolved-queue footprint (Issue #1059)
+
+An *unresolved* fund request retains its `FundQueue(u64)` entry (up to
+`MAX_FUND_QUEUE_LEN` `LpFundRequest` records) plus `FundQueueOpenedAt(u64)` in
+persistent storage. None of the terminal paths delete those keys —
+`resolve_fund_queue` writes a `QueueResolution`, and `cancel_invoice` /
+`expire_invoice` only rewrite the invoice — so the retained footprint is
+bounded by the queue cap and reclaimed only by TTL expiry. Touching the
+retained entry loads and re-serializes the whole vector, so a per-invocation
+measurement of a full-queue join tracks the retained footprint directly.
+
+**Before:** `MAX_FUND_QUEUE_LEN` was declared only as a *live-length* bound
+(`fund_queue_entries` in `storage::RESOURCE_ENVELOPE`); nothing declared or
+measured the *retained* footprint as such, and nothing showed that churning a
+full unresolved queue cannot grow it.
+
+**After:** `contracts/invoice_liquidity/src/tests_benchmarks.rs` adds
+`benchmark_unresolved_queue_storage_footprint`, which drives one unresolved
+queue to the cap and then churns it (repeated displacing joins, each loading +
+rewriting the full retained vector) and resolves it, asserting every step
+against the same absolute ceilings as the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | Retained entries | What it measures |
+| ---------------------------- | ---------------- | ---------------- |
+| `unresolved_queue_churn_join_0..2` | 50 (`MAX_FUND_QUEUE_LEN`) | repeated displacing joins into the full unresolved queue — each loads + rewrites the entire retained vector |
+| `unresolved_queue_resolve_at_cap` | 50 (`MAX_FUND_QUEUE_LEN`) | resolution at the cap (load + tie scan + resolution write) — leaves the retained vector in place |
+
+The finding: the per-invocation cost stays flat at the cap across churn — the
+footprint is bounded by `MAX_FUND_QUEUE_LEN`, not by join volume. That
+retention bound is declared as the `unresolved_queue_retained_entries` entry in
+`storage::RESOURCE_ENVELOPE` (see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)),
+and the retention behaviour (no growth under churn, rejection at the bound,
+unauthorized joins cannot inflate it, and retention across the maturity
+boundary) lives in `tests_storage.rs` (`test_1059_*`).
+
+Run it with:
+
+```bash
+cd contracts/invoice_liquidity
+cargo test --target x86_64-unknown-linux-gnu benchmark_unresolved_queue_storage_footprint -- --nocapture
+```
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, error code, or baseline format changed. To record these as a tracked
+baseline, run the command above and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Governance ledger-entry budget (Issue #1060)
+
+Every governance (admin) entry point appends to the `AdminActionLog(u32)` ring
+buffer via `access::record_admin_action`, and `get_recent_admin_actions` reads it
+back. The *stored* slots are bounded by `ADMIN_ACTION_LOG_CAPACITY` (declared as
+`admin_action_log_entries`), but two per-invocation figures were unmeasured: the
+*write* budget of a single governance action, and the *read* fan-out when a
+caller passes an oversized `limit`.
+
+**Before:** the governance log's read-loop bound was neither declared nor
+measured, so nothing pinned the read cost to the cap when the caller passes an
+arbitrary `limit`.
+
+**After:** `contracts/invoice_liquidity/src/tests_benchmarks.rs` adds
+`benchmark_governance_ledger_entry_budget`, which records the per-action write
+cost into an empty vs. a full ring buffer and the read cost with an oversized
+`limit`, asserting every row against the same absolute ceilings as the rest of
+the file:
+
+| Benchmark (`BENCHMARK` name) | Ledger entries | What it measures |
+| ---------------------------- | -------------- | ---------------- |
+| `governance_action_write_empty_log` | 1 | a governance action appending to an empty log — the per-action write budget |
+| `governance_action_write_full_log` | 1 | the same action with the ring buffer already at its cap — appending stays O(1) |
+| `governance_log_read_oversized_limit` | 50 (`ADMIN_ACTION_LOG_CAPACITY`) | `get_recent_admin_actions(u32::MAX)` — the caller-supplied `limit` is clamped, so the read fan-out cannot exceed the cap |
+
+The finding: a governance action's write cost is flat (O(1)) whether the log is
+empty or full, and a read with `limit = u32::MAX` costs the same as one at the
+cap — the ledger-entry budget is bounded by `ADMIN_ACTION_LOG_CAPACITY`, not by
+the caller. That read-loop bound is declared as the `governance_log_read_fanout`
+entry in `storage::RESOURCE_ENVELOPE` (see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)),
+and the budget behaviour (retained-slot saturation, clamped fan-out, newest-first
+order, wrap window, ledger-sequence capture, and authorization) lives in
+`tests_storage.rs` (`test_1060_*`).
+
+Run it with:
+
+```bash
+cd contracts/invoice_liquidity
+cargo test --target x86_64-unknown-linux-gnu benchmark_governance_ledger_entry_budget -- --nocapture
+```
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, error code, or baseline format changed. To record these as a tracked
+baseline, run the command above and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Fee-tier budget (Issue #1061)
+
+`update_fee_tiers` stores a `Vec<(i128, u32)>` in `FeeTiers`, and
+`effective_fee_rate` walks the **whole** vector backwards on every settlement
+(`mark_paid`) to find the applicable bracket. Because the tier list was
+unbounded, its length — not any fixed constant — determined the per-invocation
+cost of the settlement path.
+
+**Before:** `update_fee_tiers` accepted an arbitrary-length tier list, so a
+governance configuration (or a compromised admin key) could grow `FeeTiers`
+until `mark_paid` exceeded Soroban's per-transaction resource limits and the
+settlement path failed for *every* invoice. Nothing declared or measured the
+tier-walk bound.
+
+**After:** `update_fee_tiers` rejects a list larger than `MAX_FEE_TIERS` (20)
+with `TooManyFeeTiers` (81) *before* storing it, and the cap is declared as the
+`fee_tiers_entries` entry in `storage::RESOURCE_ENVELOPE`.
+`contracts/invoice_liquidity/src/tests_benchmarks.rs` adds
+`benchmark_fee_tier_budget`, which measures the config write at the cap and the
+worst-case settlement tier walk, asserting every row against the same absolute
+ceilings as the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | Tiers | What it measures |
+| ---------------------------- | ----- | ---------------- |
+| `fee_tiers_write_at_cap` | 20 (`MAX_FEE_TIERS`) | `update_fee_tiers` storing a cap-sized schedule — the config write budget |
+| `settle_without_fee_tiers` | 0 | settlement baseline with no schedule configured |
+| `settle_at_fee_tier_cap` | 20 (`MAX_FEE_TIERS`) | worst-case `mark_paid` tier walk over a full schedule |
+
+The finding: the settlement tier walk is bounded because the list can never
+exceed the cap; `update_fee_tiers` returns `TooManyFeeTiers` for anything larger.
+The bound is declared as the `fee_tiers_entries` entry in
+`storage::RESOURCE_ENVELOPE` (see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)),
+and the budget behaviour (at-cap accepted, cap+1 rejected with the stored list
+unchanged, authorization precedence, rate-limit interaction, and the
+ledger-boundary cooldown) lives in `tests_storage.rs` (`test_1061_*`).
+
+Run it with:
+
+```bash
+cd contracts/invoice_liquidity
+cargo test --target x86_64-unknown-linux-gnu benchmark_fee_tier_budget -- --nocapture
+```
+
+**Migration note:** behaviour addition — `update_fee_tiers` now rejects a list
+larger than 20 with `TooManyFeeTiers` (81). No existing valid configuration is
+affected (a piecewise schedule needs only a handful of brackets); no storage
+layout or baseline format changed. To record these as a tracked baseline, run
+the command above and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
 ## Concurrent settlement stress (Issue #1063)
 
 Settlement (`mark_paid`) is the contract's highest-value entry point, and it

@@ -291,6 +291,74 @@ until the queue has been open long enough) is written on the **first** join only
 latecomer cannot reset the open-at ledger and push the resolution gate back.
 `test_1057_displacing_insert_does_not_reset_queue_opened_at` guards this.
 
+**Queue-resolution cost bound (Issue #1058):** `resolve_fund_queue`'s cost is not
+O(1) — Issue #708's fair tie-break scans the contiguous top-score prefix
+(`queue[0..tied_count]`) before selecting, so resolution reads O(tied_count)
+entries. That loop is bounded by the queue length (worst case: every entry tied
+at the top score reads all `MAX_FUND_QUEUE_LEN` entries), and it is now declared
+as the `queue_resolution_tie_fanout` entry in `storage::RESOURCE_ENVELOPE` so the
+bound cannot silently drift. A caller cannot inflate the scan beyond the cap,
+because the cap is exactly what bounds the queue it scans; the two extremes
+(all-tied vs distinct scores) are measured in
+`benchmark_queue_resolution_cpu_cost_at_cap`.
+
+**Unresolved-request storage bound (Issue #1059):** an unresolved fund request
+retains `FundQueue(u64)` (up to `MAX_FUND_QUEUE_LEN` `LpFundRequest` records) plus
+`FundQueueOpenedAt(u64)` in persistent storage, and **no terminal path deletes
+them** — `resolve_fund_queue` writes a `QueueResolution` but leaves the queue,
+and `cancel_invoice`/`expire_invoice` only rewrite the invoice. The keys are
+reclaimed only by TTL expiry. The storage-growth vector is therefore bounded by
+the queue cap, not by how many times LPs join: a full queue rejects further joins
+(`QueueFull`) rather than growing, a duplicate re-join is rejected
+(`AlreadyInQueue`), and `require_lp`'s `lp.require_auth()` means an unauthorized
+caller cannot write the entry at all — so no one can inflate an unresolved
+request's retained footprint past `MAX_FUND_QUEUE_LEN`. That retention bound is
+declared as the `unresolved_queue_retained_entries` entry in
+`storage::RESOURCE_ENVELOPE` so it cannot silently drift, and the footprint cost
+at the bound is measured in `benchmark_unresolved_queue_storage_footprint`. Note
+this corrects a prior doc claim that unresolved queues "drain" on resolution:
+they do not, so storage sizing must assume the footprint is retained at the cap
+until TTL expiry.
+
+**Governance ledger-entry budget (Issue #1060):** the governance audit log
+(`AdminActionLog(u32)`, written by `access::record_admin_action` on every admin
+entry point and read by `get_recent_admin_actions`) is a ring buffer of fixed
+`ADMIN_ACTION_LOG_CAPACITY` (50) slots. Two per-invocation cost vectors were
+neither declared nor measured. First, the **write**: a governance action stays
+O(1) — the ring buffer overwrites slot `seq % CAPACITY` in place and only the
+monotonic `AdminActionCount` grows, so repeated actions cannot fan out the write
+budget. Second, the **read**: `get_recent_admin_actions(limit)` clamps the
+caller-supplied `limit` to the cap and to the retained total, so a caller passing
+`u32::MAX` cannot make the read scan more than the cap's worth of ledger entries.
+That read-loop bound is now declared as the `governance_log_read_fanout` entry in
+`storage::RESOURCE_ENVELOPE` (referencing the same constant as the stored-slots
+bound `admin_action_log_entries`), so it cannot silently drift, and both the
+per-action write and the oversized-`limit` read are measured in
+`benchmark_governance_ledger_entry_budget`. An unauthorized caller still fails at
+`require_admin`'s `require_auth` before any write, so it cannot spend the budget
+at all; `tests_storage.rs` (`test_1060_*`) pins the saturation, clamping,
+ordering, wrap-boundary, empty-log, and authorization cases.
+
+**Fee-tier configuration bound (Issue #1061):** `update_fee_tiers` stores a
+`Vec<(i128, u32)>` in `FeeTiers`, and `effective_fee_rate` walks the **whole**
+list (backwards) on every settlement (`mark_paid`) to find the applicable
+bracket. Because the list was unbounded, its length — not any fixed constant —
+set the per-invocation cost of the contract's highest-value entry point. A
+compromised admin key (or a mistaken configuration) could grow the list until
+`mark_paid` exceeded Soroban's per-transaction resource limits, denying
+settlement for *every* invoice — a governance-triggered denial of service on the
+settlement path. The vector is now bounded at the source: `update_fee_tiers`
+rejects a list larger than `MAX_FEE_TIERS` (20) with `TooManyFeeTiers` (81)
+*before* storing it, so the tier walk is bounded by a fixed constant. The guard
+runs after `require_admin` (an unauthorized caller still fails at
+`require_auth` before anything is written, so it cannot bypass the check or spend
+the rate-limit window) and before `check_rate_limit` (a rejected oversized config
+consumes no state). The bound is declared as the `fee_tiers_entries` entry in
+`storage::RESOURCE_ENVELOPE` so it cannot silently drift, and both the config
+write at the cap and the worst-case settlement tier walk are measured in
+`benchmark_fee_tier_budget`; `tests_storage.rs` (`test_1061_*`) pins the at-cap
+acceptance, cap+1 rejection, authorization precedence, and ledger-boundary cases.
+
 **Clarification — post-resolution transfer is NOT a fairness bypass (Issue #712):**
 `transfer_lp_position()` lets a funded invoice's LP hand their position to any
 other address, with no check against funding-queue history. This means a

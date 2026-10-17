@@ -1175,6 +1175,165 @@ See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#20-b
 and [`benchmarks.md`](benchmarks.md) (§ Worst-case queue insertion) for the
 before/after detail and the run command.
 
+## Queue Resolution CPU Bound (Issue #1058)
+
+This change **declares, benchmarks, and regression-tests** the queue-resolution
+tie scan — it does **not** change any code path, so there is nothing to migrate:
+
+- **No behaviour, storage, or error-code change.** `resolve_fund_queue` still
+  fails closed on an empty queue (`NotFunded`) and before maturity
+  (`QueueNotMature`), scans the contiguous top-score prefix to pick uniformly
+  among ties (Issue #708), records an idempotent winner, and requires no
+  authorization. No storage key, value encoding, error code, event, entry-point
+  signature, or TTL constant is touched, so **no storage migration is required**
+  and a plain `upgrade()` of an already-deployed contract is unaffected.
+- **One new envelope entry.** `storage::RESOURCE_ENVELOPE` gains
+  `queue_resolution_tie_fanout` → `constants::MAX_FUND_QUEUE_LEN`, declaring the
+  per-invocation loop bound (the entry is declarative — it references the
+  enforcing constant, it is not new state). The #1065 drift test asserts the
+  declared cap equals that constant.
+- **Corrected doc comment.** `resolve_fund_queue`'s "Optimization Note" no
+  longer claims O(1); it documents the O(tied_count) tie scan and its bound.
+- **New benchmark.** `benchmark_queue_resolution_cpu_cost_at_cap` measures the
+  two extremes of the scan at the cap (all-tied = fan-out 50; distinct =
+  fan-out 1); see [`benchmarks.md`](benchmarks.md) (§ Queue resolution CPU cost).
+- **New regression suite.** `tests_storage.rs`'s `test_1058_*` (7 cases) pins the
+  resolution outcomes, the exact maturity boundary, permissionless invocation,
+  and the declared-cap ↔ max-fan-out equality.
+
+**No rollout steps and no rollback caveat** — nothing is deployed or persisted.
+See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#21-bound-queue-resolution-cpu-cost-issue-1058),
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+and [`benchmarks.md`](benchmarks.md) (§ Queue resolution CPU cost) for the
+before/after detail.
+
+## Retained Unresolved-Queue Footprint Bound (Issue #1059)
+
+This change **declares, measures, and regression-tests** the retained footprint
+of an unresolved fund request — it does **not** change any code path, so there
+is nothing to migrate:
+
+- **No behaviour, storage, or error-code change.** `resolve_fund_queue`,
+  `cancel_invoice`, and `expire_invoice` still leave the `FundQueue` /
+  `FundQueueOpenedAt` keys in place (they are reclaimed by TTL only); joins and
+  re-joins are still bounded by `MAX_FUND_QUEUE_LEN` and fail with
+  `QueueFull`/`AlreadyInQueue`. No storage key, value encoding, error code,
+  event, entry-point signature, or TTL constant is touched, so **no storage
+  migration is required** and a plain `upgrade()` of an already-deployed
+  contract is unaffected.
+- **One new envelope entry.** `storage::RESOURCE_ENVELOPE` gains
+  `unresolved_queue_retained_entries` → `constants::MAX_FUND_QUEUE_LEN`,
+  declaring the retention bound (the entry is declarative — it references the
+  enforcing constant, it is not new state). The #1065 drift test asserts the
+  declared cap equals that constant.
+- **New benchmark.** `benchmark_unresolved_queue_storage_footprint` churns a
+  full unresolved queue (repeated displacing joins) and resolves it at the cap,
+  showing the per-invocation cost stays flat; see
+  [`benchmarks.md`](benchmarks.md) (§ Retained unresolved-queue footprint).
+- **New regression suite.** `tests_storage.rs`'s `test_1059_*` (7 cases) pins the
+  retained footprint at the cap, that churn cannot grow it, that resolution and
+  cancellation do not drain it, the rejection-at-the-bound path, and
+  authorization.
+- **Documentation correction.** §3's claim that "queues drain as invoices
+  resolve, are funded or are cancelled" is corrected — the keys are reclaimed by
+  TTL only.
+
+**Operator note:** sizing persistent storage should assume an unresolved
+request's footprint is *retained at the cap until TTL expiry*, not freed on
+resolution or cancellation.
+
+**No rollout steps and no rollback caveat** — nothing is deployed or persisted.
+See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#22-bound-unresolved-request-storage-growth-issue-1059),
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+and [`benchmarks.md`](benchmarks.md) (§ Retained unresolved-queue footprint) for
+the before/after detail.
+
+## Governance Ledger-Entry Budget (Issue #1060)
+
+This change **declares, measures, and regression-tests** the per-invocation
+ledger-entry budget of the governance (admin) audit log — it does **not** change
+any code path, so there is nothing to migrate:
+
+- **No behaviour, storage, or error-code change.** `record_admin_action` still
+  writes slot `seq % ADMIN_ACTION_LOG_CAPACITY` and bumps the monotonic
+  `AdminActionCount`; `get_recent_admin_actions` still clamps the caller's
+  `limit` to the cap and the retained total and reads newest-first; an
+  unauthorized caller still fails before any write. No storage key, value
+  encoding, error code, event, entry-point signature, or TTL constant is
+  touched, so **no storage migration is required** and a plain `upgrade()` of an
+  already-deployed contract is unaffected.
+- **One new envelope entry.** `storage::RESOURCE_ENVELOPE` gains
+  `governance_log_read_fanout` → `access::ADMIN_ACTION_LOG_CAPACITY`, declaring
+  the per-invocation read-loop bound over the log's stored slots (the entry is
+  declarative — it references the enforcing constant, it is not new state). The
+  #1065 drift test asserts the declared cap equals that constant.
+- **New benchmark.** `benchmark_governance_ledger_entry_budget` records the
+  per-action write cost into an empty vs. a full ring buffer and the read cost
+  with an oversized `limit`, showing the write is flat (O(1)) and the read is
+  clamped to the cap; see [`benchmarks.md`](benchmarks.md) (§ Governance
+  ledger-entry budget).
+- **New regression suite.** `tests_storage.rs`'s `test_1060_*` (8 cases) pins
+  one-slot-per-action, retained-slot saturation at the declared budget,
+  newest-first order within the budget, ledger-sequence capture across a
+  boundary, oversized-`limit` clamping, the wrap-boundary window, the empty-log
+  case, and authorization.
+
+**Operator note:** a single `get_recent_admin_actions` consumes at most
+`ADMIN_ACTION_LOG_CAPACITY` (50) ledger entries regardless of the `limit`
+supplied; the read fan-out is bounded by the cap, not by the caller.
+
+**No rollout steps and no rollback caveat** — nothing is deployed or persisted.
+See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#23-test-governance-ledger-entry-budget-issue-1060),
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+and [`benchmarks.md`](benchmarks.md) (§ Governance ledger-entry budget) for the
+before/after detail.
+
+## Fee-Tier Budget (Issue #1061)
+
+This change **adds one rejection path** to `update_fee_tiers` so the settlement
+tier walk stays within a fixed budget — it does **not** change any storage key,
+value encoding, or existing valid configuration, so there is nothing to
+migrate:
+
+- **One behaviour addition.** `update_fee_tiers` now returns `TooManyFeeTiers`
+  (code 81) when the supplied `Vec<(i128, u32)>` exceeds `MAX_FEE_TIERS` (20),
+  *before* storing it. The check runs after `require_admin` (authorization
+  precedence) and before `check_rate_limit` (so a rejected config neither
+  consumes the rate-limit window nor writes state). `effective_fee_rate` still
+  walks the stored list backwards and applies the first bracket whose
+  `min_amount <= invoice_amount`; the default schedule, `FeeTiers` encoding,
+  `ECONOMIC_PARAM_COOLDOWN_LEDGERS`, and `record_admin_action` are untouched —
+  so **no storage migration is required** and a plain `upgrade()` of an
+  already-deployed contract is unaffected.
+- **One new error code.** `TooManyFeeTiers = 81` — see
+  [`error-codes.md`](error-codes.md). No client breaks on the existing codes.
+- **One new envelope entry.** `storage::RESOURCE_ENVELOPE` gains
+  `fee_tiers_entries` → `constants::MAX_FEE_TIERS`, declaring the settlement
+  tier-walk bound (the entry is declarative — it references the enforcing
+  constant, it is not new state). The #1065 drift test asserts the declared cap
+  equals that constant.
+- **New benchmark.** `benchmark_fee_tier_budget` measures the config write at the
+  cap and the worst-case settlement tier walk (`mark_paid`), showing the walk is
+  bounded; see [`benchmarks.md`](benchmarks.md) (§ Fee-tier budget).
+- **New regression suite.** `tests_storage.rs`'s `test_1061_*` (6 cases) pins
+  at-cap acceptance, cap+1 rejection with the stored list unchanged,
+  authorization precedence, the length-check-before-rate-limit ordering, the
+  ledger-boundary cooldown, and settlement with a cap-sized schedule.
+
+**Operator note:** keep the fee schedule at or below 20 brackets. An existing
+deployment whose stored `FeeTiers` already satisfies the cap behaves
+identically; a schedule that somehow exceeds it (only reachable by an admin
+before this change) still settles correctly but cannot be *extended* until it is
+reduced to the cap.
+
+**No rollout steps and no rollback caveat** — the change is a constant, one error
+code, one guard, and a declarative envelope entry; nothing is persisted
+differently. See
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#24-reject-operations-exceeding-resource-budgets-issue-1061),
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+and [`benchmarks.md`](benchmarks.md) (§ Fee-tier budget) for the before/after
+detail.
+
 ---
 
 **Document Prepared By:** DevOps & Security Team  

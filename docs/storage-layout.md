@@ -348,8 +348,11 @@ hand-written literal):
 | Envelope name | Backing key | Cap (enforcing constant) |
 | ------------- | ----------- | ------------------------ |
 | `fund_queue_entries` | `FundQueue(u64)` | `constants::MAX_FUND_QUEUE_LEN` (50) |
+| `queue_resolution_tie_fanout` | `FundQueue(u64)` (tie-scan loop) | `constants::MAX_FUND_QUEUE_LEN` (50) |
+| `unresolved_queue_retained_entries` | `FundQueue(u64)` (retained) | `constants::MAX_FUND_QUEUE_LEN` (50) |
 | `price_sources_per_feed` | `PriceSources(OracleFeedType)` | `constants::MAX_PRICE_SOURCES_PER_FEED` (20) |
 | `identity_oracles_per_feed` | `IdentityOracles(OracleFeedType)` | `constants::MAX_IDENTITY_ORACLES_PER_FEED` (20) |
+| `fee_tiers_entries` | `FeeTiers` (tier-walk loop) | `constants::MAX_FEE_TIERS` (20) |
 | `admin_action_log_entries` | `AdminActionLog(u32)` | `access::ADMIN_ACTION_LOG_CAPACITY` (50) |
 | `top_payers_entries` | `TopPayersHeap` | `constants::TOP_PAYERS_CAPACITY` (50) |
 | `twap_samples_per_feed_token` | `TwapSamples(feed, token)` | `twap::MAX_TWAP_SAMPLES` (100) |
@@ -365,6 +368,50 @@ confirms an admin with full auth cannot exceed a declared cap. The read-side cos
 of the largest bounded collections *at* their caps is measured and budget-checked
 in `tests_benchmarks.rs` (`benchmark_envelope_read_views_at_cap`; see
 [`benchmarks.md`](benchmarks.md#safe-resource-envelope-read-cost-issue-1065)).
+
+The envelope declares *bounded per-invocation loops* as well as stored
+collections. `queue_resolution_tie_fanout` is one: `resolve_fund_queue` scans the
+contiguous top-score tie prefix of `FundQueue(u64)` to break ties uniformly at
+random (Issue #708), so its worst case — every entry tied at the top score —
+reads the whole queue and is capped by the same `MAX_FUND_QUEUE_LEN`. That loop
+bound is asserted in `tests_storage.rs` (`test_1058_*`) and its two extremes
+(all-tied vs distinct scores) are measured in `tests_benchmarks.rs`
+(`benchmark_queue_resolution_cpu_cost_at_cap`; see
+[`benchmarks.md`](benchmarks.md#queue-resolution-cpu-cost-issue-1058)).
+
+The envelope also distinguishes a collection's *live* length from its *retained*
+footprint. `unresolved_queue_retained_entries` is a retention bound:
+`FundQueue(u64)` (and `FundQueueOpenedAt(u64)`) are **not** deleted by
+`resolve_fund_queue`, `cancel_invoice`, or `expire_invoice` — resolution merely
+adds a `QueueResolution(u64)`, and the terminal invoice paths only rewrite the
+invoice. The keys are reclaimed only when their TTL lapses. So an unresolved
+request's on-chain footprint stays at the cap until TTL expiry, and its
+per-invocation touch cost stays flat there — asserted in `tests_storage.rs`
+(`test_1059_*`) and measured in `tests_benchmarks.rs`
+(`benchmark_unresolved_queue_storage_footprint`; see
+[`benchmarks.md`](benchmarks.md#retained-unresolved-queue-footprint-issue-1059)).
+
+The envelope also declares the settlement tier-walk. `fee_tiers_entries` bounds
+`FeeTiers`, the `Vec<(i128, u32)>` that `effective_fee_rate` walks in full on
+every settlement (`mark_paid`) to find the applicable bracket. `update_fee_tiers`
+rejects a list larger than `MAX_FEE_TIERS` with `TooManyFeeTiers` (Issue #1061),
+so the per-settlement walk cost is bounded by that constant rather than by
+whatever governance stored. The bound is asserted in `tests_storage.rs`
+(`test_1061_*`) and the at-cap write plus the worst-case settlement walk are
+measured in `tests_benchmarks.rs` (`benchmark_fee_tier_budget`; see
+[`benchmarks.md`](benchmarks.md#fee-tier-budget-issue-1061)).
+
+Finally, the envelope declares the read-side loop of the governance audit log.
+`admin_action_log_entries` bounds the *stored slots* of `AdminActionLog(u32)`;
+`governance_log_read_fanout` bounds the *per-invocation read loop* over those
+slots. `access::get_recent_admin_actions(limit)` clamps the caller-supplied
+`limit` to `ADMIN_ACTION_LOG_CAPACITY`, so a read consumes at most that many
+ledger entries however large a `limit` the caller passes — the fan-out is capped
+by the same constant, not by the caller. The bound is asserted in
+`tests_storage.rs` (`test_1060_*`) and both the per-action write budget and the
+oversized-`limit` read are measured in `tests_benchmarks.rs`
+(`benchmark_governance_ledger_entry_budget`; see
+[`benchmarks.md`](benchmarks.md#governance-ledger-entry-budget-issue-1060)).
 
 **Migration note:** documentation/measurement-only — no storage key, value
 encoding, TTL constant, or contract behavior changed. No migration is required.

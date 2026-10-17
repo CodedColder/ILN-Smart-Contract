@@ -106,7 +106,7 @@ eligibility when `fund_invoice` is called with `require_oracle_verification = tr
 | `update_max_discount` | Admin | Updates the maximum allowed discount rate (rate-limited: ~30min) |
 | `update_decay_params` | Admin | Updates reputation decay rate and period |
 | `set_distribution_contract` | Admin | Updates the distribution contract address (rate-limited: ~10min) |
-| `update_fee_tiers` | Admin | Updates tiered fee structure for invoices by size |
+| `update_fee_tiers` | Admin | Updates tiered fee structure for invoices by size (max `MAX_FEE_TIERS` = 20 brackets; oversized lists return `TooManyFeeTiers`, Issue #1061) |
 | `get_fee_tiers` | Anyone | Reads the current tiered fee configuration |
 | `set_min_payer_reputation` | Admin | Sets minimum payer reputation threshold (rate-limited: ~30min) |
 | `add_token` | Admin | Adds a supported token to the protocol (rate-limited: ~10min) |
@@ -552,3 +552,25 @@ independent of the per-action events (`AdminChanged`, `ParameterUpdated`, `Token
   and is not a substitute for the unbounded event log — it is a cheap on-chain
   "recent activity" view layered on top of it. Long-horizon audit trails should still be
   built from indexed events (see [event-types.md](event-types.md)).
+- **Ledger-entry budget (Issue #1060)**: both per-invocation costs of the log are bounded
+  by the same `ADMIN_ACTION_LOG_CAPACITY = 50` constant. The *write* stays O(1) — an
+  action overwrites slot `seq % ADMIN_ACTION_LOG_CAPACITY` in place and only the monotonic
+  `AdminActionCount` grows, so the log never grows past its cap. The *read* clamps the
+  caller-supplied `limit` to the cap and the retained total, so `get_recent_admin_actions`
+  consumes at most 50 ledger entries even when called with `limit = u32::MAX` — the
+  fan-out is bounded by the cap, not by the caller. The read-loop bound is declared as the
+  `governance_log_read_fanout` entry in `storage::RESOURCE_ENVELOPE` (alongside the
+  stored-slots bound `admin_action_log_entries`) and both costs are measured in
+  `benchmark_governance_ledger_entry_budget`; see
+  [storage-layout.md](storage-layout.md#the-safe-resource-envelope-issue-1065) and
+  [benchmarks.md](benchmarks.md) (§ Governance ledger-entry budget).
+- **Fee-tier configuration bound (Issue #1061)**: `update_fee_tiers` only accepts a
+  schedule of at most `MAX_FEE_TIERS = 20` brackets, returning `TooManyFeeTiers` (81)
+  otherwise. `effective_fee_rate` walks the whole stored list on every settlement
+  (`mark_paid`), so bounding the list at its source bounds the settlement tier-walk cost.
+  The length check runs after `require_admin` (authorization precedence) and before the
+  economic-parameter rate limit (a rejected config consumes no rate-limit window and
+  writes no state). The bound is declared as the `fee_tiers_entries` entry in
+  `storage::RESOURCE_ENVELOPE` and measured in `benchmark_fee_tier_budget`; see
+  [storage-layout.md](storage-layout.md#the-safe-resource-envelope-issue-1065) and
+  [benchmarks.md](benchmarks.md) (§ Fee-tier budget).

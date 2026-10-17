@@ -113,6 +113,23 @@ pub const MAX_PRICE_SOURCES_PER_FEED: u32 = 20;
 /// [`MAX_PRICE_SOURCES_PER_FEED`] and sits well above any realistic quorum.
 pub const MAX_IDENTITY_ORACLES_PER_FEED: u32 = 20;
 
+/// Issue #1061: maximum number of fee tiers that `update_fee_tiers` may store.
+///
+/// `update_fee_tiers` wrote an arbitrary-length `Vec<(i128, u32)>` into
+/// `StorageKey::FeeTiers`, and `effective_fee_rate` walks the *whole* vector on
+/// every settlement (`mark_paid`) to find the applicable bracket. An unbounded
+/// tier list therefore makes the per-invocation cost of an unrelated entry
+/// point — settlement — unbounded: governance (or a compromised admin key)
+/// could grow the list until `mark_paid` exceeds Soroban's per-transaction
+/// resource limits and the settlement path fails for *every* invoice.
+///
+/// Rejecting a configuration larger than this cap keeps the settlement
+/// tier-walk within a fixed, measurable budget. A piecewise fee schedule needs
+/// only a handful of brackets, so the cap sits well above any realistic
+/// configuration while mirroring the other per-entity list caps
+/// ([`MAX_PRICE_SOURCES_PER_FEED`], [`MAX_IDENTITY_ORACLES_PER_FEED`]).
+pub const MAX_FEE_TIERS: u32 = 20;
+
 /// Issue #1082: number of the most-recent invoice IDs to sample during the
 /// pre-upgrade TTL check.  Bounded to cap the resource cost of the check;
 /// the most-recently-written invoices are the most likely to still be

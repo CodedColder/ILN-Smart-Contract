@@ -48,8 +48,12 @@ definitions. Decimals rollout/migration is documented in
 
 **Queues already above 50.** Existing oversized queues are not truncated.
 New joins to such a queue are rejected unless they outscore the tail (then the
-tail is displaced and the length stays the same). Queues drain as invoices
-resolve, are funded or are cancelled.
+tail is displaced and the length stays the same). Queues are **not** drained by
+resolution, funding, or cancellation: `resolve_fund_queue` writes a
+`QueueResolution` but leaves `FundQueue`/`FundQueueOpenedAt` in place, and the
+terminal invoice paths only rewrite the invoice — the keys are reclaimed only
+when their TTL lapses (see §22 and
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)).
 
 **Recovery / rollback.** Reverting the Wasm restores prior behaviour with no
 data migration, because no state was rewritten.
@@ -746,3 +750,181 @@ no operator action, keeper step, reconfiguration, or data backfill is needed.
 See [`benchmarks.md`](benchmarks.md) (§ Worst-case queue insertion) for the
 run command and the head/middle/tail/reject table, and §5 above for the
 retention-cost baseline this section complements.
+
+## 21. Bound queue resolution CPU cost (Issue #1058)
+
+Follow-up to §5 (Issue #1062) and companion to §20 (#1057): the *insertion*
+side of the queue is now bounded and swept, but the *resolution* side's cost had
+a stale claim and an undeclared bound. `resolve_fund_queue`'s doc comment still
+advertised it as O(1); Issue #708's fairness fix had already added a scan of the
+contiguous top-score tie prefix (`queue[0..tied_count]`) to pick uniformly among
+ties, making it O(tied_count) — worst case, every entry tied, the whole queue.
+That loop's bound was neither declared in the #1065 resource envelope (which
+covered stored collections, not this per-invocation loop) nor measured as a
+worst case: the #1062 resolve benchmark ran an all-tied full queue only
+incidentally (its LPs share the default score) and never isolated the scan.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| `resolve_fund_queue` complexity claim | doc comment says O(1) — stale since #708 | corrected on the code path: O(tied_count), bounded by the queue length |
+| Tie-scan bound declared | no — the #1065 envelope covered stored collections only | `storage::RESOURCE_ENVELOPE` entry `queue_resolution_tie_fanout` → `constants::MAX_FUND_QUEUE_LEN` |
+| Worst case isolated | all-tied queue resolved incidentally by #1062, unlabelled | `benchmark_queue_resolution_cpu_cost_at_cap` measures both extremes at the cap: all-tied (fan-out = 50) vs distinct (fan-out = 1) |
+| Resolution outcomes pinned | adjacency to other suites only | `tests_storage.rs` `test_1058_*` (7 cases): all-tied winner is a tied member, distinct → unique top score, idempotent re-resolve, empty queue → `NotFunded`, exact maturity boundary (`QueueNotMature` at delay−1, resolves at delay), permissionless invocation (auth stripped), and the declared-cap ↔ max-fan-out equality |
+
+**Behaviour.** Unchanged — this issue adds **no new contract behaviour**. The
+change is a corrected doc comment, one declarative envelope entry (a `(name,
+cap)` pair referencing the enforcing constant, never a literal), a benchmark,
+and regression tests. Resolution still: rejects an empty queue with `NotFunded`;
+fails closed with `QueueNotMature` until `QUEUE_DELAY_LEDGERS` have elapsed since
+the first join (#MEV-1); scans the contiguous top-score prefix and picks
+uniformly among ties (#708); records the winner and is idempotent on re-call; and
+requires no authorization. The measured disposition is that the tie scan's two
+extremes are close — it is cheap in-memory `Vec` reads beside the queue load and
+the resolution write + TTL extension — and its cost can never exceed reading the
+whole queue, which the declared cap bounds. No storage key, value encoding, error
+code, event, entry-point signature, or TTL constant is touched, so **existing
+resolution behaviour and integrations are unchanged**.
+
+**Migration.** None required. The change is a declarative bound, a benchmark,
+and regression tests; no operator action, keeper step, reconfiguration, or data
+backfill is needed. See [`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+for the envelope entry and [`benchmarks.md`](benchmarks.md) (§ Queue resolution
+CPU cost) for the run command and the all-tied/distinct table.
+
+## 22. Bound unresolved request storage growth (Issue #1059)
+
+Companion to §20 (#1057) and §21 (#1058): the queue's *live* length is bounded
+(`MAX_FUND_QUEUE_LEN` = 50) and both its insert and resolve *costs* are now
+declared and measured. What remained undeclared is that the bound is also a
+*retention* bound. An unresolved request keeps `DataKey::FundQueue(u64)` (up to
+50 `LpFundRequest` records) plus `DataKey::FundQueueOpenedAt(u64)` in persistent
+storage, and **nothing removes them on the terminal paths** —
+`resolve_fund_queue` writes a `QueueResolution` but does not delete the queue,
+and `cancel_invoice`/`expire_invoice` only rewrite the invoice. The footprint is
+therefore reclaimed only by TTL expiry, and §3's claim that "queues drain as
+invoices resolve, are funded or are cancelled" was inaccurate.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Retained-footprint bound declared | no — `fund_queue_entries` declared the *live* length only | `storage::RESOURCE_ENVELOPE` entry `unresolved_queue_retained_entries` → `constants::MAX_FUND_QUEUE_LEN` |
+| Retention behaviour pinned | not tested; §3 asserted queues "drain" on resolve/fund/cancel | `tests_storage.rs` `test_1059_*` (7 cases): footprint sits at the cap, does not grow under churn, resolution does **not** drain it, cancellation does **not** drain it, a full queue rejects beyond the bound without growth, an existing LP cannot re-join to inflate it, an unauthorized join cannot create storage, and retention survives the maturity ledger boundary |
+| Footprint cost measured | not measured at all | `benchmark_unresolved_queue_storage_footprint` churns a full unresolved queue (repeated displacing joins) and resolves it, asserting each step against the absolute ceilings |
+| §3 "queues drain" claim | inaccurate (no key is ever removed) | corrected: reclaimed by TTL only |
+
+**Behaviour.** Unchanged — this issue adds **no new contract behaviour**. The
+change is one declarative envelope entry (a `(name, cap)` pair referencing the
+enforcing constant, never a literal), a benchmark, regression tests, and a doc
+correction. Resolution, cancellation, and expiry still leave the retained queue
+in place; joins and re-joins are still bounded by `MAX_FUND_QUEUE_LEN` and fail
+with `QueueFull`/`AlreadyInQueue` past the bound; an unauthorized join still
+fails before any write. No storage key, value encoding, error code, event,
+entry-point signature, or TTL constant is touched, so **existing queue
+behaviour and integrations are unchanged**.
+
+**Migration.** None required. The change is a declarative bound, a benchmark,
+regression tests, and a documentation correction; no operator action, keeper
+step, reconfiguration, or data backfill is needed. Operators sizing storage
+should note that an unresolved request's footprint is retained at the cap until
+TTL expiry, not freed on resolution — see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+for the envelope entry and [`benchmarks.md`](benchmarks.md) (§ Retained
+unresolved-queue footprint) for the run command and table.
+
+## 23. Test governance ledger-entry budget (Issue #1060)
+
+Companion to §21 (#1058) and §22 (#1059), one layer up in the admin surface.
+Every governance entry point appends to the `AdminActionLog(u32)` ring buffer
+through `access::record_admin_action`, and `get_recent_admin_actions(limit)`
+reads it back. The *stored* slots were already bounded by
+`ADMIN_ACTION_LOG_CAPACITY` (50) and declared as `admin_action_log_entries`, but
+two *per-invocation* figures were neither declared nor measured: the **write**
+budget of a single governance action, and the **read** fan-out when a caller
+passes an oversized `limit`. Nothing pinned the read cost to the cap, so the
+bound rested on an implementation detail (the `limit.min(CAPACITY).min(total)`
+clamp) that no test asserted.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Read-loop bound declared | no — `admin_action_log_entries` declared the *stored slots* only | `storage::RESOURCE_ENVELOPE` entry `governance_log_read_fanout` → `access::ADMIN_ACTION_LOG_CAPACITY` |
+| Per-action write budget | unmeasured | `benchmark_governance_ledger_entry_budget` measures a governance action appending to an empty vs. a full ring buffer — flat O(1) in both cases |
+| Read fan-out at oversized `limit` | unmeasured; clamped in code but untested | `benchmark_governance_ledger_entry_budget` measures `get_recent_admin_actions(u32::MAX)` against the absolute ceilings |
+| Budget behaviour pinned | adjacency to the #1065/#645 suites only | `tests_storage.rs` `test_1060_*` (8 cases): one action spends exactly one slot, retained slots saturate at the declared budget, newest-first order within the budget, records capture the ledger sequence across a boundary, an oversized `limit` is clamped, the wrap-boundary window is correct, an empty log reads nothing and spends no budget, and an unauthorized governance action consumes no budget |
+
+**Behaviour.** Unchanged — this issue adds **no new contract behaviour**. The
+change is one declarative envelope entry (a `(name, cap)` pair referencing the
+enforcing constant, never a literal), a benchmark, and regression tests.
+`record_admin_action` still writes slot `seq % CAPACITY` and bumps the monotonic
+`AdminActionCount`; `get_recent_admin_actions` still clamps the caller's `limit`
+to the cap and the retained total and reads newest-first; an unauthorized caller
+still fails before any write. The measured disposition is that the write is flat
+(O(1)) whether the log is empty or full — the ring buffer overwrites in place
+rather than growing — and the read with `limit = u32::MAX` costs the same as one
+at the cap, so the ledger-entry budget is bounded by `ADMIN_ACTION_LOG_CAPACITY`,
+not by the caller. No storage key, value encoding, error code, event, entry-point
+signature, or TTL constant is touched, so **existing governance behaviour and
+integrations are unchanged**.
+
+**Migration.** None required. The change is a declarative bound, a benchmark,
+and regression tests; no operator action, keeper step, reconfiguration, or data
+backfill is needed. Operators reasoning about governance-read cost should note
+that a single `get_recent_admin_actions` consumes at most
+`ADMIN_ACTION_LOG_CAPACITY` ledger entries regardless of the `limit` supplied —
+see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+for the envelope entry and [`benchmarks.md`](benchmarks.md) (§ Governance
+ledger-entry budget) for the run command and table.
+
+## 24. Reject operations exceeding resource budgets (Issue #1061)
+
+Companion to §7 (#1064) and §14 (#1047): all three bound a governance-supplied
+list whose length a *hot unrelated entry point* walks. Here the list is
+`FeeTiers`, the `Vec<(i128, u32)>` that `update_fee_tiers` stores and
+`effective_fee_rate` walks **in full** (backwards, to find the applicable
+bracket) on every settlement (`mark_paid`). The list was unbounded, so the
+per-invocation cost of the settlement path — the contract's highest-value entry
+point — was set by whatever governance stored rather than by any fixed constant.
+A compromised admin key (or a mistaken configuration) could grow `FeeTiers`
+until `mark_paid` exceeded Soroban's per-transaction resource limits and
+settlement failed for *every* invoice. Neither the bound nor its cost was
+declared or measured.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Tier-list length bound | unbounded — `update_fee_tiers` stored any `Vec` length | `MAX_FEE_TIERS` (20); `update_fee_tiers` rejects a larger list with `TooManyFeeTiers` (81) before storing it |
+| Bound declared | no | `storage::RESOURCE_ENVELOPE` entry `fee_tiers_entries` → `constants::MAX_FEE_TIERS` |
+| Settlement tier-walk cost | unmeasured; scales with the stored list | `benchmark_fee_tier_budget` measures `mark_paid` with no schedule vs. a cap-sized schedule — both against the absolute ceilings |
+| Budget behaviour pinned | none | `tests_storage.rs` `test_1061_*` (6 cases): a cap-sized list is accepted, a cap+1 list is rejected and leaves the stored list unchanged, an unauthorized write consumes no config, the length check precedes the rate limit, the rate limit re-opens across the ledger boundary, and a funded invoice settles with a cap-sized schedule |
+
+**Before/after.** *Before:* `update_fee_tiers` accepted an arbitrary-length tier
+list; the per-settlement tier walk, and therefore `mark_paid`'s per-invocation
+cost, grew with it; nothing declared or measured the bound. *After:*
+`update_fee_tiers` rejects a list larger than `MAX_FEE_TIERS` (20) with
+`TooManyFeeTiers` (81) *before* storing it, so the settlement tier walk is bounded
+by a fixed constant; the bound is declared in `RESOURCE_ENVELOPE` and both the
+config write and the worst-case settlement walk are measured.
+
+**Behaviour.** Adds one rejection path: `update_fee_tiers` now returns
+`TooManyFeeTiers` (81) for a list larger than `MAX_FEE_TIERS`. The length check
+runs **after** `require_admin` (so authorization precedence is preserved) and
+**before** `check_rate_limit` (so a rejected oversized config neither consumes the
+rate-limit window nor writes state). Every other tier behaviour is unchanged:
+`effective_fee_rate` still walks the stored list backwards and applies the first
+bracket whose `min_amount <= invoice_amount`; the default schedule is unchanged;
+`FeeTiers` encoding, the `ECONOMIC_PARAM_COOLDOWN_LEDGERS` rate limit, and
+`record_admin_action` are untouched. No practical configuration is affected — a
+piecewise fee schedule needs only a handful of brackets, and the cap of 20 sits
+well above that while mirroring `MAX_PRICE_SOURCES_PER_FEED` and
+`MAX_IDENTITY_ORACLES_PER_FEED`.
+
+**Migration.** None required. The change adds a constant, an error code, one
+guard, an envelope entry, tests, and a benchmark; it does not change storage
+keys, value encodings, or existing schedules, and no data backfill or
+reconfiguration is needed. A deployment that already holds a `FeeTiers` list
+within the cap behaves identically; one that somehow holds a larger list (only
+reachable by an admin before this change) keeps working for settlement but cannot
+*extend* the list until it is reduced to the cap. Operators should note the new
+code `TooManyFeeTiers` (81) — see [`error-codes.md`](error-codes.md) — and the
+`fee_tiers_entries` envelope entry in
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065);
+the run command and table are in [`benchmarks.md`](benchmarks.md) (§ Fee-tier
+budget).

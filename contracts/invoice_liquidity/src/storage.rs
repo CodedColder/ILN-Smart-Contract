@@ -235,6 +235,29 @@ pub const RESOURCE_ENVELOPE: &[(&str, u32)] = &[
     // Fund queue entries per invoice — `DataKey::FundQueue(u64)`, bounded by
     // `constants::MAX_FUND_QUEUE_LEN` (Issue #1091/#1095).
     ("fund_queue_entries", crate::constants::MAX_FUND_QUEUE_LEN),
+    // Queue-resolution tie fan-out — `resolve_fund_queue`'s top-score tie scan
+    // is a per-invocation loop over a contiguous prefix of `FundQueue(u64)`
+    // (Issue #708), so its worst case (every entry tied at the top score) is
+    // bounded by the same `constants::MAX_FUND_QUEUE_LEN` cap. Declared
+    // separately from the collection itself because it is a *loop* bound, not a
+    // stored-length bound (Issue #1058).
+    (
+        "queue_resolution_tie_fanout",
+        crate::constants::MAX_FUND_QUEUE_LEN,
+    ),
+    // Retained unresolved-queue footprint — an *unresolved* invoice keeps its
+    // `DataKey::FundQueue(u64)` (up to `MAX_FUND_QUEUE_LEN` `LpFundRequest`
+    // records) and `DataKey::FundQueueOpenedAt(u64)` in persistent storage
+    // until TTL expiry. Neither `resolve_fund_queue` nor `cancel_invoice`/
+    // `expire_invoice` removes these keys (Issue #1059), so the *retained*
+    // footprint of an unresolved request is bounded by the same
+    // `constants::MAX_FUND_QUEUE_LEN` cap — not by any drain. Declared
+    // separately from `fund_queue_entries` because this is a *retention*
+    // bound (what survives resolution), not a live-length bound.
+    (
+        "unresolved_queue_retained_entries",
+        crate::constants::MAX_FUND_QUEUE_LEN,
+    ),
     // Price sources per feed — `DataKey::PriceSources(OracleFeedType)`,
     // bounded by `constants::MAX_PRICE_SOURCES_PER_FEED` (Issue #1064).
     (
@@ -247,10 +270,27 @@ pub const RESOURCE_ENVELOPE: &[(&str, u32)] = &[
         "identity_oracles_per_feed",
         crate::constants::MAX_IDENTITY_ORACLES_PER_FEED,
     ),
+    // Fee tiers — `DataKey::FeeTiers`, a single `Vec<(i128, u32)>` bounded by
+    // `constants::MAX_FEE_TIERS` (Issue #1061). `effective_fee_rate` walks the
+    // whole list on every settlement, so the cap bounds `mark_paid`'s
+    // tier-walk cost; `update_fee_tiers` rejects an oversized list with
+    // `TooManyFeeTiers`.
+    ("fee_tiers_entries", crate::constants::MAX_FEE_TIERS),
     // Admin action audit log slots — `DataKey::AdminActionLog(u32)`, a ring
     // buffer bounded by `access::ADMIN_ACTION_LOG_CAPACITY` (Issue #645).
     (
         "admin_action_log_entries",
+        crate::access::ADMIN_ACTION_LOG_CAPACITY,
+    ),
+    // Governance audit-log read fan-out — `access::get_recent_admin_actions`
+    // loops over at most `access::ADMIN_ACTION_LOG_CAPACITY` `AdminActionLog(u32)`
+    // slots per invocation (the caller-supplied `limit` is clamped), so a single
+    // governance-log read consumes at most that many ledger entries however large
+    // a `limit` the caller passes. Declared separately from
+    // `admin_action_log_entries` because it is a *per-invocation loop* bound, not
+    // a stored-slots bound (Issue #1060).
+    (
+        "governance_log_read_fanout",
         crate::access::ADMIN_ACTION_LOG_CAPACITY,
     ),
     // Top-payers min-heap — `DataKey::TopPayersHeap`, bounded by
