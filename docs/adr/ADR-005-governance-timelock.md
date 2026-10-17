@@ -86,37 +86,8 @@ Threat model: [`docs/timelock-threat-model.md`](../timelock-threat-model.md).
 - **Action required:** A timelock must be implemented and activated via a
   governance upgrade before `disable_veto_power()` is called. Failure to do
   so leaves the protocol without any execution delay after full decentralisation.
-- The `TimelockNotExpired` error is reserved but unimplemented; contributors
-  must not assume it is enforced.
-
-## Addendum (Issues #1007 / #1008): observable rejected transitions
-
-The "no timelock, veto as brake" decision above is unchanged. Two audit
-findings on the execution path were fixed without changing that decision:
-
-1. **Rejected transitions were not observable.** `execute_proposal` wrote
-   `Rejected`, forfeited the deposit and then returned
-   `Err(QuorumNotReached | ProposalRejected)`; on Soroban an `Err` rolls back
-   the whole call, so on-chain the proposal stayed `Active`, the deposit was
-   never forfeited and no event existed. (The old unit tests hid this by
-   calling the function through `as_contract`, which does not roll back.) It
-   now returns `Ok`, commits `Rejected`, and emits `proposal_rejected` with a
-   `RejectionReason`. The same applies to a failed cross-contract execution:
-   `proposal_execution_failed` is now committed and the proposal stays
-   `Passed` (retryable).
-2. **Cross-contract authorization is now tested against the real ILN
-   contract** (`contracts/tests/governance_cross_contract_auth_test.rs`) with
-   mocked auths dropped: governance only controls ILN when ILN's `Admin` *is*
-   the governance contract address; if it is not, execution is rejected by
-   ILN's `require_auth`, ILN is untouched and the failure event is emitted.
-
-Guards that reject without any state change (`NotVetoSigner`, `NotVetoable`,
-`VetoAlreadyApproved`, `VetoPowerDisabled`, `AlreadyResolved`, ...) still
-return `Err`: there is nothing to persist, and emitting events from a reverting
-call is impossible on Soroban. Callers see them as transaction errors.
-
-**Migration.** Integrators that treated `Err(QuorumNotReached)` /
-`Err(ProposalRejected)` / `Err(ExecutionFailed)` from `execute_proposal` as the
-rejection signal must switch to the `proposal_rejected` /
-`proposal_execution_failed` events (or read `get_proposal(id).status`). The
-error variants remain in the enum so error codes do not shift.
+- **Update (Issues #991/#993/#996/#997):** `TimelockNotExpired` is enforced via
+  `set_execution_delay`; the veto-disabled handoff is tested end to end and
+  `get_timelock_status` / `get_proposal_eta` expose the state. See
+  `docs/governance.md`. The delay still defaults to `0`, so the pre-mainnet
+  checklist item is to set it before `disable_veto_power()`.

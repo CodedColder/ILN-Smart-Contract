@@ -351,7 +351,7 @@ Unlike the invoice lifecycle (one enum field on a mutable record), a `Governance
 | Action | Guard |
 |---|---|
 | `veto_proposal` | Caller must equal stored `Admin`; `VetoPowerEnabled` must be `true` |
-| `set_execution_delay` | Caller must equal stored `Admin` (or become admin on first call if unset) |
+| `set_execution_delay` | Caller must equal stored `Admin`; returns `NotInitialized` if no admin is stored (Issue #997 — no first-caller bootstrap) |
 
 ### Invariant GA4: ILN-Contract-Gated Authorization
 These parameters can only be changed by the configured `IlnContract` address (i.e. routed through a passed governance proposal on the ILN contract itself, or an equivalent trusted caller) — never by an arbitrary account:
