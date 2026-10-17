@@ -449,6 +449,19 @@ pub struct FundQueueResolutionAttempted {
     pub success: bool,
 }
 
+/// Emitted by `recover_fund_queue` (Issues #1020/#1021). `evicted_lp` is the
+/// stalled approved LP removed from the queue (if any); `purged` is true when
+/// the invoice was no longer fundable and all queue state was deleted rather
+/// than reopened for the remaining `remaining_lps`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundQueueRecovered {
+    pub invoice_id: u64,
+    pub evicted_lp: Option<Address>,
+    pub remaining_lps: u32,
+    pub purged: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct InvoiceExpired {

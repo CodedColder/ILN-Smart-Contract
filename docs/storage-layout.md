@@ -70,6 +70,8 @@ parameterized by a unique id/address, no collisions occur.
 | `LpScore(Address)` | `u32` | LP reputation score |
 | `FundQueue(u64)` | `Vec<LpFundRequest>` | LPs waiting to fund an invoice |
 | `QueueResolution(u64)` | `Address` | Selected LP from a funding queue |
+| `FundQueueOpenedAt(u64)` | `u32` | Ledger the first LP joined the queue (MEV maturity anchor) |
+| `QueueResolvedAt(u64)` | `u32` | Ledger the winner was locked in (stalled-winner recovery anchor, Issue #1020); additive key, no migration |
 | `TotalInvoices` | `u64` | Global protocol stat |
 | `TotalFunded` | `u64` | Global protocol stat |
 | `TotalPaid` | `u64` | Global protocol stat |

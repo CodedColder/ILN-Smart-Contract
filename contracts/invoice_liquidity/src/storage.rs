@@ -46,6 +46,9 @@ pub enum DataKey {
     /// Used to enforce a minimum maturity delay before `resolve_fund_queue` may
     /// be called, preventing MEV / front-running (Issue #MEV-1).
     FundQueueOpenedAt(u64),
+    /// Ledger sequence at which `resolve_fund_queue` locked in the winner
+    /// (Issue #1020). Anchors the stalled-winner recovery grace period.
+    QueueResolvedAt(u64),
     /// Issue #645: ring-buffer slot for the admin action audit log, indexed
     /// by `seq % ADMIN_ACTION_LOG_CAPACITY`.
     AdminActionLog(u32),
@@ -431,6 +434,45 @@ pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) 
     env.storage()
         .persistent()
         .set(&DataKey::QueueResolution(invoice_id), approved_lp);
+    env.storage()
+        .persistent()
+        .set(&DataKey::QueueResolvedAt(invoice_id), &env.ledger().sequence());
+}
+
+/// Ledger sequence at which the queue winner was locked in, if resolved.
+pub fn get_queue_resolved_at(env: &Env, invoice_id: u64) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::QueueResolvedAt(invoice_id))
+}
+
+/// Remove every queue-related entry for `invoice_id` (queue, resolution,
+/// resolution ledger, opened-at ledger). Idempotent.
+pub fn clear_fund_queue_state(env: &Env, invoice_id: u64) {
+    let p = env.storage().persistent();
+    p.remove(&DataKey::FundQueue(invoice_id));
+    p.remove(&DataKey::QueueResolution(invoice_id));
+    p.remove(&DataKey::QueueResolvedAt(invoice_id));
+    p.remove(&DataKey::FundQueueOpenedAt(invoice_id));
+}
+
+/// Reopen the queue after evicting a stalled winner: drop the resolution and
+/// restart the maturity window for the remaining LPs (or clear it if empty).
+pub fn reopen_fund_queue(
+    env: &Env,
+    invoice_id: u64,
+    remaining: &soroban_sdk::Vec<LpFundRequest>,
+) {
+    let p = env.storage().persistent();
+    p.remove(&DataKey::QueueResolution(invoice_id));
+    p.remove(&DataKey::QueueResolvedAt(invoice_id));
+    if remaining.is_empty() {
+        p.remove(&DataKey::FundQueue(invoice_id));
+        p.remove(&DataKey::FundQueueOpenedAt(invoice_id));
+    } else {
+        p.set(&DataKey::FundQueue(invoice_id), remaining);
+        p.set(&DataKey::FundQueueOpenedAt(invoice_id), &env.ledger().sequence());
+    }
 }
 
 /// Record the ledger sequence when the first LP joined the fund queue.

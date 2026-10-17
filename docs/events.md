@@ -73,6 +73,7 @@ contracts and should be kept current going forward.
 | [InvoiceTokenChanged](#invoicetokenchanged) | `convert_invoice_token` |
 | [FundRequested](#fundrequested) | `join_fund_queue` |
 | [FundQueueResolved](#fundqueueresolved) | `resolve_fund_queue` |
+| [FundQueueRecovered](#fundqueuerecovered) | `recover_fund_queue` |
 | [InvoiceFunded](#invoicefunded) | `fund_invoice` |
 | [InvoiceTransferred](#invoicetransferred) | `transfer_invoice` |
 | [LPPositionTransferred](#lppositiontransferred) | `transfer_lp_position` |
@@ -113,6 +114,7 @@ State-changing functions and their event coverage (✅ = emits an event,
 | `submit_invoices_batch` | ✅ `InvoiceSubmitted` per invoice |
 | `join_fund_queue` | ✅ `FundRequested` |
 | `resolve_fund_queue` | ✅ `FundQueueResolved` |
+| `recover_fund_queue` | ✅ `FundQueueRecovered` |
 | `fund_invoice` | ✅ `InvoiceFunded` (+ `InvoiceExpired` if expiry detected, + `InvoiceNftTransferred`) |
 | `transfer_invoice` | ✅ `InvoiceTransferred` |
 | `transfer_lp_position` | ✅ `LPPositionTransferred` |
@@ -276,6 +278,17 @@ Topics: `["fund_queue_resolved", invoice_id, approved_lp]`
 | `invoice_id` | `u64` | Target invoice |
 | `approved_lp` | `Address` | Winning LP |
 | `score` | `u32` | Winning score |
+
+### FundQueueRecovered
+
+Topics: `["fund_queue_recovered", invoice_id]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `invoice_id` | `u64` | Target invoice |
+| `evicted_lp` | `Option<Address>` | Stalled approved LP that was evicted, if any |
+| `remaining_lps` | `u32` | LPs left in the reopened queue (`0` when purged) |
+| `purged` | `bool` | `true` when the invoice was no longer fundable and all queue state was deleted |
 
 ### InvoiceFunded
 

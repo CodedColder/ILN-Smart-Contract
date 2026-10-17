@@ -49,6 +49,8 @@ Source of truth: [`contracts/invoice_liquidity/src/errors.rs`](../contracts/invo
 | 36 | `InvoiceNftNotFound` | No NFT exists for the requested invoice. | Querying or transferring an NFT that was never minted (or was burned). | Verify the invoice was funded and the NFT was minted before querying. |
 | 37 | `InvoiceNftNotOwned` | The caller is not the current owner of this NFT. | A non-owner attempted to transfer or burn an NFT. | Verify ownership via `invoice_nft_owner` before attempting transfer or burn. |
 | 38 | `AmountTooSmall` | The invoice amount is below the configurable minimum threshold. | The submitted invoice amount is too low to be economically viable. | Increase the invoice amount to meet the minimum required by the contract configuration. |
+| 47 | `QueueFull` | The invoice's fund queue already holds `MAX_FUND_QUEUE_LEN` (50) LPs. | An additional LP tried to `join_fund_queue`. | Wait for the queue to be resolved/recovered, or fund directly if no resolution exists. |
+| 48 | `QueueNotStalled` | `recover_fund_queue` found nothing to recover. | No queue entries, winner not yet resolved, or the recovery grace period has not elapsed. | Retry after `QUEUE_RESOLUTION_TTL_LEDGERS` (or `QUEUE_DELAY_LEDGERS` when the invoice is within 24h of its due date). |
 
 ---
 
