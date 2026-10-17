@@ -79,3 +79,12 @@ A timelock **must be introduced before the admin veto power is disabled**
   so leaves the protocol without any execution delay after full decentralisation.
 - The `TimelockNotExpired` error is reserved but unimplemented; contributors
   must not assume it is enforced.
+
+## Addendum (#1000/#1003/#1004/#1006): execution is fail-closed
+
+Although there is no timelock, `execute_proposal` now rejects cancelled
+(`ProposalCancelled`) and superseded (`ProposalSuperseded`) proposals, refuses
+to finalize without quorum data (`QuorumDataMissing`) or with corrupt tallies
+(`InvalidVoteAccounting`), and distinguishes missing proposal storage
+(`ProposalStorageCorrupt`) from never-issued ids. See
+`docs/governance-security-summary.md` §6.

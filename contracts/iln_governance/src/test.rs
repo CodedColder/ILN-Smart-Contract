@@ -2423,3 +2423,214 @@ fn test_pre_init_calls_return_not_initialized() {
         Err(Ok(GovernanceError::NotInitialized))
     );
 }
+
+// ── #1000 / #1003 / #1004 / #1006: execution & finalization hardening ─────────
+
+fn advance_past_voting(t: &GovTestEnv) {
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp += 259_201;
+    t.env.ledger().set(ledger);
+}
+
+fn tamper_proposal(t: &GovTestEnv, id: u64, f: impl FnOnce(&mut GovernanceProposal)) {
+    t.env.as_contract(&t.contract.address, || {
+        let mut p: GovernanceProposal = t
+            .env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(id))
+            .unwrap();
+        f(&mut p);
+        t.env.storage().persistent().set(&StorageKey::Proposal(id), &p);
+    });
+}
+
+#[test]
+fn test_1000_vetoed_proposal_rejected_with_cancelled_error() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_b, &id, &true);
+    t.contract.veto_proposal(&t.admin, &id, &reason_hash(&t.env));
+
+    // Dead immediately, even before the voting window closes.
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::ProposalCancelled))
+    );
+    advance_past_voting(&t);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::ProposalCancelled))
+    );
+}
+
+#[test]
+fn test_1000_vetoed_after_passed_cannot_execute() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_b, &id, &true);
+    advance_past_voting(&t);
+    t.contract.execute_proposal(&id); // Active -> Passed
+    t.contract.veto_proposal(&t.admin, &id, &reason_hash(&t.env));
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::ProposalCancelled))
+    );
+}
+
+#[test]
+fn test_1000_superseded_proposal_cannot_execute() {
+    let t = setup();
+    let old = create_fee_proposal(&t);
+    let mut l = t.env.ledger().get();
+    l.timestamp += 10;
+    t.env.ledger().set(l);
+    let newer = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_b, &old, &true);
+    t.contract.cast_vote(&t.voter_b, &newer, &true);
+    advance_past_voting(&t);
+    t.contract.execute_proposal(&old); // Passed
+    t.contract.execute_proposal(&newer); // Passed
+
+    t.contract.execute_proposal(&newer); // Executed
+    assert_eq!(
+        t.contract.get_proposal(&newer).status,
+        ProposalStatus::Executed
+    );
+    assert_eq!(
+        t.contract.try_execute_proposal(&old),
+        Err(Ok(GovernanceError::ProposalSuperseded))
+    );
+    assert_eq!(t.contract.get_proposal(&old).status, ProposalStatus::Passed);
+}
+
+#[test]
+fn test_1000_newer_unexecuted_does_not_block_older() {
+    let t = setup();
+    let old = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_b, &old, &true);
+    advance_past_voting(&t);
+    t.contract.execute_proposal(&old);
+    t.contract.execute_proposal(&old);
+    assert_eq!(t.contract.get_proposal(&old).status, ProposalStatus::Executed);
+}
+
+#[test]
+fn test_1003_missing_total_supply_fails_closed() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_a, &id, &true); // 1 voter, tiny tally
+    t.env.as_contract(&t.contract.address, || {
+        t.env.storage().instance().remove(&StorageKey::GovTokenTotalSupply);
+    });
+    advance_past_voting(&t);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::QuorumDataMissing))
+    );
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
+}
+
+#[test]
+fn test_1003_zero_supply_and_missing_quorum_bps_fail_closed() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    advance_past_voting(&t);
+    t.env.as_contract(&t.contract.address, || {
+        t.env.storage().instance().set(&StorageKey::GovTokenTotalSupply, &0_i128);
+    });
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::QuorumDataMissing))
+    );
+    t.env.as_contract(&t.contract.address, || {
+        t.env.storage().instance().set(&StorageKey::GovTokenTotalSupply, &10_000_i128);
+        t.env.storage().instance().remove(&StorageKey::MinQuorumBps);
+    });
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::QuorumDataMissing))
+    );
+}
+
+#[test]
+fn test_1004_negative_tally_rejected() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    tamper_proposal(&t, id, |p| {
+        p.votes_for = 5_000;
+        p.votes_against = -1;
+    });
+    advance_past_voting(&t);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::InvalidVoteAccounting))
+    );
+}
+
+#[test]
+fn test_1004_tally_overflow_rejected_and_max_boundary_accepted() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    advance_past_voting(&t);
+    tamper_proposal(&t, id, |p| {
+        p.votes_for = i128::MAX;
+        p.votes_against = 1;
+    });
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::InvalidVoteAccounting))
+    );
+    // Boundary: the largest non-overflowing tally is accepted (and passes).
+    tamper_proposal(&t, id, |p| {
+        p.votes_for = i128::MAX - 1;
+        p.votes_against = 1;
+    });
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Passed);
+}
+
+#[test]
+fn test_1006_missing_proposal_storage_fails_closed() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    // Never-issued ids are plain not-found.
+    assert_eq!(
+        t.contract.try_get_proposal(&0).err(),
+        Some(Ok(GovernanceError::ProposalNotFound))
+    );
+    assert_eq!(
+        t.contract.try_get_proposal(&(id + 1)).err(),
+        Some(Ok(GovernanceError::ProposalNotFound))
+    );
+    // Issued id whose entry vanished (expired/archived) is corruption.
+    t.env.as_contract(&t.contract.address, || {
+        t.env.storage().persistent().remove(&StorageKey::Proposal(id));
+    });
+    assert_eq!(
+        t.contract.try_get_proposal(&id).err(),
+        Some(Ok(GovernanceError::ProposalStorageCorrupt))
+    );
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::ProposalStorageCorrupt))
+    );
+    assert_eq!(
+        t.contract.try_cast_vote(&t.voter_a, &id, &true),
+        Err(Ok(GovernanceError::ProposalStorageCorrupt))
+    );
+}
+
+#[test]
+fn test_1006_mismatched_id_entry_rejected() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    tamper_proposal(&t, id, |p| p.id = 999);
+    assert_eq!(
+        t.contract.try_get_proposal(&id).err(),
+        Some(Ok(GovernanceError::ProposalStorageCorrupt))
+    );
+}

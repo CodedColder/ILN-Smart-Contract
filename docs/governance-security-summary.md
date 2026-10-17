@@ -86,6 +86,25 @@ A dedicated test suite combines all governance attack vectors to verify the syst
 
 ---
 
+## 6. Execution & finalization hardening (Issues #1000, #1003, #1004, #1006)
+
+Audit path: `contracts/iln_governance/src/lib.rs` (`execute_proposal`, `cast_vote`, `veto_proposal`, `get_proposal`); ADR-005 (no-timelock v1 execution model).
+
+| Issue | Before | After (fail-closed) |
+|-------|--------|---------------------|
+| #1000 | A `Vetoed` proposal returned the generic `AlreadyResolved` (or `VotingOngoing` pre-deadline). A stale `Passed` proposal could still execute after a newer same-kind proposal had executed, overwriting the newer outcome. | `Vetoed` -> `ProposalCancelled` at any time. `Passed` proposal created before the last executed same-kind proposal -> `ProposalSuperseded`. One `LastExecuted(kind)` entry per action kind (19 max) — bounded state. |
+| #1003 | Missing/zero `GovTokenTotalSupply` made `quorum = 0`, so any single vote passed; missing `MinQuorumBps` silently defaulted. | Unset/non-positive supply or unset/out-of-range bps -> `QuorumDataMissing`; no status change. |
+| #1004 | Tallies were combined with `saturating_add`; negative/overflowing tallies were not detected. | Negative or overflowing `votes_for`/`votes_against` -> `InvalidVoteAccounting`. (A `tally <= total_supply` check was deliberately **not** added: supply is a static seed and legitimate mints exceed it.) |
+| #1006 | A missing proposal entry was indistinguishable from a never-created id (`ProposalNotFound`). | Ids `1..=ProposalCount` with a missing entry or mismatched `id` -> `ProposalStorageCorrupt`. Never-issued ids (0, > count) stay `ProposalNotFound`. Applies to `get_proposal`, `cast_vote`, `execute_proposal`, `veto_proposal`. `list_proposals` still skips missing entries (read-only view). |
+
+**Rollout / upgrade.** Additive: new error codes 29-33 and one new storage key; no existing storage layout changes. Existing `Passed` proposals remain executable unless a newer same-kind proposal has executed. Before upgrading, confirm `get_gov_token_total_supply() > 0` and `get_min_quorum_bps()` in 1..=10,000 on the live deployment, otherwise active proposals will not finalize.
+
+**Recovery.** `QuorumDataMissing`: restore the value through the ILN-gated setters, then re-call `execute_proposal` (proposal remains `Active`). `ProposalStorageCorrupt` / `InvalidVoteAccounting`: the proposal is frozen (cannot execute); restore the entry from the persistent-storage archive/TTL restore, or re-propose. `ProposalSuperseded`: re-propose.
+
+**Tests.** `test_1000_*`, `test_1003_*`, `test_1004_*`, `test_1006_*` in `contracts/iln_governance/src/test.rs`.
+
+---
+
 ## 4. Cross-references
 
 - [`docs/governance.md`](governance.md) — full mechanics: proposal lifecycle, voting window, quorum/majority rules, veto functions, past decisions.
