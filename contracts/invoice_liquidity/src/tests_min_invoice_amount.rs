@@ -211,13 +211,15 @@ fn test_admin_adds_token_with_different_decimals() {
     new_sac.mint(&t.admin, &10_000_000);
 
     advance_past_rate_limit_cooldown(&t.env);
-    t.contract.add_token(&new_token, &8);
+    // Issue #1070: declared decimals must match the token's own
+    // `decimals()`; Stellar Asset Contracts always report 7.
+    t.contract.add_token(&new_token, &7);
 
-    let min_8 = 100_000_000i128;
+    let min_7 = 10_000_000i128;
     let id = t.contract.submit_invoice(
         &t.freelancer,
         &t.payer,
-        &min_8,
+        &min_7,
         &due_date(&t),
         &DISCOUNT_RATE,
         &new_token,
@@ -225,7 +227,7 @@ fn test_admin_adds_token_with_different_decimals() {
     );
     assert_eq!(id, 1);
 
-    let below = 99_999_999i128;
+    let below = 9_999_999i128;
     let result = t.contract.try_submit_invoice(
         &t.freelancer,
         &t.payer,

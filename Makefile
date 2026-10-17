@@ -118,7 +118,7 @@ help:
 	@echo ""
 	@grep -E '^## ' Makefile | sed 's/^## /  /'
 	@echo ""
-.PHONY: help install build build-rust build-sdk test test-rust test-e2e fuzz test-fuzz lint \
+.PHONY: help install build build-rust build-sdk test test-rust test-e2e fuzz test-fuzz test-formal lint \
         fmt fmt-check clippy deploy-testnet seed reset reset-testnet docs spec \
         changelog soroban-optimize health test-insurance test-invoice test-governance test-distribution
 
@@ -186,6 +186,9 @@ fuzz: ## Run the property/fuzz test suite
 
 test-fuzz: ## Run fuzz tests for the iln_fuzz crate
 	cargo test -p iln_fuzz
+
+test-formal: ## Gate on formal counterexamples + proof obligations (#1100, #1101)
+	bash scripts/run-formal-verification.sh
 
 lint: fmt-check clippy check-no-unwrap event-coverage ## Lint everything (rustfmt check + clippy + panic-path gate + event coverage)
 

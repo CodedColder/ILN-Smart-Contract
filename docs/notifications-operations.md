@@ -4,7 +4,7 @@
 
 The Invoice Liquidity Network (ILN) Notifications Service delivers real-time notifications for on-chain Soroban contract events (such as `invoice.funded`, `invoice.paid`, `invoice.disputed`, and `invoice.expiring_soon`) across multi-channel destinations including webhooks, email, Slack, and Telegram.
 
-This document details the operational architecture, burst load test results under simulated mainnet conditions (1,000 concurrent events), fault tolerance mechanisms, security controls, capacity planning guidelines, and monitoring runbooks.
+This document details the operational architecture, burst load test results under simulated mainnet conditions (1,000 concurrent events), fault tolerance mechanisms, security controls, capacity planning guidelines, monitoring runbooks, and the background services layer (`src/services/`) that powers delivery analytics, notification digests, and subscription health.
 
 ---
 
@@ -43,6 +43,56 @@ This document details the operational architecture, burst load test results unde
 1. **Webhook Delivery Service (`WebhookDeliveryService`)**: Manages per-endpoint lifecycle state with sliding window rate limiters (1,000 req/min default), circuit breakers (5 consecutive failure threshold, 10-minute cooldown), HMAC-SHA256 signature generation (`x-iln-signature`), and delivery history logging.
 2. **Retry Queue (`RetryQueue`)**: SQLite-backed persistent queue for delivery attempts, implementing exponential backoff (1s, 5s, 30s) up to 3 attempts with status tracking (`pending`, `delivered`, `failed`, `skipped`).
 3. **Email Subscriptions & Delivery (`EmailDeliveryService`, `EmailSubscriptionStore`, `emailToken`)**: Manages double opt-in email subscriptions, single-use HMAC token generation with 128-bit CSPRNG nonces, HTML/text rendering with CRLF header sanitization, HTML attribute escaping, and protocol whitelisting (`http://`, `https://`).
+4. **Services Layer (`src/services/`)**: Long-running background services (delivery analytics, notification digest, subscription health) built on a shared `BaseService` lifecycle and managed by a `ServiceRegistry`. See [Section 1.1](#11-services-layer-architectureservices).
+
+### 1.1. Services Layer (`src/services/`)
+
+Background services sit between the API/delivery plumbing and the domain stores. They never import from `api/`; the `api/` routers call into them, and `delivery/` emits fire-and-forget events that services consume.
+
+```
+ +---------------------+        +--------------------------------------+
+ |   api/ routers      | call   |            services/                 |
+ | - analytics.ts      +------->| - deliveryAnalyticsService           |
+ | - digest.ts         |        | - digestService                      |
+ | - subscriptionHealth|        | - subscriptionHealthService          |
+ +----------+----------+        |   (all extend BaseService,           |
+            |                   |    registered in ServiceRegistry)    |
+            | writes            +---------+--------------+-------------+
+            v                             |              | reads summaries
+ +---------------------+   events         v              v
+ |  subscriptions/     |<-----------+  delivery/    (health policy:
+ |  SubscriptionStore  |            |  deliveryEvents  N trips / M days)
+ +---------------------+            |  webhookDelivery
+                                    +---------------------+
+        lib/logger.ts (child loggers), config.ts (env knobs)
+```
+
+**`BaseService` contract** (`baseService.ts`):
+
+- **Lifecycle**: `idle → starting → running → stopping → stopped`, or `failed`. `start()` and `stop()` are idempotent; `stop()` on a non-running service resolves immediately.
+- **Error handling**: every service body runs through `runSafely(op, fn)`, which catches exceptions, marks the service `failed` during startup, logs via the service's child logger, and — for a running service — keeps the service alive instead of crashing the process.
+- **Logging**: each service owns `logger.child({ component: 'services/<name>' })`, so all service logs are greppable by component (see the structured logger in `src/lib/logger.ts`).
+- **Health**: `status`, `lastError`, and `startedAt`/`stoppedAt` are exposed for the registry and ops endpoints.
+
+**`ServiceRegistry` contract** (`serviceRegistry.ts`): starts services in registration order, stops them in reverse order, and rolls back already-started services if any start fails (no partially running stack). `src/index.ts` wires the registry into `SIGINT`/`SIGTERM` shutdown so buffered work is flushed before exit.
+
+| Service | Responsibility | Key config (env) |
+| :--- | :--- | :--- |
+| **`deliveryAnalyticsService`** | Consumes `delivery/` events (`circuit_open`, `rate_limited`, `delivery_success`, `delivery_failure`) and maintains per-endpoint failure summaries (trip counts, throttle events, last failure) with rolling retention. Read via `GET /analytics/deliveries*`. | `NOTIFICATIONS_ANALYTICS_RETENTION_MS` (default 30 days) |
+| **`digestService`** | Batches queued notifications per subscriber over a configurable window (default 5 min, max 100 per batch). Digest mode is **opt-in**; opted-out subscribers keep real-time delivery. Buffers are drained to the delivery sink on shutdown. | `NOTIFICATIONS_DIGEST_WINDOW_MS`, `NOTIFICATIONS_DIGEST_MAX_BATCH_SIZE` |
+| **`subscriptionHealthService`** | Reads analytics summaries and applies the threshold policy (*N circuit trips over M days*) to flag or auto-suspend persistently failing endpoints, notifies the subscriber over a non-webhook channel (`contact_email`), and supports manual reactivation (`POST /subscriptions/health/:id/reactivate`). | `NOTIFICATIONS_HEALTH_TRIP_THRESHOLD` (3), `NOTIFICATIONS_HEALTH_WINDOW_DAYS` (1), `NOTIFICATIONS_HEALTH_AUTO_SUSPEND` (true) |
+
+**API surface added by the services layer** (writes require the endpoint API key when a `SubscriptionStore` is configured):
+
+- `GET /analytics/deliveries`, `GET /analytics/deliveries/:endpointId`, `GET /analytics/deliveries/:endpointId/counts?since=`
+- `GET /subscriptions/digest`, `POST /subscriptions/digest/:subscriberId/opt-in`, `POST /subscriptions/digest/:subscriberId/opt-out`
+- `GET /subscriptions/health`, `GET /subscriptions/health/:subscriberId`, `POST /subscriptions/health/evaluate`, `POST /subscriptions/health/:subscriberId/reactivate`
+
+**Operating notes:**
+
+- Suspended endpoints are skipped by delivery with `skippedReason: 'suspended'`; suspension is sticky and cleared only by explicit reactivation (which also resets the analytics counters for that endpoint). "Degraded" flags auto-clear once trips fall below the threshold.
+- Digest and analytics state are in-memory by default: a process restart clears digests (undelivered buffered items are flushed on graceful shutdown) and analytics history. Alert on `services/*` `failed` status and on the `suspended` count (see Section 5).
+- Webhook subscribers need a `contact_email` on the subscription for health notices; without one, the notice is logged and the suspension still applies.
 
 ---
 
@@ -145,92 +195,9 @@ A burst load test was executed simulating a sudden spike of **1,000 concurrent i
 3. **`Alert: RateLimitExceededSpike`**:
    - *Impact*: Subscriber webhook is exceeding configured sliding window threshold (HTTP 429).
    - *Action*: Verify subscriber tier allocation and offer upgrade to dedicated enterprise rate limit.
-
----
-
-## 6. Digest Service
-
-The `DigestService` batches notification events for a subscriber over a configurable time window before dispatching a single combined payload to the delivery layer. This reduces downstream load for high-volume subscribers and lowers per-event overhead.
-
-### Configuration
-
-| Parameter | Default | Description |
-| :--- | :--- | :--- |
-| `windowMs` | 30,000 ms | Time to accumulate events before flushing |
-| `maxBatchSize` | 50 | Maximum events per batch before forced flush |
-
-### Behavior
-
-- Events are buffered per subscriber ID.
-- A flush is triggered when either the window expires or the batch reaches `maxBatchSize`.
-- Calling `shutdown()` flushes all remaining buffers and cancels pending timers.
-- The flush handler receives a `DigestBatch` containing all accumulated events for a subscriber.
-
-### Operational Notes
-
-- For subscribers that produce fewer than ~50 events/day, the digest window has negligible effect (they get one batch per event cycle).
-- For burst subscribers (e.g. market makers), the `maxBatchSize` cap ensures memory usage stays bounded.
-- The digest layer sits between event ingestion and delivery — it does not replace the `RetryQueue` or circuit breaker.
-
----
-
-## 7. Delivery Failure Analytics
-
-The `DeliveryAnalyticsService` tracks per-subscriber delivery success/failure rates and computes rolling failure metrics over a configurable time window.
-
-### Configuration
-
-| Parameter | Default | Description |
-| :--- | :--- | :--- |
-| `recentWindowMs` | 3,600,000 ms (1 hour) | Window for computing recent failure rates |
-
-### Key Metrics
-
-- **`totalAttempts`** — total delivery attempts for the subscriber.
-- **`failures`** — total failed deliveries.
-- **`successRate`** — overall success ratio (0–1).
-- **`recentFailureRate`** — failure ratio within the recent window only.
-- **`lastFailureAt` / `lastSuccessAt`** — timestamps of most recent outcomes.
-
-### Interpreting Metrics
-
-- A `recentFailureRate` above 0.5 (50%) typically indicates a systemic issue (endpoint down, network blocked, misconfigured secret).
-- A low `recentFailureRate` with a high `totalAttempts` and recent `lastFailureAt` suggests transient issues — check the retry queue.
-- A high overall `failures` count with a low `recentFailureRate` means the subscriber recovered — no action needed.
-
-### Integration with Subscription Health
-
-`DeliveryAnalyticsService` feeds directly into `SubscriptionHealthService` (see §8). Health checks read the analytics snapshot and auto-suspend subscribers whose `recentFailureRate` exceeds the configured threshold.
-
----
-
-## 8. Subscription Health & Auto-Suspension
-
-The `SubscriptionHealthService` monitors subscriber delivery health and auto-suspends subscriptions whose failure rates exceed a configurable threshold.
-
-### Configuration
-
-| Parameter | Default | Description |
-| :--- | :--- | :--- |
-| `failureThreshold` | 0.5 (50%) | `recentFailureRate` above which suspension triggers |
-| `minAttempts` | 10 | Minimum delivery attempts before threshold applies |
-| `checkIntervalMs` | 60,000 ms | How often to re-evaluate all subscribers |
-
-### Suspension Lifecycle
-
-1. **Detection**: Periodic health checks compare each subscriber's `recentFailureRate` against `failureThreshold`.
-2. **Suspension**: Subscribers exceeding the threshold (with at least `minAttempts` deliveries) are auto-suspended. The suspension event is logged and the `onSuspend` handler is invoked.
-3. **Manual Override**: Operators can manually suspend or reinstate a subscriber via `suspend(id, reason)` / `reinstate(id)`.
-4. **Reinstatement**: Once the subscriber's endpoint is fixed, operators call `reinstate()` to resume delivery.
-
-### Override Procedure
-
-1. Identify the subscriber ID from alerting or the `getSuspended()` list.
-2. Fix the downstream endpoint (check URL, secret rotation, IP allowlist).
-3. Call `health.reinstate(subscriberId)` to clear the suspension.
-4. Verify delivery resumes by monitoring `DeliveryAnalyticsService` success rate.
-
-### Cross-Reference
-
-- HMAC signature verification (used by all webhook deliveries) is documented in [webhook-verification.md](./webhook-verification.md).
-- Circuit breaker behavior for individual endpoints is documented in §3 of this runbook.
+4. **`Alert: SubscriptionAutoSuspended`**:
+   - *Impact*: `subscriptionHealthService` suspended an endpoint after `NOTIFICATIONS_HEALTH_TRIP_THRESHOLD` circuit trips within `NOTIFICATIONS_HEALTH_WINDOW_DAYS`; deliveries are skipped (`skippedReason: 'suspended'`) and a notice was sent to the subscriber's `contact_email`.
+   - *Action*: Check `GET /subscriptions/health/:subscriberId` for trip history, confirm the endpoint is fixed, then `POST /subscriptions/health/:subscriberId/reactivate` (resets counters and resumes delivery).
+5. **`Alert: ServicesComponentFailed`**:
+   - *Impact*: A `services/*` component transitioned to `failed` (startup error) or logged an unhandled runtime error; analytics/digest/health may be stale.
+   - *Action*: Grep logs for `component=services/`, inspect `lastError` from the service status, restart the process if the registry did not recover.

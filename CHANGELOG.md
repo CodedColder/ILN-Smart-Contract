@@ -10,6 +10,15 @@ To regenerate: `make changelog`
 
 ---
 
+## Unreleased
+
+- test(contract): regression guards for fail-closed token decimals (decimals logic itself landed in #1070) (#1094)
+- fix(contract): enforce `MAX_FUND_QUEUE_LEN` in `join_fund_queue` with strict-score displacement (#1095)
+- test: audit-path regression suite `audit_regression_test` (#1096)
+- docs: evidence → remediation control map (#1097)
+
+---
+
 ## Mainnet Launch
 
 This release marks the initial mainnet launch of the Invoice Liquidity Network (ILN) protocol on Stellar. It consolidates deliverables across all three development and audit-hardening batches into a production-grade decentralized invoice factoring protocol.
@@ -62,186 +71,12 @@ For operational and risk guidance, consult the [Mainnet Launch Notes & Known Lim
 
 ## [Unreleased]
 
-### Bug Fixes
+### Security
 
-- Fixed issues 29 & 30
-- Change Config.high_rep_threshold from u8 to u32 for Soroban compatibility
-- Add checked arithmetic overflow protection across contract logic
-- Namespace all storage keys via typed DataKey enum
-- Resolved all four issues: #33 Write reputation system documentation (docs/reputation.md), #48 Implement and document upgrade path for contract migration, #35 Add submitter reputation to invoice struct for LP visibility, #43 Write a threat model document for the ILN contract
-- Resolved all issues in one: #22 Add stablecoin price oracle interface for cross-token yield normalisation, #20 Add per-token volume tracking in contract stats
-- Add reentrancy guard to cancel_invoice and claim_default, add Reentrancy error test
-- Enforce minimum invoice amount in submit_invoice
-- Restore amount_paid field and pass xlm_sac_address through update_config
-- Enforce minimum invoice amount in submit_invoice
-- Classify XLM volume correctly (avoid EURC collision)
-- Resolved all issues in one: #42, #46, #50, #51
-- Validate discount rate bounds in submit_invoice
-- Resolved all issues in one: #15, #25
-- Resolved SSH issue
-- Remove duplicate module declarations in lib.rs
-- Fix delimiter errors, update SDK API and resolve CI failures
-- Resolve all CI compilation errors - migrate event system, fix delimiters, fix imports
-- Resolve CI compilation errors - fix event publish signatures, register API, ReferralCode enum, filter_by_contract, ProposalAction::AddToken arg, InvoiceParams fields, and Config fields across all test files
-- Add crate license
-- Use published allure reporter version
-- Address quick ci regressions
-- Address remaining quick warnings
-- Correct tsconfig base path
-- Name inner error classes to resolve TS7056
-- Use top-level ESM imports in subscribe.ts
-- Replace invalid example secret in warnIfHardcodedSecret
-- Resolve typescript errors
-- Replace deprecated publish_event with publish in nft.rs
-- Update spin 0.9.8 → 0.9.9 to clear yanked advisory
-- Add crate license
-- Use published allure reporter version
-- Address quick ci regressions
-- Address remaining quick warnings
-- Correct tsconfig base path
-- Name inner error classes to resolve TS7056
-- Use top-level ESM imports in subscribe.ts
-- Replace invalid example secret in warnIfHardcodedSecret
-- Resolve typescript errors
-- Replace deprecated publish_event with publish in nft.rs
-- Update spin 0.9.8 → 0.9.9 to clear yanked advisory
-- Resolve issues 499, 498, 496, 491
-- Guard arithmetic against overflow/underflow
-- Guard vote tallies and pagination arithmetic
-- Guard reward accrual arithmetic against overflow
-- Guard premium/balance accumulation against overflow
-- Resolve issues 517, 519, 520, 521
-- Bound reputation decay loop to prevent unbounded iteration DoS
-- Bound reputation decay loop to prevent unbounded iteration DoS
-- MEV mitigation, invoice count safety, batch reputation, pause checks
-- Add publish = false to invoice_liquidity Cargo.toml
-- Pin version alongside path dep for insurance_pool to satisfy cargo-deny wildcards check
-- Store gov_token_total_supply on-chain instead of trusting caller (#622)
-- Update tests_benchmarks initialize call for new total_supply param (#622)
-- Correct executeProposal call args to match contract signature (#622)
-- Harden mark_paid LP payout math against underflow (#619)
-- Attribute add_volume by token SAC address, not list position (#620)
-- Refund payer partial payment on dispute resolution upheld
-- Remove duplicate non-persisting get_payer_score and verify decay persistence
-- Safe arithmetic and balance cap in insurance pool deposit_premium
-- Fund/cancel SDK args, multisig admin, NFT event docs
-- Pass rustfmt, clippy, and cargo-deny checks
-- Resolve yanked chacha20 advisory and configure coverage gate with unit test suite
-- Add comprehensive tests_coverage_boost and configure tarpaulin include-path
-- Drop unsupported tarpaulin --include-path flag from coverage gate
-- Correct claim_default partial-funding test and rustfmt violations
-- Scope coverage report and add branch tests to clear the gate
-- Resolved failing CI checks
-- Update governance_main_integration_test for GovContract::initialize's new arg
-- Circuit breaker verification, email injection hardening, token security, and burst load test
-- Harden cross-contract reputation, insurance, versioning, and distribution bounds
-- Resolve webhook ssrf hardening and indexer query optimization (727, 724)
-- Exclude contracts/examples from workspace and unbreak insurance_pool tests
-- Satisfy cargo-deny advisories and bans checks
-- Bump cargo-deny-action to v2 to fix Cargo.lock v4 parse failure
-- Panic-path hardening across governance, insurance, and CI (#844 #845 #846 #847)
-- Governance param consistency, error enum, and event docs
-- Checkpoint-gated voting (#805), stored-supply quorum (#808), Sybil analysis (#809), reputation lifecycle guide (#854)
-- Restore workspace compilation on dev
-- Replace panic-prone funding-queue index unwraps with typed error returns
-- Replace panic-prone index unwraps in mark_paid and resolve_dispute with typed errors
-- Repair workspace build and test compilation errors
-- Close rate-limit enforcement and oracle health-check gaps in privileged functions
-- Audit and harden delegated vote weight against flash-loan timing gap
-- Extend SDK error decoding guidance for new batch errors
-- Verify governance token SAC-admin invariant instead of assuming it at deployment
-- Align reputation_bonus parameter-bounds discipline with invoice_liquidity
-- Enforce parameter bounds for all governance-settable numeric parameters
-
-### Documentation
-
-- Add SECURITY.md and benchmark/governance/multi-token documentation
-- Add smart contract event schema reference
-- Add README and SDK integration guide
-- Add architecture decision records for major design choices
-- Add CONTRIBUTING.md for smart contract contributors
-- Write comprehensive README for ILN-Smart-Contract repo
-- Create first invoice hands-on tutorial for new contributors
-- Add pre-audit checklist and code freeze procedure
-- Add comprehensive JSDoc to all exported functions and types
-- Write comprehensive SDK README with usage guide and examples
-- Write E2E setup guide and test authoring documentation
-- Write comprehensive indexer REST API reference
-- Write comprehensive notifications service README
-- Write comprehensive SDK integration guide with tested code examples
-- Update CONTRIBUTING.md with monorepo workflow and cross-repo conventions
-- Add CHANGELOG with release history and git-cliff configuration
-- Add CHANGELOG with release history and git-cliff configuration
-- Initialise benchmarks.json result history (#371)
-- Document all 14 ILN contract event types (#372)
-- Add FAQ document covering all user and developer segments
-- Add protocol terminology glossary
-- Write E2E setup guide and test authoring documentation
-- Write comprehensive indexer REST API reference
-- Write comprehensive notifications service README
-- Initialise benchmarks.json result history (#371)
-- Document all 14 ILN contract event types (#372)
-- Add FAQ document covering all user and developer segments
-- Add protocol terminology glossary
-- Add insurance pool readiness to mainnet launch checklist (#432)
-- Add insurance_pool test instructions and Makefile target
-- Add insurance pool readiness to mainnet launch checklist (#432)
-- Add insurance_pool test instructions and Makefile target
-- Add insurance pool specific risk analysis
-- Map storage keys across all contracts, confirm no collisions
-- Document integer overflow/underflow audit findings
-- Rewrite events.md as a full event-emission completeness audit
-- Insurance pool coverage + missing error codes
-- Add formal verification specifications and invariant definitions
-- Add ADR for insurance pool design
-- Add ADR for NFT invoice representation
-- Add ADR for multisig admin
-- Add insurance pool events documentation
-- Fix contract count contradiction across Architecture and pre-audit checklist
-- Prepare external auditor onboarding package
-- Reconcile mainnet launch checklist and update docs index
-- Analyze and document vote-snapshot resistance to flash-loan balance manipulation
-- Analyze front-running risk model specific to Stellar consensus for fund_invoice, update queue tie-breaking status
-- Clarify and test that LP position transfer post-queue-resolution is expected behavior
-- Document Slack/Telegram credential rotation procedure and verify reload behavior
-- Re-verify access-control.md against all five contracts and oracle registry
-- Re-review threat model against current five-contract architecture
-- Build unified audit-readiness dashboard reconciling both checklists
-- Extend formal verification spec to iln_governance state machine
-- Add mainnet deployment rollback runbook with rehearsal
-- Add insurance_pool scope and frontend Storybook workspace to CONTRIBUTING.md
-- Add curated mainnet launch summary to CHANGELOG
-- Add public support channels document
-- Link support channels from README and docs index
-- Author SCF technical narrative synthesizing production-hardening work
-- Add blameless postmortem template for incident reviews
-- Reconcile SECURITY.md and docs/security.md with cross-links
-- Publish governance security summary synthesizing decentralization hardening work
-- Author protocol-wide incident response runbook coordinating all component procedures
-- Link the incident response runbook from the launch checklist and docs index
-- Document the structured logging standard
-- Complete distribution doc comments, error path verification, and auth tests
-- Protocol economics/risk index, review cadence, support channels, testnet validation
-- Validate insurance pool premium rates against observed testnet default data
-- Consolidate automated cross-contract audit checks into auditor handoff dashboard
-- Add SDK integration examples for common protocol lifecycle patterns
-- Add insurance claim example
-- Add governance lifecycle example
-- Cross-link SDK examples from integration docs
-- Cross-link SDK examples from quickstart
-- Publish final audit-completion and remediation-attestation report
-- Cross-link final audit attestation in launch checklist
-- Build public audit-finding tracking board template
-- Cross-link audit tracking board
-- Record critical-audit-finding response tabletop exercise results
-- Define contract-pause authority usage policy for audit-finding response
-- Cross-link pause policy in incident runbook
-- Define severity-to-SLA remediation policy in security documentation
-- Author patch-and-redeploy runbook for critical/high audit findings
-- Document safe parameter ranges for every adjustable parameter in the governance playbook
-- Critical finding re-audit policy (922)
-- Add bug bounty program (923)
-- Contact rotation and backup coverage (924)
+- governance: enforce proposal lifecycle monotonicity via a single `transition_status` writer; terminal states are immutable (#999)
+- governance: central `assert_executable` invariant — no execution before `eta_ledger`; `eta_ledger` computed with `checked_add`; execution delay capped at 518,400 ledgers (#995)
+- governance: `set_execution_delay` no longer installs the first caller as admin before `initialize()` (#1005)
+- governance: fix test-build break in deposit settlement helpers (now `Result<bool, _>`) and pin vote-receipt TTL > voting window at compile time (#1002)
 
 ### Features
 

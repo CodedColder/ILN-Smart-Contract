@@ -1,127 +1,249 @@
+import { BaseService } from './baseService.js';
+import type { ServiceContext } from './types.js';
+
 /**
- * DigestService — batches notification events into time-windowed digests
- * before dispatching to the delivery layer.
+ * Delivery mode for one subscriber.
  *
- * Instead of delivering every event individually, events for the same
- * subscriber are accumulated over a configurable window and dispatched
- * as a single combined payload, reducing downstream load for high-volume
- * subscribers (#874).
+ * `digest` buffers notifications and delivers them as one batch when the
+ * window closes; `realtime` (the default) hands every notification straight
+ * back to the caller — opting **out** of the digest never means going quiet
+ * (Issue #871).
  */
+export type DigestMode = 'realtime' | 'digest';
 
-export interface DigestConfig {
-  /** Window in milliseconds to accumulate events before flushing. */
-  windowMs: number;
-  /** Maximum events per digest before forced flush. */
-  maxBatchSize: number;
-}
-
-export interface DigestEvent {
-  subscriberId: string;
-  eventType: string;
+export interface DigestNotification {
+  event: string;
   invoiceId: number;
   payload: unknown;
-  timestamp: number;
+  queuedAt: number;
 }
 
+/** One batched delivery covering a subscriber's window. */
 export interface DigestBatch {
   subscriberId: string;
-  events: DigestEvent[];
-  flushedAt: number;
+  notifications: DigestNotification[];
+  /** When the batch's window opened (first queued notification). */
+  windowStart: number;
 }
 
-export type DigestFlushHandler = (batch: DigestBatch) => Promise<void>;
+export interface EnqueueResult {
+  /** false ⇒ deliver this notification immediately (real-time path). */
+  batched: boolean;
+}
 
-const DEFAULT_CONFIG: DigestConfig = {
-  windowMs: 30_000,
-  maxBatchSize: 50,
-};
+export interface DigestSubscriptionView {
+  subscriberId: string;
+  mode: DigestMode;
+  pending: number;
+  due: boolean;
+}
 
-export class DigestService {
-  private readonly buffers = new Map<string, DigestEvent[]>();
-  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly config: DigestConfig;
+export type DigestDeliverFn = (batch: DigestBatch) => Promise<void> | void;
 
-  constructor(
-    private readonly flushHandler: DigestFlushHandler,
-    config?: Partial<DigestConfig>,
-  ) {
-    this.config = { ...DEFAULT_CONFIG, ...config };
+export interface DigestServiceOptions extends ServiceContext {
+  /** Batching window. Defaults to 5 minutes. */
+  windowMs?: number | undefined;
+  /** A batch is released as soon as it reaches this many notifications. */
+  maxBatchSize?: number | undefined;
+  /** Mode for subscribers that never chose one. Defaults to `realtime`. */
+  defaultMode?: DigestMode | undefined;
+  /** How often due batches are checked. Defaults to half the window. */
+  flushIntervalMs?: number | undefined;
+  /** Sink that delivers a finished batch (typically `WebhookDeliveryService`). */
+  deliver?: DigestDeliverFn | undefined;
+}
+
+const DEFAULT_WINDOW_MS = 5 * 60 * 1000;
+const DEFAULT_MAX_BATCH_SIZE = 100;
+
+interface DigestEntry {
+  mode: DigestMode;
+  notifications: DigestNotification[];
+  windowStart: number;
+}
+
+/**
+ * Batches queued notifications per subscriber over a configurable window.
+ *
+ * High-volume subscribers opt in to reduce delivery chatter; everyone else
+ * keeps the real-time path. Buffers live in memory (same trade-off as
+ * `DeliveryHistoryStore`) and are drained to the `deliver` sink on shutdown
+ * so a restart does not silently drop queued notifications.
+ */
+export class DigestService extends BaseService {
+  private readonly entries = new Map<string, DigestEntry>();
+  private readonly windowMs: number;
+  private readonly maxBatchSize: number;
+  private readonly defaultMode: DigestMode;
+  private readonly flushIntervalMs: number;
+  private readonly deliver: DigestDeliverFn | undefined;
+  private flushTimer: NodeJS.Timeout | null = null;
+
+  constructor(options: DigestServiceOptions = {}) {
+    super('digest', options);
+    this.windowMs = options.windowMs ?? DEFAULT_WINDOW_MS;
+    this.maxBatchSize = options.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE;
+    this.defaultMode = options.defaultMode ?? 'realtime';
+    this.flushIntervalMs =
+      options.flushIntervalMs ?? Math.max(1, Math.floor(this.windowMs / 2));
+    this.deliver = options.deliver;
+  }
+
+  /** Effective mode: the subscriber's choice, else the service default. */
+  mode(subscriberId: string): DigestMode {
+    return this.entries.get(subscriberId)?.mode ?? this.defaultMode;
+  }
+
+  optIn(subscriberId: string): DigestMode {
+    return this.setMode(subscriberId, 'digest');
+  }
+
+  optOut(subscriberId: string): DigestMode {
+    return this.setMode(subscriberId, 'realtime');
+  }
+
+  setMode(subscriberId: string, mode: DigestMode): DigestMode {
+    const entry =
+      this.entries.get(subscriberId) ??
+      { mode: this.defaultMode, notifications: [], windowStart: 0 };
+    entry.mode = mode;
+    this.entries.set(subscriberId, entry);
+    this.log.info('digest_mode_set', { subscriberId, mode });
+    return mode;
   }
 
   /**
-   * Enqueue an event for batching. If the batch reaches `maxBatchSize`,
-   * it is flushed immediately regardless of the window timer.
+   * Queue one notification.
+   *
+   * @returns `{ batched: false }` when the subscriber is on the real-time
+   * path — the caller must deliver immediately. `{ batched: true }` means the
+   * notification is buffered and will be released by `flushDue`.
    */
-  async enqueue(event: DigestEvent): Promise<void> {
-    const buffer = this.buffers.get(event.subscriberId) ?? [];
-    buffer.push(event);
-    this.buffers.set(event.subscriberId, buffer);
-
-    if (buffer.length >= this.config.maxBatchSize) {
-      await this.flush(event.subscriberId);
-      return;
+  enqueue(
+    subscriberId: string,
+    input: { event: string; invoiceId: number; payload: unknown },
+  ): EnqueueResult {
+    const existing = this.entries.get(subscriberId);
+    const mode = existing?.mode ?? this.defaultMode;
+    if (mode !== 'digest') {
+      this.log.debug('digest_bypassed', { subscriberId, mode });
+      return { batched: false };
     }
 
-    if (!this.timers.has(event.subscriberId)) {
-      const timer = setTimeout(() => {
-        this.flush(event.subscriberId);
-      }, this.config.windowMs);
-      this.timers.set(event.subscriberId, timer);
+    const entry = existing ?? { mode: 'digest', notifications: [], windowStart: 0 };
+    if (!existing) {
+      this.entries.set(subscriberId, entry);
     }
-  }
-
-  /**
-   * Flush all buffered events for a subscriber immediately.
-   * Safe to call even if the buffer is empty (no-op).
-   */
-  async flush(subscriberId: string): Promise<void> {
-    const timer = this.timers.get(subscriberId);
-    if (timer) {
-      clearTimeout(timer);
-      this.timers.delete(subscriberId);
+    if (entry.notifications.length === 0) {
+      entry.windowStart = this.now();
     }
-
-    const events = this.buffers.get(subscriberId);
-    if (!events || events.length === 0) {
-      this.buffers.delete(subscriberId);
-      return;
-    }
-
-    this.buffers.delete(subscriberId);
-
-    const batch: DigestBatch = {
+    entry.notifications.push({ ...input, queuedAt: this.now() });
+    this.log.debug('digest_queued', {
       subscriberId,
-      events: [...events],
-      flushedAt: Date.now(),
-    };
-
-    await this.flushHandler(batch);
+      pending: entry.notifications.length,
+    });
+    return { batched: true };
   }
 
-  /** Flush all pending batches across all subscribers. */
-  async flushAll(): Promise<void> {
-    const subscriberIds = [...this.buffers.keys()];
-    for (const id of subscriberIds) {
-      await this.flush(id);
+  /** Buffered notifications for one subscriber (a copy; safe to mutate). */
+  pending(subscriberId: string): DigestNotification[] {
+    return [...(this.entries.get(subscriberId)?.notifications ?? [])];
+  }
+
+  /** Every subscriber the service has a preference or buffer for. */
+  list(): DigestSubscriptionView[] {
+    const out: DigestSubscriptionView[] = [];
+    for (const [subscriberId, entry] of this.entries) {
+      out.push({
+        subscriberId,
+        mode: entry.mode,
+        pending: entry.notifications.length,
+        due: this.isReady(entry, this.now()),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Release every batch whose window has closed (or that reached
+   * `maxBatchSize`). Entries are cleared as they are taken, so a batch is
+   * never delivered twice.
+   */
+  flushDue(now?: number): DigestBatch[] {
+    const at = now ?? this.now();
+    const batches: DigestBatch[] = [];
+    for (const [subscriberId, entry] of [...this.entries]) {
+      if (this.isReady(entry, at)) {
+        batches.push({
+          subscriberId,
+          notifications: entry.notifications,
+          windowStart: entry.windowStart,
+        });
+        entry.notifications = [];
+        entry.windowStart = 0;
+      }
+    }
+    if (batches.length > 0) {
+      this.log.debug('digest_batches_released', { batches: batches.length });
+    }
+    return batches;
+  }
+
+  protected onStart(): void {
+    const deliver = this.deliver;
+    if (!deliver) {
+      this.log.debug('digest_timer_skipped', { reason: 'no_deliver_sink' });
+      return;
+    }
+    this.flushTimer = setInterval(() => {
+      void this.flushAndDeliver(this.flushDue(), deliver);
+    }, this.flushIntervalMs);
+    // Never hold the process open for a batching window.
+    this.flushTimer.unref();
+  }
+
+  protected async onStop(): Promise<void> {
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    // Drain what is queued rather than dropping it on shutdown — but only
+    // when there is somewhere to drain to.
+    if (this.deliver) {
+      await this.flushAndDeliver(this.drain(), this.deliver);
     }
   }
 
-  /** Number of subscribers with pending (unflushed) events. */
-  get pendingCount(): number {
-    return this.buffers.size;
-  }
-
-  /** Number of buffered events for a specific subscriber. */
-  bufferedCount(subscriberId: string): number {
-    return this.buffers.get(subscriberId)?.length ?? 0;
-  }
-
-  /** Cancel all pending timers and flush remaining events. */
-  async shutdown(): Promise<void> {
-    for (const timer of this.timers.values()) {
-      clearTimeout(timer);
+  private isReady(entry: DigestEntry, at: number): boolean {
+    if (entry.notifications.length === 0) {
+      return false;
     }
-    this.timers.clear();
-    await this.flushAll();
+    return (
+      entry.notifications.length >= this.maxBatchSize ||
+      at - entry.windowStart >= this.windowMs
+    );
+  }
+
+  private drain(): DigestBatch[] {
+    const batches: DigestBatch[] = [];
+    for (const [subscriberId, entry] of this.entries) {
+      if (entry.notifications.length === 0) {
+        continue;
+      }
+      batches.push({
+        subscriberId,
+        notifications: entry.notifications,
+        windowStart: entry.windowStart,
+      });
+      entry.notifications = [];
+      entry.windowStart = 0;
+    }
+    return batches;
+  }
+
+  private async flushAndDeliver(batches: DigestBatch[], deliver: DigestDeliverFn): Promise<void> {
+    for (const batch of batches) {
+      await this.runSafely('digest_deliver', () => deliver(batch), undefined);
+    }
   }
 }

@@ -1,5 +1,6 @@
 pub use crate::storage::DataKey as StorageKey;
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::testutils::storage::Persistent as _;
 
 /// A nullable BytesN<32> that works with #[contracttype] derive.
 /// In Soroban SDK 21.x, `Option<BytesN<32>>` doesn't implement the required
@@ -46,6 +47,19 @@ pub enum ReferralCode {
 //   Operations on invoice i never read or write invoice j (i != j).
 // INVARIANT S2: Submitter invoice index and LP invoice index are eventually
 //   consistent — every invoice appears in at least one index.
+//
+// == Fund-Queue Invariants (Issue #1017) ==
+// INVARIANT Q1: resolve_fund_queue only finalizes a *not-yet-resolved*
+//   queue while invoice.status is Pending or PartiallyFunded — matching
+//   join_fund_queue's own status gate. cancel_invoice / expire_invoice
+//   never touch FundQueue / FundQueueOpenedAt / QueueResolution, so without
+//   this check a queue left unresolved when the invoice was cancelled or
+//   expired would still be resolvable afterward, announcing a reputation-
+//   weighted "winner" for funding that can never happen.
+// INVARIANT Q2: a queue already resolved (QueueResolution present) before
+//   cleanup stays resolved — cancel_invoice / expire_invoice cannot erase a
+//   decision that already finalized; resolve_fund_queue's cache check for
+//   an existing QueueResolution runs before Q1's status gate.
 // ----------------------------------------------------------------
 
 // ----------------------------------------------------------------
@@ -842,54 +856,147 @@ pub fn set_lp_score(env: &Env, lp: &Address, score: u32) {
     }
 }
 
-/// Return all queued LP requests for an invoice
+/// Return all queued LP requests for an invoice.
+///
+/// Issues #1009 / #1010: the queue helpers live in `storage.rs`, where reads
+/// and writes extend the TTL of the queue, its opened-at marker and the
+/// resolution record together. These wrappers delegate so there is a single
+/// implementation.
 pub fn get_fund_queue(env: &Env, invoice_id: u64) -> soroban_sdk::Vec<LpFundRequest> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::FundQueue(invoice_id))
-        .unwrap_or(soroban_sdk::Vec::new(env))
+    crate::storage::get_fund_queue(env, invoice_id)
 }
 
-/// Persist the queue
+/// Persist the queue and extend its TTL (Issue #1025, #1091)
 pub fn save_fund_queue(env: &Env, invoice_id: u64, queue: &soroban_sdk::Vec<LpFundRequest>) {
-    env.storage()
-        .persistent()
-        .set(&StorageKey::FundQueue(invoice_id), queue);
+    crate::storage::save_fund_queue(env, invoice_id, queue)
 }
 
 /// Return the resolved (approved) funder for an invoice, if any
 pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::QueueResolution(invoice_id))
+    crate::storage::get_queue_resolution(env, invoice_id)
 }
 
-/// Store the approved funder chosen by the priority queue
+/// Store the approved funder chosen by the priority queue and extend its TTL (Issue #1025, #1091)
 pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
     env.storage()
         .persistent()
         .set(&StorageKey::QueueResolution(invoice_id), approved_lp);
+    env.storage()
+        .persistent()
+        .set(&StorageKey::QueueResolvedAt(invoice_id), &env.ledger().sequence());
+}
+
+/// Ledger sequence at which the queue winner was locked in, if resolved.
+pub fn get_queue_resolved_at(env: &Env, invoice_id: u64) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::QueueResolvedAt(invoice_id))
+}
+
+/// Remove every queue-related entry for `invoice_id`. Idempotent.
+pub fn clear_fund_queue_state(env: &Env, invoice_id: u64) {
+    let p = env.storage().persistent();
+    p.remove(&StorageKey::FundQueue(invoice_id));
+    p.remove(&StorageKey::QueueResolution(invoice_id));
+    p.remove(&StorageKey::QueueResolvedAt(invoice_id));
+    p.remove(&StorageKey::FundQueueOpenedAt(invoice_id));
+}
+
+/// Reopen the queue after evicting a stalled winner: drop the resolution and
+/// restart the maturity window for the remaining LPs (or clear it if empty).
+pub fn reopen_fund_queue(env: &Env, invoice_id: u64, remaining: &soroban_sdk::Vec<LpFundRequest>) {
+    let p = env.storage().persistent();
+    p.remove(&StorageKey::QueueResolution(invoice_id));
+    p.remove(&StorageKey::QueueResolvedAt(invoice_id));
+    if remaining.is_empty() {
+        p.remove(&StorageKey::FundQueue(invoice_id));
+        p.remove(&StorageKey::FundQueueOpenedAt(invoice_id));
+    } else {
+        p.set(&StorageKey::FundQueue(invoice_id), remaining);
+        p.set(&StorageKey::FundQueueOpenedAt(invoice_id), &env.ledger().sequence());
+    }
 }
 
 /// Record the ledger sequence when the first LP joined the fund queue.
 /// Called once when the queue transitions from empty to non-empty.
-/// Subsequent joins do not overwrite this value.
+/// Subsequent joins do not overwrite this value. Extends TTL (Issue #1025, #1091).
 pub fn try_set_fund_queue_opened_at(env: &Env, invoice_id: u64) {
-    let key = StorageKey::FundQueueOpenedAt(invoice_id);
-    if !env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .set(&key, &env.ledger().sequence());
-    }
+    crate::storage::try_set_fund_queue_opened_at(env, invoice_id)
 }
 
 /// Return the ledger sequence when the fund queue for `invoice_id` was first
 /// opened (i.e. when the first LP joined), or `None` if the queue is still
 /// empty.
 pub fn get_fund_queue_opened_at(env: &Env, invoice_id: u64) -> Option<u32> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::FundQueueOpenedAt(invoice_id))
+    crate::storage::get_fund_queue_opened_at(env, invoice_id)
+}
+
+/// Issue #1015: per-key TTL headroom for the fund-queue records that gate
+/// `resolve_fund_queue`'s MEV-mitigation delay (Issue #MEV-1), the
+/// fail-closed archived-state check (Issue #1013), and the pre-upgrade TTL
+/// guard (Issue #1082, `TTL_MIN_LEDGERS_BEFORE_UPGRADE`).
+///
+/// `margin` is `remaining_ttl - TTL_MIN_LEDGERS_BEFORE_UPGRADE`: positive
+/// means the key has at least that much headroom above the threshold the
+/// upgrade guard enforces; zero or negative means it has already drifted
+/// into the zone an upgrade would reject (and, for `FundQueueOpenedAt`
+/// specifically, the zone where an untouched key risks the archived-state
+/// failure). `None` fields mean the corresponding key does not currently
+/// exist (never written, or already evicted).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundQueueTtlMargins {
+    pub fund_queue_ttl: Option<u32>,
+    pub fund_queue_margin: Option<i64>,
+    pub fund_queue_opened_at_ttl: Option<u32>,
+    pub fund_queue_opened_at_margin: Option<i64>,
+    pub queue_resolution_ttl: Option<u32>,
+    pub queue_resolution_margin: Option<i64>,
+}
+
+/// Issue #1015: measure the live TTL (and margin above
+/// `TTL_MIN_LEDGERS_BEFORE_UPGRADE`) for each fund-queue-related persistent
+/// key of `invoice_id`, so operators can monitor queue health and catch TTL
+/// drift before it causes an upgrade rejection (Issue #1082) or a
+/// `QueueStateArchived` failure (Issue #1013), rather than finding out only
+/// when one of those checks actually fires.
+pub fn get_fund_queue_ttl_margins(env: &Env, invoice_id: u64) -> FundQueueTtlMargins {
+    let threshold = crate::constants::TTL_MIN_LEDGERS_BEFORE_UPGRADE as i64;
+
+    let fq_key = StorageKey::FundQueue(invoice_id);
+    let (fund_queue_ttl, fund_queue_margin) = if env.storage().persistent().has(&fq_key) {
+        let ttl = env.storage().persistent().get_ttl(&fq_key);
+        (Some(ttl), Some(ttl as i64 - threshold))
+    } else {
+        (None, None)
+    };
+
+    let fqoa_key = StorageKey::FundQueueOpenedAt(invoice_id);
+    let (fund_queue_opened_at_ttl, fund_queue_opened_at_margin) =
+        if env.storage().persistent().has(&fqoa_key) {
+            let ttl = env.storage().persistent().get_ttl(&fqoa_key);
+            (Some(ttl), Some(ttl as i64 - threshold))
+        } else {
+            (None, None)
+        };
+
+    let qr_key = StorageKey::QueueResolution(invoice_id);
+    let (queue_resolution_ttl, queue_resolution_margin) =
+        if env.storage().persistent().has(&qr_key) {
+            let ttl = env.storage().persistent().get_ttl(&qr_key);
+            (Some(ttl), Some(ttl as i64 - threshold))
+        } else {
+            (None, None)
+        };
+
+    FundQueueTtlMargins {
+        fund_queue_ttl,
+        fund_queue_margin,
+        fund_queue_opened_at_ttl,
+        fund_queue_opened_at_margin,
+        queue_resolution_ttl,
+        queue_resolution_margin,
+    }
 }
 // Contract stats helpers
 // ----------------------------------------------------------------
@@ -1095,4 +1202,33 @@ pub fn get_last_pause_timestamp(env: &Env) -> u64 {
         .instance()
         .get(&StorageKey::LastPauseTimestamp)
         .unwrap_or(0)
+}
+
+// ----------------------------------------------------------------
+// Issue #1031: Queue Tie-Score Margin helpers
+// ----------------------------------------------------------------
+
+/// Return the current queue tie-score margin (default 0 = disabled).
+///
+/// When non-zero, `join_fund_queue` requires the joining LP to have a score
+/// of at least `current_best_score + margin`, rather than simply ≥ best_score.
+/// This raises the economic barrier to equal-score manipulation: an attacker
+/// at the default score cannot silently tie with an established LP without
+/// first building `margin` additional funded-invoice history.
+///
+/// Score range: 50 (default) to 100 (max). A margin > 50 is clamped to 50 by
+/// `set_queue_tie_score_margin` to avoid blocking legitimate high-rep LPs.
+pub fn get_queue_tie_score_margin(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::QueueTieScoreMargin)
+        .unwrap_or(0)
+}
+
+/// Persist a new queue tie-score margin. Clamped to [0, 50].
+pub fn set_queue_tie_score_margin(env: &Env, margin: u32) {
+    let margin = margin.min(50);
+    env.storage()
+        .instance()
+        .set(&StorageKey::QueueTieScoreMargin, &margin);
 }

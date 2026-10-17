@@ -36,7 +36,7 @@ Every mitigation available *today* against a compromised admin is an **off-chain
 |---|------|---------|-----------|----------------|
 | 1 | **Quadratic voting analysis** | `QuadraticVotingEnabled` flag (default `false`), governance-toggled. When on, `cast_vote` weight is `isqrt(own_balance + delegated_weight)` — floor integer sqrt via binary search over `i128`, `#![no_std]`-safe. Modeling against a synthetic power-law holder distribution showed it compresses a ~50% whale dominance to ~13% without disenfranchising large holders. **Recommendation: enable at mainnet launch** given the concentrated early token supply. Sybil-plus-flash-loan vote-splitting modeled in §6 (Issue #809): splitting `B` across `N` addresses multiplies weight by ~`sqrt(N)`, but every Sybil now needs its own aged pre-proposal checkpoint (Issue #805), so flash-funded swarms cannot materialise — no extra protocol cap added (documented decision). | ✅ Implemented; ⚠️ off by default — enabling is itself a governance action | [ADR-009](adr/ADR-009-quadratic-voting.md) |
 | 2 | **Delegation depth & cost bounds** | Transitive delegation is implemented (Issue #64). **Cycle detection and a hard maximum depth of 10 hops** prevent infinite loops and bound the per-vote traversal cost. Quadratic mode sums own + delegated balance *before* the square root (not sqrt-per-component), which removes the incentive to split power across many delegate chains — sqrt is concave, so splitting-then-summing would otherwise inflate weight. | ✅ Bounded (depth 10, cycle-checked) | [`governance.md` §9 "Delegation"](governance.md#9-security-considerations); [ADR-009 "Alternatives Considered"](adr/ADR-009-quadratic-voting.md#alternatives-considered) |
-| 3 | **Snapshot timing guarantees** | Voting power is pinned to **pre-proposal checkpoints** (Issue #805). Each voter holds a `BalanceCheckpoint { balance, ledger }` (`checkpoint_balance`, auto-seeded for proposers at `create_proposal`); a vote on a proposal created at ledger `C` requires `checkpoint.ledger + 10 <= C` and carries `min(checkpoint.balance, current_balance)`. The proposer's creation-time snapshot is still honoured (real funds must clear the proposer gate and escrow there). The proposal creation ledger is stored per proposal. Double-vote is blocked by a `HasVoted(proposal_id, voter)` receipt in temporary storage (TTL ≈ 4 days — the 3-day window plus a 1-day buffer). The applied weight (linear or quadratic) is recorded per-voter-per-proposal in an `AppliedVoteWeight` receipt for after-the-fact auditability. Delegation entries draw on the same proven balance; un-delegation always succeeds so tallies cannot get stuck. | ✅ Same-transaction flash-loan voting rejected (`InsufficientHoldingPeriod`); post-vote inflation impossible; ⚠️ residual — multi-ledger (non-flash) borrows, proposer-snapshot liveness — see §3.2 | [`governance.md` §2, §4](governance.md#2-governance-token-and-voting-power); [threat-model.md §E3](threat-model.md) |
+| 3 | **Snapshot timing guarantees** | Voting power is pinned to **pre-proposal checkpoints** (Issue #805). Each voter holds a `BalanceCheckpoint { balance, ledger }` (`checkpoint_balance`, auto-seeded for proposers at `create_proposal`); a vote on a proposal created at ledger `C` requires `checkpoint.ledger + 10 <= C` and carries `min(checkpoint.balance, current_balance)`. The proposer's creation-time snapshot is still honoured (real funds must clear the proposer gate and escrow there). The proposal creation ledger is stored per proposal. Double-vote is blocked by a `HasVoted(proposal_id, voter)` receipt in temporary storage (TTL ≈ 4 days — the 3-day window plus a 1-day buffer) **and** a durable persistent `VoteReceipt(proposal_id, voter)` mirror (Issue #1099) so a host-archived temporary receipt cannot reopen the double-vote window; the guard fails closed on presence in either store. The applied weight (linear or quadratic) is recorded per-voter-per-proposal in an `AppliedVoteWeight` receipt for after-the-fact auditability (its durable `VoteReceipt` mirror is the archival fallback). Veto multisig approvals are similarly durable per signer (`VetoApprovalReceipt`), so an archived approval list cannot reset a partially-collected veto. Delegation entries draw on the same proven balance; un-delegation always succeeds so tallies cannot get stuck. | ✅ Same-transaction flash-loan voting rejected (`InsufficientHoldingPeriod`); post-vote inflation impossible; ⚠️ residual — multi-ledger (non-flash) borrows, proposer-snapshot liveness — see §3.2 | [`governance.md` §2, §4](governance.md#2-governance-token-and-voting-power); [threat-model.md §E3](threat-model.md) |
 | 4 | **Spam resistance (proposals & votes)** | **Vote** spam: bounded by the per-voter double-vote receipt and by needing non-zero voting power (`NoVotingPower` rejects 0-balance callers). **Proposal** spam: the static `MinProposalBalance` holding gate plus a forfeitable `MinProposalDeposit` escrow (Issue #814, default `0` = disabled for backwards compatibility, governance-settable via `set_min_proposal_deposit`). `create_proposal` escrows the deposit, `execute_proposal` refunds it on `Passed`/`Executed` and forfeits it on `Rejected`/expired-without-quorum, `veto_proposal` forfeits on `Vetoed`. Forfeits go to the governance-configurable `ProposalDepositSink` treasury address (not the insurance pool — spam penalties are treasury revenue, mixing them would distort pool coverage accounting); when unset, forfeits stay locked in the governance contract. Events `ProposalDepositEscrowed` / `ProposalDepositRefunded` / `ProposalDepositForfeited`; settlement is idempotent via `ProposalDepositSettled` (double-refund safe). | ✅ Implemented (deposit `0` by default — governance must set a non-zero value to activate); ⚠️ residual — a wallet above the static gate can still spam while the deposit is `0` | [`governance.md` §9 "Double-proposal spam"](governance.md#9-security-considerations); [ADR-009 "set_min_proposal_balance"](adr/ADR-009-quadratic-voting.md) |
 | 5 | **Quorum consistency** | Quorum = `stored_total_supply * min_quorum_bps / 10_000` (default 10%, governance-configurable via `min_quorum_bps`). **`total_supply` is no longer caller-supplied**: `execute_proposal(proposal_id)` reads the contract-stored `GovTokenTotalSupply` (seeded at `initialize`, readable via `get_gov_token_total_supply`, updatable only by the ILN contract via `set_gov_token_total_supply`). A live SAC `total_supply()` query does not exist in `soroban-sdk` 21.x's SEP-41 interface, so the tracked counter is the on-chain source of truth (Issue #808). An attacker holding >10% of supply can still reach quorum alone. | ✅ Caller-supply manipulation closed; ⚠️ residual — tracked-supply staleness vs real mints/burns, see §3.3 | [`governance.md` §6 (note)](governance.md#6-quorum-and-majority-rules); [`governance.md` §9 "Quorum attacks"](governance.md#9-security-considerations) |
 | 6 | **Veto sunset roadmap** | The admin veto (`veto_proposal`, now multisig-gated per Issue #642) is an emergency brake for the early phase. `disable_veto_power()` is a **one-way switch** callable only by the ILN contract (i.e. via a passed governance proposal); after it, `veto_proposal` returns `VetoPowerDisabled`. ADR-012 sequences the retirement: **Phase 1** wire the contract-level multisig (ADR-008) → **Phase 2** expand governance's parameter authority → **Phase 3** implement and activate a timelock on `execute_proposal` → **Phase 4** retire the veto (requires Phases 1–3 done, the multisig proven as the operative emergency mechanism, and a governance vote). | ✅ **Phase 3 Complete** — timelock implemented, handoff is a documented plan with no phase complete; `disable_veto_power()` **must be called via governance vote before mainnet** but the prerequisites for doing so safely are not yet met | [`governance.md` §8](governance.md#8-admin-veto-power); [ADR-005](adr/ADR-005-governance-timelock.md); [ADR-012 §"Decision" (phases)](adr/ADR-012-governance-multisig-handoff.md) |
@@ -47,7 +47,14 @@ Every mitigation available *today* against a compromised admin is an **off-chain
 
 These are known, documented, and consciously carried into mainnet. They are listed here so a reviewer does not have to reconstruct them from six sources.
 
-### 3.1 No execution timelock
+### 3.1 Execution timelock (partially implemented)
+
+> **Update (#995/#999/#1002/#1005):** the contract now enforces an `eta_ledger` timelock and monotonic proposal states — see the [ADR-005 addendum](adr/ADR-005-governance-timelock.md#addendum-995-999-1002-1005-implemented-timelock-invariants). The default `ExecutionDelay` is still `0`, so mainnet must set a non-zero delay (admin `set_execution_delay`, capped at 518,400 ledgers) before the veto is retired. **Rollout:** no storage migration (no struct changes; new error codes 29–31 are additive). **Recovery:** if a bad delay is set, lower it with `set_execution_delay`; already-`Passed` proposals keep their original eta, and any `Passed` proposal can still be vetoed while the veto is enabled.
+>
+> **Known follow-ups, not fixed here:** (a) `execute_proposal` returns `Err` for quorum/majority rejection, and Soroban rolls back state on `Err`, so `Rejected` status and the deposit forfeit do not persist on-chain (tests bypass this with `as_contract`); (b) `delegate_votes` after voting can let the same balance be counted by the delegate; (c) the delay is admin-key controlled.
+
+Original accepted-risk text (pre-timelock):
+
 
 `execute_proposal` runs in the same transaction as the call that triggers it, immediately after the voting window closes ([ADR-005](adr/ADR-005-governance-timelock.md), [`governance.md` §7](governance.md#7-execution-mechanics)). The stated substitute is the admin veto, which can block any `Active`/`Passed` proposal. **Accepted because:** at launch the token distribution is concentrated enough that a long timelock would slow necessary parameter tuning without a real decentralization benefit, and the veto covers the "malicious proposal" case. **Exit:** ADR-012 Phase 3 implements and activates a real timelock via governance upgrade *before* the veto is retired.
 
@@ -65,6 +72,26 @@ Per [§2, finding 6](#2-findings-by-governance-hardening-area) and [ADR-012](adr
 
 ---
 
+## 4a. Rejected-transition events and cross-contract auth (Issues #1007 / #1008)
+
+* `execute_proposal` commits `Rejected` and emits `proposal_rejected` (reason:
+  `QuorumNotReached` / `MajorityAgainst`) instead of returning an `Err` that
+  Soroban rolls back; a failed cross-contract execution commits
+  `proposal_execution_failed` and leaves the proposal `Passed`.
+* A rejection is terminal: re-calling returns `AlreadyResolved`, the deposit is
+  forfeited exactly once, and a rejected proposal can no longer be voted on or
+  vetoed. No new storage keys; no unbounded growth.
+* `contracts/tests/governance_cross_contract_auth_test.rs` proves, with no
+  mocked auths on the execution path, that only a governance contract that is
+  ILN's `Admin` can drive ILN's admin setters, that a mis-wired deployment fails
+  closed, and that the timelock boundary (`eta - 1` refused, `eta` accepted)
+  holds across the contract boundary.
+* **Rollout:** deploy the new governance wasm, then update indexers/alerts to
+  consume `proposal_rejected` / `proposal_execution_failed`. **Recovery:** the
+  change is wasm-only (no storage migration); rolling back restores the old
+  `Err` returns. Proposals already `Active` past their window are rejected with
+  the new behaviour on the next `execute_proposal` call.
+
 ## 5. Adversarial Test Coverage (Issue #813)
 
 A dedicated test suite combines all governance attack vectors to verify the system rejects or economically deters combined attacks, not just isolated ones:
@@ -80,7 +107,7 @@ A dedicated test suite combines all governance attack vectors to verify the syst
 | `test_quadratic_sybil_split_needs_aged_checkpoint_per_address()` | Split 10_000 across 2 Sybils under quadratic voting | ✅ Only the aged Sybil counts (70 = `isqrt(5_000)`); the fresh Sybil is rejected | #809 |
 | `test_sybil_proposal_spam()` | Create many Sybil addresses, spam proposals | ✅ Rejected: MinProposalBalance gate prevents spam | #813 |
 | `test_delegation_cycle_prevention()` | Create delegation cycles (A→B→C→A) to confuse vote tallies | ✅ Rejected: cycle detection guard in `delegate_votes` | #813 |
-| `test_delegation_depth_bound()` | Create deep delegation chain (>10 hops) to increase vote resolution cost | ✅ Rejected: MaxDelegationDepth = 10 enforced | #813 |
+| `test_max_delegation_depth_cap_exceeded_panics()` / `test_delegation_depth_bound()` | Create deep delegation chain (> cap) to increase vote resolution cost, including appending at the leaf | ✅ Rejected: `MaxDelegationDepth` enforced against the delegator's full inbound depth for every insertion order (reverse adjacency, #1098) | #813, #1098 |
 | `test_combined_adversarial_attack()` | Flash-loan + Sybil + delegation + voting in sequence | ✅ Rejected: checkpoint gating + quorum mechanics | #813 |
 
 **Test location:** [`contracts/iln_governance/src/test.rs`](../contracts/iln_governance/src/test.rs) (compiled unit tests). The older [`contracts/tests/tests_adversarial_governance.rs`](../contracts/tests/tests_adversarial_governance.rs) scenario suite predates the current `initialize`/`create_proposal` API and is not compiled; its scenarios are superseded by the rows above (follow-up: delete or port it).
@@ -89,49 +116,24 @@ A dedicated test suite combines all governance attack vectors to verify the syst
 
 ---
 
-## 6. Quadratic Sybil-plus-flash-loan cost model (Issue #809)
+## 6. Execution & finalization hardening (Issues #1000, #1003, #1004, #1006)
 
-ADR-009 introduced quadratic voting (`weight = isqrt(own + delegated)`) to
-compress whale dominance; #735 audited it against realistic distributions.
-The open question here is the adaptive attacker: split a flash-loaned balance
-`B` across `N` fresh addresses and vote from each, approximating linear power
-under the quadratic curve — and interacting with the (now fixed, §3.2)
-first-vote snapshot gap.
+Audit path: `contracts/iln_governance/src/lib.rs` (`execute_proposal`, `cast_vote`, `veto_proposal`, `get_proposal`); ADR-005 (no-timelock v1 execution model).
 
-### 6.1 The math: splitting gains ~sqrt(N)
+| Issue | Before | After (fail-closed) |
+|-------|--------|---------------------|
+| #1000 | A `Vetoed` proposal returned the generic `AlreadyResolved` (or `VotingOngoing` pre-deadline). A stale `Passed` proposal could still execute after a newer same-kind proposal had executed, overwriting the newer outcome. | `Vetoed` -> `ProposalCancelled` at any time. `Passed` proposal created before the last executed same-kind proposal -> `ProposalSuperseded`. One `LastExecuted(kind)` entry per action kind (19 max) — bounded state. |
+| #1003 | Missing/zero `GovTokenTotalSupply` made `quorum = 0`, so any single vote passed; missing `MinQuorumBps` silently defaulted. | Unset/non-positive supply or unset/out-of-range bps -> `QuorumDataMissing`; no status change. |
+| #1004 | Tallies were combined with `saturating_add`; negative/overflowing tallies were not detected. | Negative or overflowing `votes_for`/`votes_against` -> `InvalidVoteAccounting`. (A `tally <= total_supply` check was deliberately **not** added: supply is a static seed and legitimate mints exceed it.) |
+| #1006 | A missing proposal entry was indistinguishable from a never-created id (`ProposalNotFound`). | Ids `1..=ProposalCount` with a missing entry or mismatched `id` -> `ProposalStorageCorrupt`. Never-issued ids (0, > count) stay `ProposalNotFound`. Applies to `get_proposal`, `cast_vote`, `execute_proposal`, `veto_proposal`. `list_proposals` still skips missing entries (read-only view). |
 
-Under `isqrt`, one address voting `B` carries `sqrt(B)`. Split evenly across
-`N` addresses, each carries `sqrt(B/N)`, for a combined `N·sqrt(B/N) =
-sqrt(B)·sqrt(N)` — a `sqrt(N)` influence multiplier (e.g. `N = 100` → 10×).
-This is inherent to any concave weight function and is *not* introduced by
-our `isqrt` implementation; summing before the root (ADR-009) already removes
-the delegate-chain variant of the same trick.
+**Rollout / upgrade.** Additive: new error codes 29-33 and one new storage key; no existing storage layout changes. Existing `Passed` proposals remain executable unless a newer same-kind proposal has executed. Before upgrading, confirm `get_gov_token_total_supply() > 0` and `get_min_quorum_bps()` in 1..=10,000 on the live deployment, otherwise active proposals will not finalize.
 
-### 6.2 What each Sybil costs after the Issue #805 fix
+**Recovery.** `QuorumDataMissing`: restore the value through the ILN-gated setters, then re-call `execute_proposal` (proposal remains `Active`). `ProposalStorageCorrupt` / `InvalidVoteAccounting`: the proposal is frozen (cannot execute); restore the entry from the persistent-storage archive/TTL restore, or re-propose. `ProposalSuperseded`: re-propose.
 
-| Cost per Sybil | Magnitude | Notes |
-|----------------|-----------|-------|
-| Aged pre-proposal checkpoint | ≥ 10 ledgers of lead time | `checkpoint.ledger + 10 <= proposal_created_ledger`, else `InsufficientHoldingPeriod` — a flash-funded swarm cannot materialise in one transaction |
-| Real aged funds at checkpoint time | `min(checkpoint, current)` caps weight | Flash-inflated checkpoints repay to dust before the vote; only funds that survive checkpoint→vote count |
-| Account + transaction fees | ~Stellar base reserve + fee × N | Sublinear `sqrt(N)` gain vs linear cost; break-even requires large `N`, each needing its own aged funding |
-| Delegation depth / cycle guards | Max depth 10, cycle-checked | Accumulator-funnelling variants are bounded |
+**Tests.** `test_1000_*`, `test_1003_*`, `test_1004_*`, `test_1006_*` in `contracts/iln_governance/src/test.rs`.
 
-Net: the split still yields `sqrt(N)` *if* the attacker pre-funds and ages `N`
-addresses with real capital — at which point it is no longer a flash loan but
-a costly, slow, on-chain-visible Sybil farm whose per-address weight is capped
-by surviving funds. The first-vote timing gap that made this atomic is closed
-(§3.2; regression test `test_quadratic_sybil_split_needs_aged_checkpoint_per_address`).
-
-### 6.3 Decision: no additional per-transaction/per-block cap
-
-The issue asked us to implement a new-address voting cap *if net-beneficial*.
-It is not: a cap adds consensus-critical complexity (what counts as
-"new"? per-tx vs per-ledger accounting, griefing via address rotation) to
-deter an attack whose atomic form is already rejected and whose slow form is
-economically dominated by simply buying and holding. The checkpoint-aging
-rule *is* the rate limit — one aged checkpoint per address per ~10 ledgers of
-lead time. Revisit only if on-chain monitoring shows aged-Sybil farms
-accumulating (trigger, not TODO).
+---
 
 ## 4. Cross-references
 

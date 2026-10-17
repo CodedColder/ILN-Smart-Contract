@@ -1020,14 +1020,13 @@ pub fn get_twap_price(env: &Env, feed_type: OracleFeedType, token: &Address) -> 
                 min_required: min_obs,
             },
         );
-        return Err(ContractError::InsufficientTwapObservations);
+        return None;
     }
     let window_ledgers = get_twap_window_ledgers(env);
     let window_seconds = window_ledgers.saturating_mul(LEDGER_SECONDS);
     let current_time = env.ledger().timestamp();
     let window_start = current_time.saturating_sub(window_seconds);
     crate::twap::twap_average(&samples, window_start, current_time)
-        .ok_or(ContractError::InsufficientTwapObservations)
 }
 
 /// TWAP-aware price read used by numeric `Price` consumers.
@@ -1045,7 +1044,11 @@ pub fn get_twap_aware_price(
     token: Address,
 ) -> Result<i128, ContractError> {
     if is_twap_enabled(&env, feed_type) {
-        return get_twap_price(&env, feed_type, &token);
+        // Surface the specific health-gate error first, then treat any
+        // remaining `None` as too few observations (no silent spot fallback).
+        require_healthy_price_feed(&env, feed_type, &token)?;
+        return get_twap_price(&env, feed_type, &token)
+            .ok_or(ContractError::InsufficientTwapObservations);
     }
     get_verified_price(env, feed_type, token)
 }

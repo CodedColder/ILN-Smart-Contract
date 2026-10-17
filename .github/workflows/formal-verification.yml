@@ -1,0 +1,46 @@
+name: Formal Verification
+
+on:
+  pull_request:
+    paths:
+      - "contracts/iln_governance/**"
+      - "contracts/tests/**"
+      - "docs/formal-verification.md"
+      - "docs/formal-verification-cross-contract.md"
+      - "docs/proof-obligations.md"
+      - "docs/proof-obligations.json"
+      - "scripts/run-formal-verification.sh"
+      - "scripts/check-proof-obligations.py"
+      - ".github/workflows/formal-verification.yml"
+  push:
+    branches: [dev, main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: formal-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formal-counterexamples:
+    name: Formal counterexamples gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Runs: governance differential + archival/TTL + proptest counterexamples,
+      # the published proof-obligation registry check (#1100), and the
+      # cross-contract invariant harness when its dependencies build.
+      - name: Run formal verification gate
+        run: bash scripts/run-formal-verification.sh

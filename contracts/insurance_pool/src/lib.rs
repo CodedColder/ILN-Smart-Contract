@@ -31,7 +31,7 @@ pub use insurance_interface::{
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, BytesN, Env,
+    Address, BytesN, Env, IntoVal, Symbol, Val,
 };
 
 /// Minimum defaults on a single (lp, payer) pair before the collusion
@@ -668,10 +668,10 @@ pub fn calculate_premium_rate_bps(env: Env, lp: Address) -> u32 {
 
         // Cross-contract call: reputation_bonus.get_reputation(lp) → ReputationScore
         // We only need the `score` field (0–100).
-        let args = soroban_sdk::vec![&env, soroban_sdk::IntoVal::into_val(&lp, &env)];
-        let result = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+        let args = soroban_sdk::vec![&env, lp.into_val(&env)];
+        let result = env.try_invoke_contract::<Val, soroban_sdk::Error>(
             &rep_contract,
-            &soroban_sdk::Symbol::new(&env, "get_reputation"),
+            &Symbol::new(&env, "get_reputation"),
             args,
         );
 
@@ -1660,10 +1660,7 @@ impl InsurancePoolInterface for InsurancePool {
 
         // Transfer tokens from LP to pool (checks-effects-interactions pattern).
         // State changes above must complete before this external call.
-        let token = match Self::get_token_client(&env) {
-            Ok(client) => client,
-            Err(err) => panic_with_error!(&env, err),
-        };
+        let token = Self::get_token_client(&env).unwrap_or_else(|e| panic_with_error!(&env, e));
         token.transfer(
             &lp,                             // from (caller)
             &env.current_contract_address(), // to (this contract)
@@ -1724,10 +1721,7 @@ impl InsurancePoolInterface for InsurancePool {
                 .set(&DataKey::Claimed(invoice_id), &true);
 
             // Transfer tokens from pool to LP (Issue #527).
-            let token = match Self::get_token_client(&env) {
-                Ok(client) => client,
-                Err(err) => panic_with_error!(&env, err),
-            };
+            let token = Self::get_token_client(&env).unwrap_or_else(|e| panic_with_error!(&env, e));
             token.transfer(
                 &env.current_contract_address(), // from (this contract)
                 &lp,                             // to

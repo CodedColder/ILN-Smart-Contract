@@ -6,7 +6,7 @@ pub const CONTRACT_VERSION: &str = "1.0.0";
 /// Issue #539: Current storage schema version. Bump this whenever the
 /// persistent/instance storage layout changes so that `migrate()` can
 /// detect and apply incremental upgrades.
-pub const CURRENT_STORAGE_VERSION: u32 = 2;
+pub const CURRENT_STORAGE_VERSION: u32 = 3;
 
 // ----------------------------------------------------------------
 // Rate Limiting Defaults (Issue #541)
@@ -42,22 +42,16 @@ pub const MAX_REPUTATION_DECAY_PERIODS: u64 = 1000;
 /// block to lock-out competing LPs (Issue #MEV-1).
 pub const QUEUE_DELAY_LEDGERS: u32 = 120;
 
-/// Issue #1091: maximum number of entries a single invoice's fund queue may
-/// hold. `join_fund_queue` is O(n) in the queue length (duplicate scan +
-/// sorted insert) and rewrites the whole vector, so an unbounded queue lets
-/// anyone grief the queue (and, since Issue #1090, funding of the invoice)
-/// by spamming joins from fresh addresses until the entry exceeds Soroban's
-/// per-transaction resource limits.
-///
-/// When the queue is full a new LP is admitted only if its score strictly
-/// exceeds the lowest queued score, displacing that lowest entry — an entry
-/// that can no longer win, so every *potential* winner is retained until
-/// resolution.
+/// Issue #1022: hard cap on LPs per invoice fund queue. Bounds the persistent
+/// `FundQueue` entry and the O(n) scans in `join_fund_queue` /
+/// `resolve_fund_queue` regardless of how long the queue sits open.
 pub const MAX_FUND_QUEUE_LEN: u32 = 50;
 
-/// Issue #1091: TTL policy for the fund-queue keys (`FundQueue`,
-/// `FundQueueOpenedAt`, `QueueResolution`). Matches the invoice's own
-/// `extend_ttl(1_000_000, 2_000_000)` in `storage::save_invoice` so the
-/// queue cannot be archived while the invoice it gates is still live.
-pub const FUND_QUEUE_TTL_THRESHOLD: u32 = 1_000_000;
-pub const FUND_QUEUE_TTL_EXTEND_TO: u32 = 2_000_000;
+/// Issue #1020: ledgers an approved LP has, after `resolve_fund_queue`, to
+/// fund before anyone may call `recover_fund_queue` to evict them (~1 hour).
+pub const QUEUE_RESOLUTION_TTL_LEDGERS: u32 = 720;
+
+/// Issue #1020: when the invoice is due within this many seconds, the
+/// recovery grace period shortens from `QUEUE_RESOLUTION_TTL_LEDGERS` to
+/// `QUEUE_DELAY_LEDGERS` so a stalled winner cannot run out the clock.
+pub const NEAR_EXPIRY_WINDOW_SECS: u64 = 60 * 60 * 24;

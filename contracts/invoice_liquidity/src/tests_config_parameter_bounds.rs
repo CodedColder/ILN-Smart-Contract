@@ -20,7 +20,7 @@ use super::test::{setup, TestEnv};
 // ================================================================
 
 #[test]
-fn test_decay_rate_bps_boundary_accepted_at_max() {
+pub(crate) fn test_decay_rate_bps_boundary_accepted_at_max() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -43,7 +43,7 @@ fn test_decay_rate_bps_boundary_accepted_at_max() {
 }
 
 #[test]
-fn test_decay_rate_bps_exceeding_max_rejected() {
+pub(crate) fn test_decay_rate_bps_exceeding_max_rejected() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -90,7 +90,7 @@ fn test_decay_rate_bps_zero_accepted() {
 // ================================================================
 
 #[test]
-fn test_high_rep_threshold_boundary_accepted_at_max() {
+pub(crate) fn test_high_rep_threshold_boundary_accepted_at_max() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -113,7 +113,7 @@ fn test_high_rep_threshold_boundary_accepted_at_max() {
 }
 
 #[test]
-fn test_high_rep_threshold_exceeding_max_rejected() {
+pub(crate) fn test_high_rep_threshold_exceeding_max_rejected() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -180,7 +180,7 @@ fn test_high_rep_threshold_mid_range_accepted() {
 // ================================================================
 
 #[test]
-fn test_min_discount_rate_bps_zero_rejected() {
+pub(crate) fn test_min_discount_rate_bps_zero_rejected() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -203,7 +203,7 @@ fn test_min_discount_rate_bps_zero_rejected() {
 }
 
 #[test]
-fn test_min_discount_rate_bps_boundary_accepted_below_max() {
+pub(crate) fn test_min_discount_rate_bps_boundary_accepted_below_max() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -226,7 +226,7 @@ fn test_min_discount_rate_bps_boundary_accepted_below_max() {
 }
 
 #[test]
-fn test_min_discount_rate_bps_exceeding_max_rejected() {
+pub(crate) fn test_min_discount_rate_bps_exceeding_max_rejected() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -299,7 +299,7 @@ fn test_min_discount_rate_bps_low_value_accepted() {
 /// If any parameter's upper bound is silently removed in a refactor,
 /// this test will fail.
 #[test]
-fn test_all_parameters_at_max_bounds() {
+pub(crate) fn test_all_parameters_at_max_bounds() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -324,7 +324,7 @@ fn test_all_parameters_at_max_bounds() {
 /// Composite test: at least one parameter exceeds its bound.
 /// Validates that bounds are actually enforced in combination.
 #[test]
-fn test_one_parameter_exceeds_bound_rejected() {
+pub(crate) fn test_one_parameter_exceeds_bound_rejected() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -348,7 +348,7 @@ fn test_one_parameter_exceeds_bound_rejected() {
 
 /// Test: minimal valid parameter set (all at lower bounds where applicable).
 #[test]
-fn test_minimal_valid_parameters() {
+pub(crate) fn test_minimal_valid_parameters() {
     let t = setup();
 
     let result = t.contract.try_update_config(
@@ -372,7 +372,7 @@ fn test_minimal_valid_parameters() {
 
 /// Test: typical production parameters (mid-range, sensible governance defaults).
 #[test]
-fn test_typical_production_parameters() {
+pub(crate) fn test_typical_production_parameters() {
     let t = setup();
 
     let result = t.contract.try_update_config(

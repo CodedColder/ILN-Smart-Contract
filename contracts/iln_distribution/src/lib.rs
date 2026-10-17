@@ -107,7 +107,7 @@ impl IlnDistribution {
     ///   contract (Issue #861). The check runs before any state is written,
     ///   so a rejected deployment leaves the contract uninitialized and
     ///   retryable.
-    pub fn initialize(env: Env, iln_contract: Address, gov_token: Address) {
+    pub fn initialize(env: Env, iln_contract: Address, gov_token: Address) -> Result<(), DistributionError> {
         if env.storage().instance().has(&StorageKey::Initialized) {
             soroban_sdk::panic_with_error!(&env, DistributionError::AlreadyInitialized);
         }
@@ -141,6 +141,8 @@ impl IlnDistribution {
                 gov_token,
             },
         );
+
+        Ok(())
     }
 
     /// Re-check the governance-token mint authority invariant (Issue #861).

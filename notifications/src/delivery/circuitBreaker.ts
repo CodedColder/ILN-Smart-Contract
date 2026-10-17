@@ -4,6 +4,13 @@ export interface CircuitBreakerOptions {
   failureThreshold?: number | undefined;
   cooldownMs?: number | undefined;
   now?: (() => number) | undefined;
+  /**
+   * Called exactly once per transition *into* the `open` state — including a
+   * half-open probe failing. Never called for sends that were merely skipped
+   * because the circuit was already open, so consumers (delivery analytics,
+   * Issue #872) can count real trips rather than skipped attempts.
+   */
+  onTrip?: ((snapshot: CircuitSnapshot) => void) | undefined;
 }
 
 export interface CircuitSnapshot {
@@ -23,11 +30,13 @@ export class CircuitBreaker {
   private readonly failureThreshold: number;
   private readonly cooldownMs: number;
   private readonly now: () => number;
+  private readonly onTrip: ((snapshot: CircuitSnapshot) => void) | undefined;
 
   constructor(opts: CircuitBreakerOptions = {}) {
     this.failureThreshold = opts.failureThreshold ?? DEFAULT_FAILURE_THRESHOLD;
     this.cooldownMs = opts.cooldownMs ?? DEFAULT_COOLDOWN_MS;
     this.now = opts.now ?? Date.now;
+    this.onTrip = opts.onTrip;
   }
 
   getState(): CircuitState {
@@ -81,6 +90,11 @@ export class CircuitBreaker {
       logger?.(
         `circuit_breaker_open consecutive_failures=${this.consecutiveFailures}`,
       );
+      this.onTrip?.({
+        state: 'open',
+        consecutiveFailures: this.consecutiveFailures,
+        openedAt: this.openedAt,
+      });
     }
   }
 

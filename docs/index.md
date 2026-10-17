@@ -22,6 +22,7 @@ Start here when you are looking for ILN protocol, contract, service, or contribu
 | [Reputation Model](reputation-model.md) | Reputation and NFT lifecycle guide: initialization, accrual, lazy decay, NFT interaction, source of truth. |
 | [Reputation System](reputation.md) | Reputation mechanics, parameters, events, and FAQ. |
 | [Multi-Token Support](multi-token.md) | SAC, USDC, XLM, and supported token configuration. |
+| [Token Safety](token-safety.md) | Token admission checks, decimals, SAC authorization, frozen accounts, clawback, and escrowed payouts. |
 | [Storage Layout](storage-layout.md) | Contract storage keys and data structures. |
 
 ## Security And Operations
@@ -42,6 +43,7 @@ Start here when you are looking for ILN protocol, contract, service, or contribu
 | [Pre-Audit Checklist](pre-audit-checklist.md) | Audit preparation tasks. |
 | [Formal Verification (lifecycle)](formal-verification.md) | Invoice/governance invariants. |
 | [Formal Verification (cross-contract)](formal-verification-cross-contract.md) | ILN × distribution × insurance system invariants. |
+| [Cross-Contract Proof Obligations](proof-obligations.md) | Machine-checked registry mapping each cross-contract invariant to its code path and discharging test. |
 
 
 ## Protocol Economics & Risk

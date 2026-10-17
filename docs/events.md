@@ -120,6 +120,7 @@ check fails if a row exists in one place but not the other.
 | [InvoiceTokenChanged](#invoicetokenchanged) | `convert_invoice_token` |
 | [FundRequested](#fundrequested) | `join_fund_queue` |
 | [FundQueueResolved](#fundqueueresolved) | `resolve_fund_queue` |
+| [FundQueueRecovered](#fundqueuerecovered) | `recover_fund_queue` |
 | [InvoiceFunded](#invoicefunded) | `fund_invoice` |
 | [InvoiceTransferred](#invoicetransferred) | `transfer_invoice` |
 | [LPPositionTransferred](#lppositiontransferred) | `transfer_lp_position` |
@@ -163,6 +164,7 @@ State-changing functions and their event coverage (✅ = emits an event,
 | `submit_invoices_batch` | ✅ `InvoiceSubmitted` per invoice |
 | `join_fund_queue` | ✅ `FundRequested` |
 | `resolve_fund_queue` | ✅ `FundQueueResolved` |
+| `recover_fund_queue` | ✅ `FundQueueRecovered` |
 | `fund_invoice` | ✅ `InvoiceFunded` (+ `InvoiceExpired` if expiry detected, + `InvoiceNftTransferred`) |
 | `transfer_invoice` | ✅ `InvoiceTransferred` |
 | `transfer_lp_position` | ✅ `LPPositionTransferred` |
@@ -326,6 +328,17 @@ Topics: `["fund_queue_resolved", invoice_id, approved_lp]`
 | `invoice_id` | `u64` | Target invoice |
 | `approved_lp` | `Address` | Winning LP |
 | `score` | `u32` | Winning score |
+
+### FundQueueRecovered
+
+Topics: `["fund_queue_recovered", invoice_id]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `invoice_id` | `u64` | Target invoice |
+| `evicted_lp` | `Option<Address>` | Stalled approved LP that was evicted, if any |
+| `remaining_lps` | `u32` | LPs left in the reopened queue (`0` when purged) |
+| `purged` | `bool` | `true` when the invoice was no longer fundable and all queue state was deleted |
 
 ### InvoiceFunded
 
@@ -910,6 +923,39 @@ Topics: `["proposal_executed", proposal_id]`
 | `proposed_value` | `i128` | The value that was applied |
 | `votes_for` | `i128` | Total votes in favour |
 | `votes_against` | `i128` | Total votes against |
+
+### ProposalRejected
+
+Emitted when voting has closed and an `Active` proposal is rejected (Issue #1007).
+`execute_proposal` now **returns `Ok`** for this transition: Soroban rolls back
+all storage writes and events of a call that returns `Err`, so the previous
+`Err(QuorumNotReached)` / `Err(ProposalRejected)` return meant the `Rejected`
+status, the deposit forfeiture and any event were never committed on-chain.
+
+Topics: `["proposal_rejected", proposal_id]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `proposal_id` | `u64` | Rejected proposal identifier |
+| `reason` | `RejectionReason` | `QuorumNotReached` (votes below quorum) or `MajorityAgainst` (`votes_for <= votes_against`, including ties) |
+| `votes_for` | `i128` | Votes in favour |
+| `votes_against` | `i128` | Votes against |
+| `quorum` | `i128` | Quorum (in votes) that applied |
+
+### ProposalExecutionFailed
+
+Emitted when a `Passed` proposal's cross-contract call fails (callee error,
+or the callee's `require_auth` rejects governance as caller). Since Issue #1007
+`execute_proposal` returns `Ok` after emitting it, so the event is committed;
+the proposal stays `Passed` with its original `eta_ledger` and can be retried.
+Indexers should key on this event, not on a transaction error.
+
+Topics: `["proposal_execution_failed", proposal_id]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `proposal_id` | `u64` | Proposal whose execution failed |
+| `action_type` | `ProposalAction` | The action that failed |
 
 ### ProposalVetoed
 

@@ -17,6 +17,13 @@ suites — those cannot see foreign contract storage.
 **Harness:** `contracts/tests/cross_contract_invariants_test.rs`  
 **Run:** `cargo test -p invoice_liquidity --test cross_contract_invariants_test`
 
+**Published registry (Issue #1100):** the binding obligation↔test mapping is
+machine-readable in [`proof-obligations.json`](proof-obligations.json), described
+in [`proof-obligations.md`](proof-obligations.md), and validated against the tree
+by `scripts/check-proof-obligations.py` and
+`contracts/iln_governance/src/tests_proof_obligations.rs`. Any change to the
+invariants below must update the registry too (the check fails otherwise).
+
 ---
 
 ## 2. Invariant X1 — Funding notifies distribution (when wired)
