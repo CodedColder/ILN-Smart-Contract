@@ -1,5 +1,6 @@
 pub use crate::storage::DataKey as StorageKey;
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::testutils::storage::Persistent as _;
 
 /// A nullable BytesN<32> that works with #[contracttype] derive.
 /// In Soroban SDK 21.x, `Option<BytesN<32>>` doesn't implement the required

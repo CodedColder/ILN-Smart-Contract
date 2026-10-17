@@ -52,12 +52,12 @@ use events::{
     AdminChanged, AppealResolved, ContractInitialized, ContractPaused, ContractUnpaused,
     ContractUpgraded, DefaultAppealed, DisputeResolved, DisputeUpheldPayerRefund,
     DistributionContractUpdated, EqualScoreManipulationSimulated, FundQueueResolutionAttempted,
-    FundQueueResolved, FundRequested, InsuranceClaimAttempted, InvoiceCancelled, InvoiceDefaulted,
-    InvoiceDisputed, InvoiceExpired, InvoiceFunded, InvoicePaid, InvoicePartiallyPaid,
-    InvoiceSubmitted, InvoiceTokenChanged, InvoiceTransferred, InvoiceUpdated,
-    LPPositionTransferred, ParameterUpdated, PriceOracleUpdated, QueueTieScoreMarginUpdated,
-    RollbackRehearsalCompleted, SignerRotationCancelled, SignerRotationFinalized,
-    SignerRotationScheduled, TokenAdded, TokenRemoved,
+    FundQueueResolved, FundQueueTieBroken, FundRequested, InsuranceClaimAttempted,
+    InvoiceCancelled, InvoiceDefaulted, InvoiceDisputed, InvoiceExpired, InvoiceFunded,
+    InvoicePaid, InvoicePartiallyPaid, InvoiceSubmitted, InvoiceTokenChanged, InvoiceTransferred,
+    InvoiceUpdated, LPPositionTransferred, ParameterUpdated, PriceOracleUpdated,
+    QueueTieScoreMarginUpdated, RollbackRehearsalCompleted, SignerRotationCancelled,
+    SignerRotationFinalized, SignerRotationScheduled, TokenAdded, TokenRemoved,
 };
 use invoice::get_last_pause_timestamp;
 use invoice::{
@@ -2330,6 +2330,21 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
 
         save_queue_resolution(&env, invoice_id, &best_lp);
 
+        // Issue #1027: emit FundQueueTieBroken when the winner was drawn by
+        // PRNG among two or more equally-scored LPs. Lets off-chain
+        // monitors measure tie frequency and per-LP tie-win rates.
+        if tied_count > 1 {
+            env.events().publish(
+                (Symbol::new(&env, "fund_queue_tie_broken"), invoice_id),
+                FundQueueTieBroken {
+                    invoice_id,
+                    tied_count,
+                    winner_index,
+                    approved_lp: best_lp.clone(),
+                },
+            );
+        }
+
         // Emit resolution attempt event (successful).
         let current_ledger = env.ledger().sequence();
         env.events().publish(
@@ -4286,3 +4301,5 @@ mod tests_config_parameter_bounds;
 mod tests_token_safety;
 // Issue #1025: Benchmark extension cost at maximum depth and queue TTL / pause controls
 mod tests_max_depth_extension;
+// Issue #1027: Focused tests for join-order tie-breaking replacement
+mod tests_tie_breaking;
