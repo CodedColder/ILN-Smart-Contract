@@ -1245,3 +1245,208 @@ fn benchmark_envelope_read_views_at_cap() {
         assert_within_resource_budget(*name, *cpu, *mem, MAX_CPU_INSTRUCTIONS, MAX_MEMORY_BYTES);
     }
 }
+
+// -----------------------------------------------------------------------
+// Issue #1050: oracle-freshness gate cost on the funding path
+// -----------------------------------------------------------------------
+
+/// Minimal verifying oracle for the freshness-gate benchmark: returns
+/// `is_verified = true` with an externally-set ledger-sequence timestamp,
+/// mirroring `tests_oracle_freshness.rs`'s `MockTimestampedOracle`.
+#[contract]
+struct BenchTimestampedOracle;
+
+#[contractimpl]
+impl BenchTimestampedOracle {
+    /// Store the ledger-sequence timestamp `get_payer_data` will report.
+    pub fn set_timestamp(env: Env, ts: u32) {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("ts"), &ts);
+    }
+
+    pub fn interface_version(_env: Env) -> u32 {
+        crate::oracle_interface::ORACLE_INTERFACE_VERSION
+    }
+
+    pub fn get_payer_data(env: Env, _payer: Address) -> OracleVerificationResponse {
+        let ts: u32 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("ts"))
+            .unwrap_or(env.ledger().sequence());
+        OracleVerificationResponse {
+            is_verified: true,
+            timestamp: ts,
+        }
+    }
+}
+
+/// Issue #1050 before/after. The freshness gate is now one shared predicate
+/// (`oracle_registry::is_oracle_data_stale`) evaluated on the funding path, in
+/// place of the inline saturating-subtraction it replaces. `benchmark_fund_invoice`
+/// (above) measures the *ungated* path (`require_oracle_verification = false`);
+/// this measures the *gated* path (`true`) against a verifying oracle whose data
+/// sits exactly on the **last-fresh** ledger for the configured window
+/// (`age == max_age - 1`), i.e. the boundary the rule is built around. The delta
+/// between the two figures is the cost the ledger-boundary freshness rule adds,
+/// and the absolute figure proves the fix — which additionally rejects
+/// future-dated data the old formulation accepted — stays inside the same
+/// per-invocation budget.
+#[test]
+fn benchmark_fund_invoice_oracle_freshness_gate() {
+    let bench = setup_benchmark_env();
+
+    // Put the sequence somewhere with headroom so the boundary age cannot
+    // underflow, and pin a small explicit window so the last-fresh ledger is
+    // reachable without advancing the default 17 280-ledger window.
+    let mut ledger = bench.env.ledger().get();
+    ledger.sequence_number = 1_000;
+    bench.env.ledger().set(ledger);
+
+    let max_age: u64 = 10;
+    bench.contract.set_max_oracle_age(&max_age).unwrap();
+
+    let id = submit_invoice_bench(&bench);
+
+    // Data one ledger inside the window: age == max_age - 1 → fresh.
+    let current_seq = bench.env.ledger().sequence();
+    let oracle_ts = current_seq - (max_age as u32 - 1);
+
+    let oracle_id = bench.env.register_contract(None, BenchTimestampedOracle);
+    BenchTimestampedOracleClient::new(&bench.env, &oracle_id).set_timestamp(&oracle_ts);
+    bench.contract.set_price_oracle(&oracle_id).unwrap();
+
+    let (cpu, mem) = measure(&bench.env, "fund_invoice_oracle_gate_fresh", || {
+        bench
+            .contract
+            .fund_invoice(&bench.lp, &id, &BENCH_INVOICE_AMOUNT, &true);
+    });
+    assert_within_resource_budget(
+        "fund_invoice_oracle_gate_fresh",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+// -----------------------------------------------------------------------
+// Issue #1052: oracle-timestamp monotonicity gate cost on the funding path
+// -----------------------------------------------------------------------
+
+/// Issue #1052 before/after. The monotonicity gate adds one persisted
+/// `OracleHealthStatus` read plus a comparison to the funding path, evaluated
+/// *before* `record_oracle_health` overwrites the snapshot. The #1050
+/// benchmark above measures the gated path with **no** prior snapshot, so the
+/// regression predicate short-circuits on "no snapshot"; this measures the
+/// gated path with a **seeded** baseline and the oracle re-serving exactly
+/// that timestamp (the non-decreasing equality edge — accepted, so the compare
+/// actually runs). The delta between the two gated figures is the cost the
+/// monotonicity check adds, and the absolute figure proves it stays inside the
+/// same per-invocation budget.
+#[test]
+fn benchmark_fund_invoice_oracle_timestamp_monotonicity_gate() {
+    let bench = setup_benchmark_env();
+
+    let mut ledger = bench.env.ledger().get();
+    ledger.sequence_number = 1_000;
+    bench.env.ledger().set(ledger);
+
+    let id = submit_invoice_bench(&bench);
+
+    // Oracle reports a timestamp a couple of ledgers inside the default window.
+    let current_seq = bench.env.ledger().sequence();
+    let oracle_ts = current_seq - 2;
+
+    let oracle_id = bench.env.register_contract(None, BenchTimestampedOracle);
+    BenchTimestampedOracleClient::new(&bench.env, &oracle_id).set_timestamp(&oracle_ts);
+    bench.contract.set_price_oracle(&oracle_id).unwrap();
+
+    // Seed the monotonicity baseline so the predicate reads and compares a
+    // stored snapshot rather than short-circuiting.
+    bench.env.as_contract(&bench.contract.address, || {
+        crate::oracle_registry::record_oracle_health(
+            &bench.env,
+            OracleFeedType::Identity,
+            &bench.token,
+            &oracle_id,
+            oracle_ts,
+            DEFAULT_MAX_ORACLE_AGE_LEDGERS,
+        );
+    });
+
+    let (cpu, mem) = measure(&bench.env, "fund_invoice_oracle_monotonic", || {
+        bench
+            .contract
+            .fund_invoice(&bench.lp, &id, &BENCH_INVOICE_AMOUNT, &true);
+    });
+    assert_within_resource_budget(
+        "fund_invoice_oracle_monotonic",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+// -----------------------------------------------------------------------
+// Issue #1053: duplicate-update-frequency gate cost on the funding path
+// -----------------------------------------------------------------------
+
+/// Issue #1053 before/after. The duplicate-frequency bound reads
+/// `consecutive_duplicate_count` off the *same* `OracleHealthStatus` snapshot
+/// the #1052 monotonicity gate already fetches — no extra storage read, one
+/// extra comparison — so it should track the monotonicity figure closely. This
+/// measures the gated path with the duplicate streak staged one below the cap
+/// and the oracle re-serving exactly the recorded timestamp, so the benchmarked
+/// read is the duplicate that is *still accepted* (and pushes the streak onto
+/// the cap; the next identical read would be rejected with
+/// `OracleDuplicateUpdate`). The absolute figure proves the added bound stays
+/// inside the same per-invocation budget as the monotonicity gate above.
+#[test]
+fn benchmark_fund_invoice_oracle_duplicate_frequency_gate() {
+    let bench = setup_benchmark_env();
+
+    let mut ledger = bench.env.ledger().get();
+    ledger.sequence_number = 1_000;
+    bench.env.ledger().set(ledger);
+
+    let id = submit_invoice_bench(&bench);
+
+    let current_seq = bench.env.ledger().sequence();
+    let oracle_ts = current_seq - 2;
+
+    let oracle_id = bench.env.register_contract(None, BenchTimestampedOracle);
+    BenchTimestampedOracleClient::new(&bench.env, &oracle_id).set_timestamp(&oracle_ts);
+    bench.contract.set_price_oracle(&oracle_id).unwrap();
+
+    // `MAX_CONSECUTIVE_DUPLICATE_UPDATES` identical reads leave the streak at
+    // cap - 1, so the benchmarked read is accepted (not the rejection path).
+    let cap = crate::oracle_registry::MAX_CONSECUTIVE_DUPLICATE_UPDATES;
+    bench.env.as_contract(&bench.contract.address, || {
+        for _ in 0..cap {
+            crate::oracle_registry::record_oracle_health(
+                &bench.env,
+                OracleFeedType::Identity,
+                &bench.token,
+                &oracle_id,
+                oracle_ts,
+                DEFAULT_MAX_ORACLE_AGE_LEDGERS,
+            );
+        }
+    });
+
+    let (cpu, mem) = measure(&bench.env, "fund_invoice_oracle_duplicate", || {
+        bench
+            .contract
+            .fund_invoice(&bench.lp, &id, &BENCH_INVOICE_AMOUNT, &true);
+    });
+    assert_within_resource_budget(
+        "fund_invoice_oracle_duplicate",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}

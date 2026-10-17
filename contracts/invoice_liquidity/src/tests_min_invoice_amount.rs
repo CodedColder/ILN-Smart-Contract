@@ -239,3 +239,152 @@ fn test_admin_adds_token_with_different_decimals() {
     );
     assert_eq!(result, Err(Ok(ContractError::InvalidAmount)));
 }
+
+// ================================================================
+// Issue #1051: prevent missing decimals weakening precision
+//
+// The amount floor is now enforced *solely* through the token's
+// registered decimal precision (fail closed). The former
+// decimals-blind `validate_invoice_terms` helper — a hardcoded
+// 6-decimal floor (1_000_000) — has been removed from
+// `submit_invoice`, `update_invoice` and `submit_invoices_batch`, so
+// no entry point can compare an amount against an assumed scale.
+// For a 7-decimal asset that legacy floor was 10x too small.
+// ================================================================
+
+fn batch_param(t: &TestEnv, token: &Address, amount: i128) -> InvoiceParams {
+    InvoiceParams {
+        freelancer: t.freelancer.clone(),
+        payer: t.payer.clone(),
+        amount,
+        due_date: due_date(t),
+        discount_rate: DISCOUNT_RATE,
+        token: token.clone(),
+        referral_code: ReferralCode::None,
+    }
+}
+
+/// A 7-decimal token's floor is 10_000_000 (1 XLM). A value that clears
+/// the legacy 6-decimal floor (1_000_000) but sits below the token's own
+/// floor must be rejected by `update_invoice`.
+#[test]
+fn test_issue_1051_update_invoice_enforces_token_floor() {
+    let t = setup_extended();
+    let id = t.contract.submit_invoice(
+        &t.freelancer,
+        &t.payer,
+        &10_000_000i128,
+        &due_date(&t),
+        &DISCOUNT_RATE,
+        &t.xlm,
+        &ReferralCode::None,
+    );
+
+    // Clears the legacy 6-decimal floor but is below 1 XLM.
+    assert_eq!(
+        t.contract.try_update_invoice(
+            &t.freelancer,
+            &id,
+            &9_999_999i128,
+            &due_date(&t),
+            &DISCOUNT_RATE,
+        ),
+        Err(Ok(ContractError::InvalidAmount))
+    );
+
+    // At the token floor the update is accepted and persisted.
+    assert_eq!(
+        t.contract.try_update_invoice(
+            &t.freelancer,
+            &id,
+            &10_000_000i128,
+            &due_date(&t),
+            &DISCOUNT_RATE,
+        ),
+        Ok(Ok(()))
+    );
+    assert_eq!(t.contract.get_invoice(&id).amount, 10_000_000i128);
+}
+
+#[test]
+fn test_issue_1051_batch_enforces_token_floor() {
+    let t = setup_extended();
+
+    let mut below = Vec::new(&t.env);
+    below.push_back(batch_param(&t, &t.xlm, 9_999_999));
+    assert_eq!(
+        t.contract.try_submit_invoices_batch(&below),
+        Err(Ok(ContractError::InvalidAmount))
+    );
+    // Rejected batch consumed no invoice ids.
+    assert_eq!(t.contract.get_invoice_count(), 0);
+
+    let mut at_floor = Vec::new(&t.env);
+    at_floor.push_back(batch_param(&t, &t.xlm, 10_000_000));
+    let ids = t.contract.submit_invoices_batch(&at_floor);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(
+        t.contract.get_invoice(&ids.get(0).unwrap()).amount,
+        10_000_000i128
+    );
+}
+
+/// Authorization precedence: an unlisted token is rejected as
+/// `Unauthorized`, never leaking a decimals/amount error — in the batch
+/// path too, where the allowlist check now runs first.
+#[test]
+fn test_issue_1051_batch_unlisted_token_is_unauthorized() {
+    let t = setup_extended();
+    let rogue = Address::generate(&t.env);
+    let mut batch = Vec::new(&t.env);
+    batch.push_back(batch_param(&t, &rogue, 1_000_000));
+    assert_eq!(
+        t.contract.try_submit_invoices_batch(&batch),
+        Err(Ok(ContractError::Unauthorized))
+    );
+}
+
+/// Fail-closed: an allowlisted token that has no registered decimals must
+/// never be treated as 6-decimal. Both `update_invoice` and
+/// `submit_invoices_batch` surface `TokenDecimalsNotConfigured`.
+#[test]
+fn test_issue_1051_missing_decimals_fails_closed_on_update_and_batch() {
+    let t = setup_extended();
+
+    // Create the invoice while decimals are still registered.
+    let id = t.contract.submit_invoice(
+        &t.freelancer,
+        &t.payer,
+        &1_000_000i128,
+        &due_date(&t),
+        &DISCOUNT_RATE,
+        &t.usdc,
+        &ReferralCode::None,
+    );
+
+    // Simulate a legacy allowlisted token with no decimals recorded.
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .remove(&DataKey::TokenDecimals(t.usdc.clone()));
+    });
+
+    assert_eq!(
+        t.contract.try_update_invoice(
+            &t.freelancer,
+            &id,
+            &1_000_000i128,
+            &due_date(&t),
+            &DISCOUNT_RATE,
+        ),
+        Err(Ok(ContractError::TokenDecimalsNotConfigured))
+    );
+
+    let mut batch = Vec::new(&t.env);
+    batch.push_back(batch_param(&t, &t.usdc, 1_000_000));
+    assert_eq!(
+        t.contract.try_submit_invoices_batch(&batch),
+        Err(Ok(ContractError::TokenDecimalsNotConfigured))
+    );
+}

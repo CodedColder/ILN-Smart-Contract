@@ -145,6 +145,31 @@ fn c1_unlisted_token_still_unauthorized_not_decimals_error() {
     assert_eq!(submit(&t, &rogue), Err(ContractError::Unauthorized));
 }
 
+// Issue #1051: the amount floor must be enforced solely through the token's
+// registered decimals. `update_invoice` no longer runs the decimals-blind
+// `validate_invoice_terms` pre-check (hardcoded 6-decimal floor), so a token
+// with missing decimals now fails closed on update too.
+#[test]
+fn c1_update_invoice_fails_closed_when_decimals_missing() {
+    let t = setup();
+    let id = submit(&t, &t.token.address).unwrap();
+
+    // Simulate a legacy allowlisted token that never had decimals recorded.
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .remove(&DataKey::TokenDecimals(t.token.address.clone()));
+    });
+
+    let due = t.env.ledger().timestamp() + DUE_DATE_OFFSET;
+    assert_eq!(
+        t.contract
+            .try_update_invoice(&t.freelancer, &id, &INVOICE_AMOUNT, &due, &DISCOUNT_RATE),
+        Err(Ok(ContractError::TokenDecimalsNotConfigured))
+    );
+}
+
 // ── C3: bounded fund queue (#1095) ───────────────────────────────────────────
 
 fn fill_queue(t: &T, id: u64) -> soroban_sdk::Vec<Address> {

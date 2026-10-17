@@ -41,6 +41,18 @@ use crate::OracleVerificationResponse;
 /// `reset_oracle_circuit`.
 pub const MAX_CONSECUTIVE_STALE_QUERIES: u32 = 3;
 
+/// Issue #1053 — maximum number of *consecutive* duplicate oracle updates
+/// (the same oracle re-serving an identical `data_timestamp`, i.e. no
+/// advancement) that oracle-gated funding will accept before rejecting with
+/// `OracleDuplicateUpdate`.
+///
+/// Bounds duplicate update frequency: an oracle that has stopped advancing
+/// would otherwise keep producing non-stale responses (a re-served timestamp
+/// stays within the freshness window) and keep resetting the consecutive
+/// stale streak, so the circuit breaker never trips and funding stays open on
+/// data that is no longer live. Mirrors [`MAX_CONSECUTIVE_STALE_QUERIES`].
+pub const MAX_CONSECUTIVE_DUPLICATE_UPDATES: u32 = 3;
+
 /// The kind of off-chain data an oracle provides.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +86,12 @@ pub struct OracleHealthStatus {
     /// Number of consecutive queries (across calls) that returned stale
     /// data. Resets to 0 on a fresh (non-stale) response.
     pub consecutive_stale_count: u32,
+    /// Issue #1053: number of consecutive queries where the *same* oracle
+    /// re-served an identical `last_data_timestamp` — a duplicate update with
+    /// no advancement. Resets to 0 the moment the timestamp advances or
+    /// resolution falls back to a different oracle. Bounding this is what
+    /// stops a "frozen" oracle from standing in for live verification.
+    pub consecutive_duplicate_count: u32,
 }
 
 /// Register (or update) the default oracle for `feed_type`. Applies to every
@@ -221,6 +239,124 @@ pub fn get_oracle_for_token(
     resolve_oracle(&env, feed_type, &token)
 }
 
+/// Whether oracle data timestamped `data_timestamp` (a ledger sequence) is
+/// stale relative to `current_ledger`, given `max_age_ledgers`.
+///
+/// Staleness is `age >= max_age_ledgers`, where `age = current_ledger -
+/// data_timestamp`; `max_age_ledgers == 0` disables the check entirely (the
+/// governance escape hatch).
+///
+/// Issue #1050 — a `data_timestamp` *ahead* of `current_ledger` is treated as
+/// stale, not as age 0. Plain saturating subtraction maps every future
+/// timestamp onto the freshest possible reading, so an oracle (or a buggy one)
+/// reporting an arbitrarily large timestamp would defeat the freshness bound
+/// on every subsequent ledger. Rejecting the future region makes the bound hold
+/// across the full ledger range, including the boundary where the data
+/// timestamp first overtakes the current ledger sequence.
+///
+/// This is the single source of truth for the ledger-based freshness rule; both
+/// `fund_invoice`'s gate and `record_oracle_health` call it so the funding
+/// decision and the recorded health snapshot can never disagree.
+pub fn is_oracle_data_stale(
+    current_ledger: u32,
+    data_timestamp: u32,
+    max_age_ledgers: u64,
+) -> bool {
+    if max_age_ledgers == 0 {
+        return false;
+    }
+    if data_timestamp > current_ledger {
+        return true;
+    }
+    (current_ledger as u64).saturating_sub(data_timestamp as u64) >= max_age_ledgers
+}
+
+/// Whether `data_timestamp` *regresses* relative to the most recently recorded
+/// health snapshot for the same `oracle` on this `feed_type` + `token`.
+///
+/// Issue #1052 — an oracle's reported data timestamp must be monotonically
+/// non-decreasing. `record_oracle_health` persists the last timestamp seen per
+/// (feed type, token); a later response from the *same* oracle carrying a
+/// **smaller** timestamp is a regression — replayed or rolled-back data — and
+/// the funding gate rejects it with `OracleTimestampRegression`. Together with
+/// [`is_oracle_data_stale`] (which rejects *future*-dated data), an accepted
+/// response must therefore lie in `[last_recorded, current_ledger]`.
+///
+/// Equal timestamps are allowed (non-decreasing, not strictly increasing): a
+/// re-read of the same data is not a regression.
+///
+/// A regression is only meaningful against the *same* oracle's timeline, so a
+/// snapshot recorded for a different oracle address is ignored (resolution may
+/// have fallen back to another oracle). Returns `false` when no snapshot exists
+/// yet — there is no baseline to regress from.
+///
+/// Note: the funding gate records health only on success, and a rejected call
+/// rolls its writes back, so a regression observed through funding never lowers
+/// the baseline. A regression observed through the never-erroring
+/// `check_oracle_health` is recorded as-is for monitoring.
+pub fn is_oracle_data_timestamp_regression(
+    env: &Env,
+    feed_type: OracleFeedType,
+    token: &Address,
+    oracle: &Address,
+    data_timestamp: u32,
+) -> bool {
+    let key = DataKey::OracleHealth(feed_type, token.clone());
+    match env
+        .storage()
+        .persistent()
+        .get::<DataKey, OracleHealthStatus>(&key)
+    {
+        Some(prev) => prev.oracle == *oracle && data_timestamp < prev.last_data_timestamp,
+        None => false,
+    }
+}
+
+/// Whether `data_timestamp` is a *duplicate* oracle update that pushes the
+/// consecutive duplicate streak past [`MAX_CONSECUTIVE_DUPLICATE_UPDATES`] —
+/// i.e. the same oracle has already re-served this identical timestamp enough
+/// times in a row that the funding gate should reject the next one.
+///
+/// Issue #1053 — [`is_oracle_data_timestamp_regression`] forbids a timestamp
+/// going *backwards* but deliberately allows an *equal* one (non-decreasing).
+/// Nothing there stops an oracle from standing still: an oracle that stops
+/// advancing and re-serves the same value would keep producing non-stale
+/// responses (within the freshness window) and keep resetting the
+/// consecutive-stale streak, so the circuit breaker never trips and funding
+/// stays open on data that is no longer live. This predicate bounds that.
+///
+/// Meaningful only against the *same* oracle (resolution may fail over to a
+/// different oracle, whose own timeline starts clean) — a snapshot recorded
+/// for another address is ignored. Returns `false` when no snapshot exists.
+///
+/// Same rollback property as the regression check: a rejected `fund_invoice`
+/// rolls its health write back, so a rejected duplicate never advances the
+/// streak — the gate stays shut until the oracle actually advances its
+/// timestamp (or governance changes the resolved oracle). A duplicate
+/// observed through the never-erroring `check_oracle_health` is recorded
+/// as-is for monitoring.
+pub fn is_oracle_data_duplicate_update(
+    env: &Env,
+    feed_type: OracleFeedType,
+    token: &Address,
+    oracle: &Address,
+    data_timestamp: u32,
+) -> bool {
+    let key = DataKey::OracleHealth(feed_type, token.clone());
+    match env
+        .storage()
+        .persistent()
+        .get::<DataKey, OracleHealthStatus>(&key)
+    {
+        Some(prev) => {
+            prev.oracle == *oracle
+                && data_timestamp == prev.last_data_timestamp
+                && prev.consecutive_duplicate_count >= MAX_CONSECUTIVE_DUPLICATE_UPDATES
+        }
+        None => false,
+    }
+}
+
 /// Record a health snapshot for the oracle that served `feed_type` + `token`
 /// at the current ledger, given the data timestamp it returned and the max
 /// age threshold that was applied.
@@ -244,7 +380,9 @@ pub fn record_oracle_health(
 ) {
     let current_ledger = env.ledger().sequence();
     let age = (current_ledger as u64).saturating_sub(data_timestamp as u64);
-    let is_stale = max_age_ledgers > 0 && age >= max_age_ledgers;
+    // Note: `age` is the saturating distance (0 for future-dated data), while
+    // `is_stale` treats the future region as stale — see `is_oracle_data_stale`.
+    let is_stale = is_oracle_data_stale(current_ledger, data_timestamp, max_age_ledgers);
 
     let key = DataKey::OracleHealth(feed_type, token.clone());
     let previous: Option<OracleHealthStatus> = env.storage().persistent().get(&key);
@@ -260,6 +398,17 @@ pub fn record_oracle_health(
         _ => 0,
     };
 
+    // Issue #1053: consecutive duplicate (identical-timestamp) update streak
+    // for the same oracle — bounds duplicate update frequency. A duplicate is
+    // an *unchanged* `data_timestamp` from the same oracle; the first read
+    // (no snapshot) and any advance/fallback reset the streak to 0.
+    let consecutive_duplicate_count = match &previous {
+        Some(prev) if prev.oracle == *oracle && data_timestamp == prev.last_data_timestamp => {
+            prev.consecutive_duplicate_count.saturating_add(1)
+        }
+        _ => 0,
+    };
+
     let status = OracleHealthStatus {
         oracle: oracle.clone(),
         last_checked_ledger: current_ledger,
@@ -267,6 +416,7 @@ pub fn record_oracle_health(
         last_data_age_ledgers: age,
         is_stale,
         consecutive_stale_count,
+        consecutive_duplicate_count,
     };
     env.storage().persistent().set(&key, &status);
 
@@ -281,6 +431,7 @@ pub fn record_oracle_health(
             is_stale,
             last_data_age_ledgers: age,
             consecutive_stale_count,
+            consecutive_duplicate_count,
         },
     );
 
