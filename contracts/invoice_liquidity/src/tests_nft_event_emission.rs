@@ -8,7 +8,7 @@
 use super::*;
 use crate::nft::{get_invoice_nft_metadata, get_invoice_nft_owner, invoice_nft_exists};
 use crate::test::setup;
-use soroban_sdk::testutils::{Address as _, Events};
+use soroban_sdk::testutils::{Address as _, Events, Ledger};
 
 const INVOICE_AMOUNT: i128 = 1_000_000_000;
 const DISCOUNT_RATE: u32 = 300;
@@ -40,14 +40,10 @@ fn test_nft_minted_event_on_fund() {
         .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &false);
 
     let events = t.env.events().all();
-    let nft_mint_events: Vec<_> = events
+    let nft_mint_events: std::vec::Vec<_> = events
+        .events()
         .iter()
-        .filter(|e| {
-            e.topics
-                .get(0)
-                .map(|t| t == &soroban_sdk::Symbol::new(&t.env, "invoice_nft_minted"))
-                .unwrap_or(false)
-        })
+        .filter(|e| std::format!("{:?}", e).contains("invoice_nft_minted"))
         .collect();
 
     assert_eq!(
@@ -93,14 +89,10 @@ fn test_nft_burned_event_on_pay() {
     t.contract.mark_paid(&id, &INVOICE_AMOUNT);
 
     let events = t.env.events().all();
-    let nft_burn_events: Vec<_> = events
+    let nft_burn_events: std::vec::Vec<_> = events
+        .events()
         .iter()
-        .filter(|e| {
-            e.topics
-                .get(0)
-                .map(|t| t == &soroban_sdk::Symbol::new(&t.env, "invoice_nft_burned"))
-                .unwrap_or(false)
-        })
+        .filter(|e| std::format!("{:?}", e).contains("invoice_nft_burned"))
         .collect();
 
     assert_eq!(
@@ -133,7 +125,8 @@ fn test_nft_transferred_event_on_lp_change() {
     );
 
     // First LP funds partially
-    t.contract.fund_invoice(&t.funder, &id, &half_amount, &false);
+    t.contract
+        .fund_invoice(&t.funder, &id, &half_amount, &false);
 
     // Verify NFT is owned by first LP
     let owner_before = get_invoice_nft_owner(&t.env, id).unwrap();
@@ -144,7 +137,7 @@ fn test_nft_transferred_event_on_lp_change() {
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token.address);
     token_admin.mint(&funder2, &(INVOICE_AMOUNT * 10));
 
-    t.contract.join_fund_queue(&funder2, &id, &half_amount);
+    t.contract.join_fund_queue(&funder2, &id);
 
     // Advance past queue delay
     let mut ledger_info = t.env.ledger().get();
@@ -158,14 +151,10 @@ fn test_nft_transferred_event_on_lp_change() {
     t.contract.resolve_fund_queue(&id);
 
     let events = t.env.events().all();
-    let nft_transfer_events: Vec<_> = events
+    let nft_transfer_events: std::vec::Vec<_> = events
+        .events()
         .iter()
-        .filter(|e| {
-            e.topics
-                .get(0)
-                .map(|t| t == &soroban_sdk::Symbol::new(&t.env, "invoice_nft_transferred"))
-                .unwrap_or(false)
-        })
+        .filter(|e| std::format!("{:?}", e).contains("invoice_nft_transferred"))
         .collect();
 
     // Should have a transfer event if the lead LP changed
@@ -209,7 +198,7 @@ fn test_nft_state_on_default() {
     t.env.events().all();
 
     // Claim default — NFT should still exist (Defaulted status)
-    t.contract.claim_default(&id);
+    t.contract.claim_default(&t.funder, &id);
 
     // Per ADR-007 invariant: NFT exists for Defaulted status
     assert!(

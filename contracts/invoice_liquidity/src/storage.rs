@@ -1,9 +1,8 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::testutils::storage::Persistent as _;
 
 use crate::config::Config;
-use crate::invoice::{
-    AppealRecord, Invoice, InvoiceCore, InvoiceMetadata, LpFundRequest, ReputationScore,
-};
+use crate::invoice::{AppealRecord, Invoice, InvoiceCore, InvoiceMetadata, ReputationScore};
 use crate::multisig::AdminAction;
 
 #[contracttype]
@@ -53,6 +52,9 @@ pub enum DataKey {
     /// Issue #645: ring-buffer slot for the admin action audit log, indexed
     /// by `seq % ADMIN_ACTION_LOG_CAPACITY`.
     AdminActionLog(u32),
+    /// Issue #645: monotonically increasing sequence counter for the admin
+    /// action audit log (instance storage).
+    AdminActionCount,
 
     // Stats (Persistent)
     TotalInvoices,
@@ -125,6 +127,7 @@ pub enum DataKey {
     /// by `MIN/MAX_TWAP_WINDOW_LEDGERS`. Distinct from the
     /// `max_oracle_age_ledgers` staleness bound.
     TwapWindowLedgers,
+    MinTwapObservations,
     /// Issue #815/#816: chronological TWAP price samples per feed + token,
     /// backing the opt-in windowed average.
     TwapSamples(crate::oracle_registry::OracleFeedType, Address),
@@ -152,6 +155,24 @@ pub enum DataKey {
     /// never cleared on `unpause()` so operators keep a "last halted at"
     /// reference.
     LastPauseTimestamp,
+    /// Issue #1093: governance-configurable minimum number of price
+    /// sources that must respond *and* survive outlier rejection before
+    /// `get_verified_price` returns a value. Absent = 1 (legacy behavior).
+    MinPriceQuorum,
+    /// Issue #1072: payout owed to `(recipient, token)` that could not be
+    /// delivered because the recipient's trustline was frozen. Claimable via
+    /// `claim_pending_payout` once re-authorized.
+    PendingPayout(Address, Address),
+    /// Issue #1071/#1072: sum of all `PendingPayout` entries for a token —
+    /// reserved balance that new payouts may not spend.
+    PendingPayoutTotal(Address),
+    /// Issue #1031: governance-configurable minimum score margin above the
+    /// current queue leader that a new joiner must have.  `0` (default) means
+    /// the pre-existing behaviour is preserved: any score ≥ best_score is
+    /// allowed to join.  A non-zero margin requires a joining LP to score
+    /// `best_score + margin` or higher, raising the economic barrier to
+    /// equal-score manipulation.  Stored as a `u32` in instance storage.
+    QueueTieScoreMargin,
 }
 
 // ----------------------------------------------------------------
@@ -410,6 +431,23 @@ pub fn set_lp_score(env: &Env, lp: &Address, score: u32) {
 
 // ----------------------------------------------------------------
 // LP Queue Helpers
+//
+// Issue #1014: centralized. These keys (`FundQueue`, `FundQueueOpenedAt`,
+// `QueueResolution`) and their TTL-extension logic live in exactly one
+// place — `invoice::save_fund_queue`, `invoice::try_set_fund_queue_opened_at`,
+// `invoice::save_queue_resolution`, and the private `invoice::extend_queue_key_ttl`
+// they all call — because that is the module `lib.rs` actually imports from
+// for `join_fund_queue` / `resolve_fund_queue`.
+//
+// This file used to carry a second, parallel copy of the same six functions
+// (added for Issue #1091) that called `extend_ttl` while the `invoice.rs`
+// copies did not, so the TTL-extension fix lived in code nothing ever called
+// — `lib.rs` only ever imported the `invoice.rs` versions. Issue #1011 moved
+// the `extend_ttl` logic into the copies that are actually on the call path,
+// which made this module's copies fully redundant; they have been removed
+// so there is only one implementation to maintain and no risk of a future
+// change landing in the unused half again. See `docs/storage-layout.md` §
+// "Queued-entry retention guarantees" for the full before/after history.
 // ----------------------------------------------------------------
 
 /// Extend `key`'s TTL if (and only if) it exists. `extend_ttl` on a missing
@@ -658,4 +696,288 @@ pub fn get_total_paid(env: &Env) -> u64 {
         .persistent()
         .get(&DataKey::TotalPaid)
         .unwrap_or(0)
+}
+
+// ----------------------------------------------------------------
+// Issue #1082: Pre-upgrade TTL field validation
+// ----------------------------------------------------------------
+
+/// Guard that rejects a contract upgrade when any live persistent storage
+/// entry carrying critical invoice or fund-queue data has a remaining TTL
+/// below [`crate::constants::TTL_MIN_LEDGERS_BEFORE_UPGRADE`].
+///
+/// ## Why this guard exists
+///
+/// Soroban persistent storage entries are individually TTL-managed.  If an
+/// upgrade were allowed to proceed while one or more of these entries had
+/// already drifted close to expiry (e.g. because an earlier code path
+/// forgot to call `extend_ttl`, or because the admin deliberately omitted
+/// the renewal step to silently archive data), the new WASM would start
+/// with live state it believes it can read, but those entries would expire
+/// mid-flight and cause silent data loss.
+///
+/// ## What is checked
+///
+/// The most-recent `TTL_UPGRADE_SAMPLE_SIZE` invoices (by ID, counting down
+/// from `NextInvoiceId`) are sampled.  For each ID the following keys are
+/// checked *if they exist* in persistent storage:
+///
+/// * `InvoiceCore(id)`
+/// * `InvoiceMetadata(id)`
+/// * `FundQueue(id)`
+/// * `FundQueueOpenedAt(id)`
+/// * `QueueResolution(id)`
+///
+/// If *any* existing entry has `get_ttl(key) < TTL_MIN_LEDGERS_BEFORE_UPGRADE`
+/// the function returns `Err(ContractError::UpgradeRemovesTtlFields)` and the
+/// upgrade is rejected **fail-closed** — the WASM swap is never executed.
+///
+/// ## Remediation
+///
+/// Before retrying the upgrade the admin should call `save_invoice` for the
+/// affected invoices (which calls `extend_ttl`) and/or the relevant queue
+/// helpers in `invoice.rs` (`invoice::save_fund_queue`,
+/// `invoice::save_queue_resolution`, `invoice::try_set_fund_queue_opened_at`
+/// — the module `lib.rs` actually calls; see Issue #1014) to restore TTLs.
+pub fn validate_ttl_fields_pre_upgrade(
+    env: &Env,
+) -> Result<(), crate::errors::ContractError> {
+    use crate::constants::{TTL_MIN_LEDGERS_BEFORE_UPGRADE, TTL_UPGRADE_SAMPLE_SIZE};
+
+    // Determine the upper bound of invoice IDs written so far.
+    let next_id = read_next_invoice_id(env);
+    if next_id <= 1 {
+        // No invoices have been written yet — nothing to check.
+        return Ok(());
+    }
+
+    // The last written ID is (next_id - 1).  We sample at most
+    // TTL_UPGRADE_SAMPLE_SIZE IDs counting downward from the most recent.
+    let last_id = next_id - 1;
+    let sample_start = last_id.saturating_sub(TTL_UPGRADE_SAMPLE_SIZE.saturating_sub(1));
+
+    // Iterate sample_start ..= last_id
+    let mut id = last_id;
+    loop {
+        // --- InvoiceCore(id) ---
+        let core_key = DataKey::InvoiceCore(id);
+        if env.storage().persistent().has(&core_key) {
+            let ttl = env.storage().persistent().get_ttl(&core_key);
+            if ttl < TTL_MIN_LEDGERS_BEFORE_UPGRADE {
+                return Err(crate::errors::ContractError::UpgradeRemovesTtlFields);
+            }
+        }
+
+        // --- InvoiceMetadata(id) ---
+        let meta_key = DataKey::InvoiceMetadata(id);
+        if env.storage().persistent().has(&meta_key) {
+            let ttl = env.storage().persistent().get_ttl(&meta_key);
+            if ttl < TTL_MIN_LEDGERS_BEFORE_UPGRADE {
+                return Err(crate::errors::ContractError::UpgradeRemovesTtlFields);
+            }
+        }
+
+        // --- FundQueue(id) ---
+        let fq_key = DataKey::FundQueue(id);
+        if env.storage().persistent().has(&fq_key) {
+            let ttl = env.storage().persistent().get_ttl(&fq_key);
+            if ttl < TTL_MIN_LEDGERS_BEFORE_UPGRADE {
+                return Err(crate::errors::ContractError::UpgradeRemovesTtlFields);
+            }
+        }
+
+        // --- FundQueueOpenedAt(id) ---
+        let fqoa_key = DataKey::FundQueueOpenedAt(id);
+        if env.storage().persistent().has(&fqoa_key) {
+            let ttl = env.storage().persistent().get_ttl(&fqoa_key);
+            if ttl < TTL_MIN_LEDGERS_BEFORE_UPGRADE {
+                return Err(crate::errors::ContractError::UpgradeRemovesTtlFields);
+            }
+        }
+
+        // --- QueueResolution(id) ---
+        let qr_key = DataKey::QueueResolution(id);
+        if env.storage().persistent().has(&qr_key) {
+            let ttl = env.storage().persistent().get_ttl(&qr_key);
+            if ttl < TTL_MIN_LEDGERS_BEFORE_UPGRADE {
+                return Err(crate::errors::ContractError::UpgradeRemovesTtlFields);
+            }
+        }
+
+        if id == sample_start {
+            break;
+        }
+        id -= 1;
+    }
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------
+// Issue #1083: Rollback rehearsal — layout completeness check
+// ----------------------------------------------------------------
+
+/// Dry-run validator that checks whether rolling back the WASM to a version
+/// that only understands the monolithic `Invoice` storage key would leave any
+/// invoice data silently inaccessible.
+///
+/// ## Background
+///
+/// The v2 storage layout stores each invoice as two separate persistent
+/// entries:
+///
+/// * `InvoiceCore(id)` — hot-path fields (status, amounts, addresses)
+/// * `InvoiceMetadata(id)` — cold-path fields (funder, funded_at,
+///   referral_code, submitter_reputation)
+///
+/// A v1 (pre-split) WASM only reads the monolithic `Invoice(id)` key.
+/// If the contract is rolled back to v1, any invoice written exclusively in
+/// the split format (no `Invoice(id)` key) would be silently invisible — the
+/// old code would report `InvoiceNotFound` for every such ID.
+///
+/// ## What this function checks
+///
+/// The most-recent `ROLLBACK_SAMPLE_SIZE` invoice IDs (counting down from
+/// `NextInvoiceId - 1`) are inspected.  For each ID the function checks:
+///
+/// ```text
+/// has_legacy   = Invoice(id) key is present
+/// has_core     = InvoiceCore(id) key is present
+/// has_metadata = InvoiceMetadata(id) key is present
+/// ```
+///
+/// The *rollback-safe invariant* is:
+///
+/// ```text
+/// has_legacy  OR  (has_core AND has_metadata)
+/// ```
+///
+/// An invoice violates the invariant — and is counted as **orphaned** — when:
+/// * `has_core` is true but `has_metadata` is false (core without metadata)
+/// * `has_metadata` is true but `has_core` is false (metadata without core)
+///
+/// **Neither** of the split halves alone is sufficient for old WASM to read
+/// the invoice; the old code only understands `Invoice(id)`.
+///
+/// ## Return value
+///
+/// Returns `Ok(RollbackRehearsalReport)` always — including when the check
+/// finds orphaned entries — so the caller can inspect the report and decide
+/// whether to proceed.  Returns `Err(RollbackUnsafe)` only if at least one
+/// orphaned entry is found, enabling a fail-closed pattern in callers that
+/// need to gate a rollback on safety.
+///
+/// ## Normal operation
+///
+/// `save_invoice()` always writes **both** split halves atomically, so
+/// orphaned entries should never occur under normal contract behaviour.
+/// This function is a safety net for detecting storage corruption, partial
+/// writes from an interrupted migration, or a deliberate adversarial scenario.
+pub fn check_rollback_safety(
+    env: &Env,
+) -> Result<crate::events::RollbackRehearsalReport, crate::errors::ContractError> {
+    use crate::constants::ROLLBACK_SAMPLE_SIZE;
+    use crate::events::RollbackRehearsalReport;
+
+    let next_id = read_next_invoice_id(env);
+
+    // No invoices have been written — trivially safe.
+    if next_id <= 1 {
+        return Ok(RollbackRehearsalReport {
+            invoices_checked: 0,
+            split_format_count: 0,
+            legacy_format_count: 0,
+            orphaned_count: 0,
+            rollback_safe: true,
+        });
+    }
+
+    let last_id = next_id - 1;
+    let sample_start = last_id.saturating_sub(ROLLBACK_SAMPLE_SIZE.saturating_sub(1));
+
+    let mut invoices_checked: u32 = 0;
+    let mut split_format_count: u32 = 0;
+    let mut legacy_format_count: u32 = 0;
+    let mut orphaned_count: u32 = 0;
+
+    let mut id = last_id;
+    loop {
+        let has_legacy = env.storage().persistent().has(&DataKey::Invoice(id));
+        let has_core = env.storage().persistent().has(&DataKey::InvoiceCore(id));
+        let has_metadata = env.storage().persistent().has(&DataKey::InvoiceMetadata(id));
+
+        // Skip IDs that have no storage at all (gaps are possible if IDs were
+        // reserved but never committed, though normal operation is gapless).
+        if !has_legacy && !has_core && !has_metadata {
+            if id == sample_start {
+                break;
+            }
+            id -= 1;
+            continue;
+        }
+
+        invoices_checked = invoices_checked.saturating_add(1);
+
+        if has_legacy {
+            // Old monolithic format — always safe to roll back.
+            legacy_format_count = legacy_format_count.saturating_add(1);
+        } else if has_core && has_metadata {
+            // Both split halves present — safe (v2 format, fully intact).
+            split_format_count = split_format_count.saturating_add(1);
+        } else {
+            // Orphaned: exactly one of the two split halves is present.
+            // Rolling back to v1 WASM would make this invoice invisible.
+            orphaned_count = orphaned_count.saturating_add(1);
+        }
+
+        if id == sample_start {
+            break;
+        }
+        id -= 1;
+    }
+
+    let rollback_safe = orphaned_count == 0;
+
+    let report = RollbackRehearsalReport {
+        invoices_checked,
+        split_format_count,
+        legacy_format_count,
+        orphaned_count,
+        rollback_safe,
+    };
+
+    if rollback_safe {
+        Ok(report)
+    } else {
+        Err(crate::errors::ContractError::RollbackUnsafe)
+    }
+}
+
+// ----------------------------------------------------------------
+// Issue #1031: Queue Tie-Score Margin helpers
+// ----------------------------------------------------------------
+
+/// Return the current queue tie-score margin (default 0 = disabled).
+///
+/// When > 0, `join_fund_queue` requires a joining LP to have a score of
+/// at least `current_best_score + margin`. This raises the economic barrier
+/// to equal-score manipulation from zero additional invoices to `margin`
+/// additional funded invoices.
+pub fn get_queue_tie_score_margin(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::QueueTieScoreMargin)
+        .unwrap_or(0)
+}
+
+/// Persist a new queue tie-score margin.  The margin is clamped to [0, 50]
+/// so it cannot block legitimate high-reputation LPs from joining (the score
+/// range is 50–100, so a margin > 50 would prevent most LPs from ever
+/// joining a non-empty queue).
+pub fn set_queue_tie_score_margin(env: &Env, margin: u32) {
+    // Max useful margin: 50 (half the achievable score range above default).
+    let margin = margin.min(50);
+    env.storage()
+        .instance()
+        .set(&DataKey::QueueTieScoreMargin, &margin);
 }

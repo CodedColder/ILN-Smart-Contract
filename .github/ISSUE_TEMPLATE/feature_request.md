@@ -33,3 +33,7 @@ labels: enhancement
 
 ### Additional Context
 <!-- Screenshots, mockups, links, or any other relevant information -->
+
+---
+
+<!-- Support: see docs/support-channels.md for live help paths. Do not use public issues for security reports — see SECURITY.md. -->

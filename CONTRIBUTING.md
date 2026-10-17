@@ -488,9 +488,20 @@ bash scripts/check_benchmark_regression.sh
 
 ---
 
+
+
+## Economics & risk documentation reviews
+
+Assumptions in the LP risk guide, governance playbook, and token economics paper
+are reviewed on a fixed cadence (quarterly, plus usage-growth and incident
+triggers). See [`docs/review-cadence.md`](docs/review-cadence.md) for ownership,
+scope, and required PR outputs. The reading order is indexed under
+[Protocol Economics & Risk](docs/index.md#protocol-economics--risk).
+
 ## Questions?
 
-Open a [GitHub Discussion](https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/discussions)
-or comment on the relevant issue.
+See [`docs/support-channels.md`](docs/support-channels.md) for the live support
+paths (GitHub Issues today; Discussions when enabled). You can also comment on
+the relevant issue.
 ## Dependabot
 Dependabot is configured to automatically submit PRs to update dependencies. Maintainers should review and merge them as appropriate.

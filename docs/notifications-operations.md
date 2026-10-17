@@ -4,7 +4,7 @@
 
 The Invoice Liquidity Network (ILN) Notifications Service delivers real-time notifications for on-chain Soroban contract events (such as `invoice.funded`, `invoice.paid`, `invoice.disputed`, and `invoice.expiring_soon`) across multi-channel destinations including webhooks, email, Slack, and Telegram.
 
-This document details the operational architecture, burst load test results under simulated mainnet conditions (1,000 concurrent events), fault tolerance mechanisms, security controls, capacity planning guidelines, and monitoring runbooks.
+This document details the operational architecture, burst load test results under simulated mainnet conditions (1,000 concurrent events), fault tolerance mechanisms, security controls, capacity planning guidelines, monitoring runbooks, and the background services layer (`src/services/`) that powers delivery analytics, notification digests, and subscription health.
 
 ---
 
@@ -43,6 +43,56 @@ This document details the operational architecture, burst load test results unde
 1. **Webhook Delivery Service (`WebhookDeliveryService`)**: Manages per-endpoint lifecycle state with sliding window rate limiters (1,000 req/min default), circuit breakers (5 consecutive failure threshold, 10-minute cooldown), HMAC-SHA256 signature generation (`x-iln-signature`), and delivery history logging.
 2. **Retry Queue (`RetryQueue`)**: SQLite-backed persistent queue for delivery attempts, implementing exponential backoff (1s, 5s, 30s) up to 3 attempts with status tracking (`pending`, `delivered`, `failed`, `skipped`).
 3. **Email Subscriptions & Delivery (`EmailDeliveryService`, `EmailSubscriptionStore`, `emailToken`)**: Manages double opt-in email subscriptions, single-use HMAC token generation with 128-bit CSPRNG nonces, HTML/text rendering with CRLF header sanitization, HTML attribute escaping, and protocol whitelisting (`http://`, `https://`).
+4. **Services Layer (`src/services/`)**: Long-running background services (delivery analytics, notification digest, subscription health) built on a shared `BaseService` lifecycle and managed by a `ServiceRegistry`. See [Section 1.1](#11-services-layer-architectureservices).
+
+### 1.1. Services Layer (`src/services/`)
+
+Background services sit between the API/delivery plumbing and the domain stores. They never import from `api/`; the `api/` routers call into them, and `delivery/` emits fire-and-forget events that services consume.
+
+```
+ +---------------------+        +--------------------------------------+
+ |   api/ routers      | call   |            services/                 |
+ | - analytics.ts      +------->| - deliveryAnalyticsService           |
+ | - digest.ts         |        | - digestService                      |
+ | - subscriptionHealth|        | - subscriptionHealthService          |
+ +----------+----------+        |   (all extend BaseService,           |
+            |                   |    registered in ServiceRegistry)    |
+            | writes            +---------+--------------+-------------+
+            v                             |              | reads summaries
+ +---------------------+   events         v              v
+ |  subscriptions/     |<-----------+  delivery/    (health policy:
+ |  SubscriptionStore  |            |  deliveryEvents  N trips / M days)
+ +---------------------+            |  webhookDelivery
+                                    +---------------------+
+        lib/logger.ts (child loggers), config.ts (env knobs)
+```
+
+**`BaseService` contract** (`baseService.ts`):
+
+- **Lifecycle**: `idle → starting → running → stopping → stopped`, or `failed`. `start()` and `stop()` are idempotent; `stop()` on a non-running service resolves immediately.
+- **Error handling**: every service body runs through `runSafely(op, fn)`, which catches exceptions, marks the service `failed` during startup, logs via the service's child logger, and — for a running service — keeps the service alive instead of crashing the process.
+- **Logging**: each service owns `logger.child({ component: 'services/<name>' })`, so all service logs are greppable by component (see the structured logger in `src/lib/logger.ts`).
+- **Health**: `status`, `lastError`, and `startedAt`/`stoppedAt` are exposed for the registry and ops endpoints.
+
+**`ServiceRegistry` contract** (`serviceRegistry.ts`): starts services in registration order, stops them in reverse order, and rolls back already-started services if any start fails (no partially running stack). `src/index.ts` wires the registry into `SIGINT`/`SIGTERM` shutdown so buffered work is flushed before exit.
+
+| Service | Responsibility | Key config (env) |
+| :--- | :--- | :--- |
+| **`deliveryAnalyticsService`** | Consumes `delivery/` events (`circuit_open`, `rate_limited`, `delivery_success`, `delivery_failure`) and maintains per-endpoint failure summaries (trip counts, throttle events, last failure) with rolling retention. Read via `GET /analytics/deliveries*`. | `NOTIFICATIONS_ANALYTICS_RETENTION_MS` (default 30 days) |
+| **`digestService`** | Batches queued notifications per subscriber over a configurable window (default 5 min, max 100 per batch). Digest mode is **opt-in**; opted-out subscribers keep real-time delivery. Buffers are drained to the delivery sink on shutdown. | `NOTIFICATIONS_DIGEST_WINDOW_MS`, `NOTIFICATIONS_DIGEST_MAX_BATCH_SIZE` |
+| **`subscriptionHealthService`** | Reads analytics summaries and applies the threshold policy (*N circuit trips over M days*) to flag or auto-suspend persistently failing endpoints, notifies the subscriber over a non-webhook channel (`contact_email`), and supports manual reactivation (`POST /subscriptions/health/:id/reactivate`). | `NOTIFICATIONS_HEALTH_TRIP_THRESHOLD` (3), `NOTIFICATIONS_HEALTH_WINDOW_DAYS` (1), `NOTIFICATIONS_HEALTH_AUTO_SUSPEND` (true) |
+
+**API surface added by the services layer** (writes require the endpoint API key when a `SubscriptionStore` is configured):
+
+- `GET /analytics/deliveries`, `GET /analytics/deliveries/:endpointId`, `GET /analytics/deliveries/:endpointId/counts?since=`
+- `GET /subscriptions/digest`, `POST /subscriptions/digest/:subscriberId/opt-in`, `POST /subscriptions/digest/:subscriberId/opt-out`
+- `GET /subscriptions/health`, `GET /subscriptions/health/:subscriberId`, `POST /subscriptions/health/evaluate`, `POST /subscriptions/health/:subscriberId/reactivate`
+
+**Operating notes:**
+
+- Suspended endpoints are skipped by delivery with `skippedReason: 'suspended'`; suspension is sticky and cleared only by explicit reactivation (which also resets the analytics counters for that endpoint). "Degraded" flags auto-clear once trips fall below the threshold.
+- Digest and analytics state are in-memory by default: a process restart clears digests (undelivered buffered items are flushed on graceful shutdown) and analytics history. Alert on `services/*` `failed` status and on the `suspended` count (see Section 5).
+- Webhook subscribers need a `contact_email` on the subscription for health notices; without one, the notice is logged and the suspension still applies.
 
 ---
 
@@ -145,3 +195,9 @@ A burst load test was executed simulating a sudden spike of **1,000 concurrent i
 3. **`Alert: RateLimitExceededSpike`**:
    - *Impact*: Subscriber webhook is exceeding configured sliding window threshold (HTTP 429).
    - *Action*: Verify subscriber tier allocation and offer upgrade to dedicated enterprise rate limit.
+4. **`Alert: SubscriptionAutoSuspended`**:
+   - *Impact*: `subscriptionHealthService` suspended an endpoint after `NOTIFICATIONS_HEALTH_TRIP_THRESHOLD` circuit trips within `NOTIFICATIONS_HEALTH_WINDOW_DAYS`; deliveries are skipped (`skippedReason: 'suspended'`) and a notice was sent to the subscriber's `contact_email`.
+   - *Action*: Check `GET /subscriptions/health/:subscriberId` for trip history, confirm the endpoint is fixed, then `POST /subscriptions/health/:subscriberId/reactivate` (resets counters and resumes delivery).
+5. **`Alert: ServicesComponentFailed`**:
+   - *Impact*: A `services/*` component transitioned to `failed` (startup error) or logged an unhandled runtime error; analytics/digest/health may be stale.
+   - *Action*: Grep logs for `component=services/`, inspect `lastError` from the service status, restart the process if the registry did not recover.

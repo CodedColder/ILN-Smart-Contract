@@ -277,7 +277,7 @@ pub fn query_nft_owner(env: Env, invoice_id: u64) -> Option<Address> {
 /// NFT exists iff invoice is Funded/PartiallyFunded/settled-pending-burn (Defaulted/Appealed/Disputed),
 /// and the holder is the LP (funder) or the lead LP for partial funding.
 pub fn sync_nft_state(env: &Env, invoice_id: u64) -> Result<(), ContractError> {
-    use crate::invoice::{try_load_invoice, get_invoice_funders, InvoiceStatus};
+    use crate::invoice::{get_invoice_funders, try_load_invoice, InvoiceStatus};
 
     let invoice = match try_load_invoice(env, invoice_id) {
         Some(inv) => inv,
@@ -328,7 +328,8 @@ pub fn sync_nft_state(env: &Env, invoice_id: u64) -> Result<(), ContractError> {
         };
 
         if invoice_nft_exists(env, invoice_id) {
-            let current_owner = get_invoice_nft_owner(env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
+            let current_owner =
+                get_invoice_nft_owner(env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
             if current_owner != target_owner {
                 transfer_invoice_nft(env, invoice_id, current_owner, target_owner)?;
             }
@@ -346,11 +347,11 @@ pub fn sync_nft_state(env: &Env, invoice_id: u64) -> Result<(), ContractError> {
     } else {
         // Should not exist
         if invoice_nft_exists(env, invoice_id) {
-            let current_owner = get_invoice_nft_owner(env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
+            let current_owner =
+                get_invoice_nft_owner(env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
             burn_invoice_nft(env, invoice_id, current_owner)?;
         }
     }
 
     Ok(())
 }
-

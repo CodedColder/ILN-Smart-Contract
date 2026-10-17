@@ -18,6 +18,7 @@
     "verify-restore": "tsx scripts/verify-restore.ts",
     "reconcile": "tsx scripts/reconcile.ts",
     "replay": "tsx scripts/replay.ts",
+    "status-page": "tsx scripts/generate-status-page.ts",
     "clean": "rm -rf dist coverage node_modules/.cache backups restored"
   },
   "dependencies": {

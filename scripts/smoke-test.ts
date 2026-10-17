@@ -13,6 +13,7 @@ import {
 const SOROBAN_RPC_URL = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE || Networks.TESTNET;
 const CONTRACT_ID = process.env.CONTRACT_ID;
+const DISTRIBUTION_CONTRACT_ID = process.env.DISTRIBUTION_CONTRACT_ID;
 
 if (!CONTRACT_ID) {
   console.error("❌ Error: CONTRACT_ID environment variable is required.");
@@ -84,7 +85,7 @@ async function invokeContract(
 
   console.log(`Simulating function '${functionName}'...`);
   const simulated = await server.simulateTransaction(tx);
-  if (rpc.Api.isSimulateTransactionError(simulated)) {
+  if (rpc.Api.isSimulationError(simulated)) {
     throw new Error(`Simulation failed for '${functionName}': ${JSON.stringify(simulated.error)}`);
   }
 
@@ -113,6 +114,36 @@ async function invokeContract(
   }
 
   throw new Error(`Unexpected transaction status: ${status}`);
+}
+
+// Read-only contract call: simulate (never submit) and return the native value.
+async function simulateReadonly(
+  server: rpc.Server,
+  contractId: string,
+  functionName: string,
+  args: xdr.ScVal[],
+  signer: Keypair
+) {
+  const contract = new Contract(contractId);
+  const account = await server.getAccount(signer.publicKey());
+
+  const tx = new TransactionBuilder(account, {
+    fee: "100000",
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(functionName, ...args))
+    .setTimeout(30)
+    .build();
+
+  console.log(`Simulating read-only '${functionName}' on ${contractId}...`);
+  const simulated = await server.simulateTransaction(tx);
+  if (rpc.Api.isSimulationError(simulated)) {
+    throw new Error(`Simulation failed for '${functionName}': ${JSON.stringify(simulated.error)}`);
+  }
+  if (!simulated.result?.retval) {
+    throw new Error(`Simulation of '${functionName}' returned no value.`);
+  }
+  return scValToNative(simulated.result.retval);
 }
 
 async function runSmokeTest() {
@@ -157,6 +188,34 @@ async function runSmokeTest() {
     console.log("✓ Contract successfully initialized!");
   }
   console.log("");
+
+  // Step 1b: Verify the governance-token SAC-admin invariant (Issue #861).
+  // `iln_distribution.claim_tokens` mints through StellarAssetClient::mint,
+  // which only the SAC admin may call, so a token administered by an
+  // EOA/multisig would make every non-empty claim revert at runtime.
+  // Optional: skipped unless DISTRIBUTION_CONTRACT_ID is set.
+  if (DISTRIBUTION_CONTRACT_ID) {
+    console.log("Step 1b: Verifying distribution mint authority...");
+    const mintAuthority = await simulateReadonly(
+      server,
+      DISTRIBUTION_CONTRACT_ID,
+      "verify_mint_authority",
+      [],
+      freelancer
+    );
+    if (mintAuthority !== true) {
+      throw new Error(
+        `verify_mint_authority() returned ${JSON.stringify(mintAuthority)} on ` +
+          `${DISTRIBUTION_CONTRACT_ID}: the governance token is not administered by the ` +
+          "distribution contract, so claims cannot mint."
+      );
+    }
+    console.log("✓ verify_mint_authority() = true\n");
+  } else {
+    console.log(
+      "Step 1b: DISTRIBUTION_CONTRACT_ID not set — skipping mint-authority check.\n"
+    );
+  }
 
   // Step 2: Submit Invoice
   console.log("Step 2: Submitting a test invoice...");

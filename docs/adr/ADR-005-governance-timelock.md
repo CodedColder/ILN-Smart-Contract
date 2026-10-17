@@ -37,16 +37,18 @@ Competing concerns:
 
 ## Decision
 
-**No timelock delay in v1.** `execute_proposal` is callable by anyone
-immediately after the 3-day voting window closes, provided quorum and majority
-criteria are met. The admin veto power serves as the emergency brake during the
-early phase.
+**Phase 3 Timelock Implementation and Hardening (Issues #985, #987, #989, #990).**
 
-The `TimelockNotExpired` error code is reserved in the error enum for a future
-timelock implementation.
+While v1 initially launched without an execution delay, ADR-012 Phase 3 established a governance execution timelock with the following critical security controls:
 
-A timelock **must be introduced before the admin veto power is disabled**
-(which must happen before mainnet launch per the governance documentation).
+1. **Minimum Production Delay Bounds (Issue #985):**
+   `set_execution_delay(delay)` enforces bounds to prevent governance deadlocks (`MAX_EXECUTION_DELAY_LEDGERS = 518_400` ~ 30 days) and guarantees that once admin veto power is disabled (`!is_veto_power_enabled()`), execution delay cannot be reduced below `MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS` (17,280 ledgers ~ 24 hours), resolving the decentralized transition risk.
+2. **Rollover-Safe Eta Comparisons (Issue #987):**
+   Proposal scheduling and execution timelock checks utilize RFC 1982 serial number arithmetic (`is_eta_reached`) and wrapping addition (`wrapping_add`), preventing execution stalls or bypasses across ledger sequence boundaries or rollover at `u32::MAX`.
+3. **Veto Transition State Machine (Issue #989):**
+   The multisig veto mechanism implements an explicit finite state machine (`VetoStatus`: `Uninitiated -> Pending -> Executed`), emitting `VetoStateTransition` events and exposing `get_veto_state(proposal_id)` for transparent on-chain auditing.
+4. **Veto-Disable Authorization and Reason Recording (Issue #990):**
+   Permanent disablement of admin veto power (`disable_veto_power` / `disable_veto_power_with_reason`) records caller authorization, ledger sequence, and reason hash in `VetoDisableRecord`, prevents redundant disable calls (`VetoPowerAlreadyDisabled`), and emits structured `VetoDisableRecorded` events.
 
 ## Alternatives Considered
 
@@ -55,18 +57,16 @@ A timelock **must be introduced before the admin veto power is disabled**
 | **24-hour timelock** | Adds friction without meaningful security benefit while the admin veto exists; a 24-hour window is too short for large token holders to coordinate a response anyway. |
 | **48-hour timelock** | Same reasoning as 24-hour; the admin veto already covers the early phase. |
 | **7-day timelock (Compound-style)** | Appropriate for a mature, decentralised protocol, but excessive for a protocol in active parameter tuning. Would slow down legitimate fee adjustments. |
-| **Configurable timelock (governance sets the delay)** | Correct long-term design, but adds implementation complexity at v1. Deferred to a future upgrade. |
+| **Configurable timelock (governance sets the delay)** | Implemented in Phase 3 with strict production delay bounds and bounds enforcement upon veto retirement (Issue #985). |
 | **Optimistic execution with challenge period** | Complex to implement correctly; requires a separate challenge mechanism and bond. Out of scope for v1. |
 
 ## Consequences
 
 **Positive:**
-- Proposals can be executed immediately after voting closes, enabling rapid
-  response to protocol conditions.
-- Implementation is simpler — no timelock storage, no expiry checks on
-  execution.
-- The admin veto provides equivalent protection during the early phase when
-  token distribution is concentrated.
+- Proposals are safely timelocked with bounded delays (`17_280..=518_400` ledgers), ensuring community reaction windows.
+- Eta comparisons remain sound and verified even across ledger rollover boundaries.
+- Veto approvals follow a deterministic finite state machine with queryable state and event traces.
+- Veto retirement permanently audits the authorization and justification on-chain.
 
 **Negative / Trade-offs:**
 - Without a timelock, a proposal that passes cannot be stopped by the community

@@ -51,3 +51,11 @@ Expect `ingestion.isLeader` true on the active writer and lag within threshold.
 
 - If the leader crashes, its lease expires after ~15s (`leaseMs`); a standby acquires and resumes from `last_processed_cursor`.
 - Event inserts use `UNIQUE(transaction_hash, event_index)` to make accidental double-processing fail closed on conflict rather than silently duplicating rows.
+
+## Reorg handling and recovery
+
+See [Indexer Reorg Handling](indexer-reorg-handling.md) for the full design and operator runbook.
+
+A detected chain fork immediately latches the shared halt flag in `indexer_state`, stops new writes, and triggers the rollback-and-replay path. Recovery is serialized through the same SQLite lease holder that controls ingestion, so a concurrent writer cannot interleave new rows while the reorg is being repaired.
+
+Manual intervention is required for deep reorgs or a replay that stalls: the operator must confirm the canonical fork point, roll back the affected ledger window, and re-run replay from the divergence ancestor before clearing the halt latch.

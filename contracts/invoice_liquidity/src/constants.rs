@@ -6,7 +6,7 @@ pub const CONTRACT_VERSION: &str = "1.0.0";
 /// Issue #539: Current storage schema version. Bump this whenever the
 /// persistent/instance storage layout changes so that `migrate()` can
 /// detect and apply incremental upgrades.
-pub const CURRENT_STORAGE_VERSION: u32 = 2;
+pub const CURRENT_STORAGE_VERSION: u32 = 3;
 
 // ----------------------------------------------------------------
 // Rate Limiting Defaults (Issue #541)

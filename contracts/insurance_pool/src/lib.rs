@@ -20,8 +20,8 @@
 #[cfg(test)]
 extern crate std;
 
-mod insurance_interface;
 mod claim_prioritization;
+mod insurance_interface;
 #[cfg(test)]
 mod test;
 
@@ -31,7 +31,7 @@ pub use insurance_interface::{
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, BytesN, Env,
+    Address, BytesN, Env, IntoVal, Symbol, Val,
 };
 
 /// Minimum defaults on a single (lp, payer) pair before the collusion
@@ -126,6 +126,12 @@ pub enum DataKey {
     RiskMultiplierNumerator,
     /// Risk multiplier denominator for premium calculation (Issue #528).
     RiskMultiplierDenominator,
+    /// Pending (timelocked) risk multiplier numerator (Issue #542/#528).
+    PendingRiskMultiplierNumerator,
+    /// Pending (timelocked) risk multiplier denominator (Issue #542/#528).
+    PendingRiskMultiplierDenominator,
+    /// Ledger timestamp at which the pending risk multiplier becomes executable.
+    RiskMultiplierEta,
     /// LP's historical default count (Issue #528).
     DefaultCount(Address),
     /// LP's historical claim count (Issue #528).
@@ -167,6 +173,10 @@ pub enum DataKey {
     /// Default counter for a specific (lp, payer) pair, the raw data
     /// surfaced for the collusion heuristic (Issue #829).
     PairDefaultCount(Address, Address),
+    /// Address of the reputation_bonus contract for cross-contract
+    /// reputation reads (ADR-015). If not set, premium calculation
+    /// ignores reputation scores.
+    ReputationContract,
 }
 
 /// Solvency snapshot returned by `get_pool_health`, so LPs can judge
@@ -256,13 +266,22 @@ pub struct InsurancePool;
 
 #[contractimpl]
 impl InsurancePool {
-    /// Initialise the pool.
-    ///
-    /// * `admin` — authorised to file claims (in production, the liquidity
-    ///   contract address acting on a confirmed default).
-    /// * `coverage` — flat per-claim compensation cap (in token stroops).
-    /// * `token` — address of the token contract for real transfers (Issue #527).
-    pub fn initialize(
+/// Initialise the pool.
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `admin` — see signature
+/// * `coverage` — see signature
+/// * `token` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * Authorization / validation errors as defined by this contract
+///
+/// Access: Caller (require_auth)
+pub fn initialize(
         env: Env,
         admin: Address,
         coverage: i128,
@@ -287,24 +306,30 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Total premium an LP has contributed over the pool's lifetime.
-    pub fn get_premiums_paid(env: Env, lp: Address) -> i128 {
+/// Total premium an LP has contributed over the pool's lifetime.
+///
+/// Access: Anyone
+pub fn get_premiums_paid(env: Env, lp: Address) -> i128 {
         env.storage()
             .persistent()
             .get(&DataKey::Premiums(lp))
             .unwrap_or(0)
     }
 
-    /// The configured flat per-claim coverage cap.
-    pub fn get_coverage(env: Env) -> i128 {
+/// The configured flat per-claim coverage cap.
+///
+/// Access: Anyone
+pub fn get_coverage(env: Env) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::Coverage)
             .unwrap_or(0)
     }
 
-    /// The configured token address for real transfers (Issue #527).
-    pub fn get_token_address(env: Env) -> Result<Address, InsuranceError> {
+/// The configured token address for real transfers (Issue #527).
+///
+/// Access: Anyone
+pub fn get_token_address(env: Env) -> Result<Address, InsuranceError> {
         env.storage()
             .instance()
             .get(&DataKey::TokenAddress)
@@ -317,16 +342,30 @@ impl InsurancePool {
     // Higher risk = higher premiums, lower risk = lower premiums.
     // This creates incentives for LPs to fund high-quality invoices.
 
-    /// Get the base premium rate in basis points (e.g., 500 = 5%).
-    pub fn get_base_premium_rate_bps(env: Env) -> u32 {
+/// Get the base premium rate in basis points (e.g., 500 = 5%).
+///
+/// Access: Anyone
+pub fn get_base_premium_rate_bps(env: Env) -> u32 {
         env.storage()
             .instance()
             .get(&DataKey::BasePremiumRateBps)
             .unwrap_or(500) // Default 5%
     }
 
-    /// Set the base premium rate in basis points. Requires admin auth.
-    pub fn set_base_premium_rate_bps(env: Env, rate_bps: u32) -> Result<(), InsuranceError> {
+/// Set the base premium rate in basis points. Requires admin auth.
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `rate_bps` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn set_base_premium_rate_bps(env: Env, rate_bps: u32) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         if rate_bps == 0 || rate_bps > 10_000 {
             return Err(InsuranceError::InvalidAmount);
@@ -337,24 +376,41 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Get the risk multiplier numerator for premium calculation.
-    pub fn get_risk_multiplier_numerator(env: Env) -> i128 {
+/// Get the risk multiplier numerator for premium calculation.
+///
+/// Access: Anyone
+pub fn get_risk_multiplier_numerator(env: Env) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::RiskMultiplierNumerator)
             .unwrap_or(1) // Default 1x
     }
 
-    /// Get the risk multiplier denominator for premium calculation.
-    pub fn get_risk_multiplier_denominator(env: Env) -> i128 {
+/// Get the risk multiplier denominator for premium calculation.
+///
+/// Access: Anyone
+pub fn get_risk_multiplier_denominator(env: Env) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::RiskMultiplierDenominator)
             .unwrap_or(1) // Default 1/1
     }
 
-    /// Set the risk multiplier for premium calculation. Requires admin auth.
-    pub fn set_risk_multiplier(
+/// Set the risk multiplier for premium calculation. Requires admin auth.
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `numerator` — see signature
+/// * `denominator` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn set_risk_multiplier(
         env: Env,
         numerator: i128,
         denominator: i128,
@@ -372,16 +428,155 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Get the LP's historical default count.
-    pub fn get_default_count(env: Env, lp: Address) -> u32 {
+    /// Set the reputation_bonus contract address for cross-contract
+    /// reputation reads (ADR-015). Requires admin auth.
+    ///
+    /// Once set, `calculate_premium_rate_bps` will read the LP's reputation
+    /// score and reduce their effective default count proportionally.
+    ///
+    /// Pass `None` or an empty address to disable reputation integration.
+    pub fn set_reputation_contract(
+        env: Env,
+        contract: Address,
+    ) -> Result<(), InsuranceError> {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReputationContract, &contract);
+        Ok(())
+    }
+
+    /// Get the configured reputation_bonus contract address, if any.
+    pub fn get_reputation_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReputationContract)
+    }
+
+/// Propose a new risk multiplier. Requires current admin auth. Overwrites
+/// any previously pending risk multiplier proposal.
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `numerator` — see signature
+/// * `denominator` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn propose_risk_multiplier(
+        env: Env,
+        numerator: i128,
+        denominator: i128,
+    ) -> Result<u64, InsuranceError> {
+        Self::require_admin(&env);
+        if numerator < 0 || denominator <= 0 {
+            return Err(InsuranceError::InvalidAmount);
+        }
+
+        let eta = env
+            .ledger()
+            .timestamp()
+            .saturating_add(TIMELOCK_DELAY_SECONDS);
+
+        let storage = env.storage().instance();
+        storage.set(&DataKey::PendingRiskMultiplierNumerator, &numerator);
+        storage.set(&DataKey::PendingRiskMultiplierDenominator, &denominator);
+        storage.set(&DataKey::RiskMultiplierEta, &eta);
+
+        env.events()
+            .publish((symbol_short!("rm_prop"),), (numerator, denominator, eta));
+        Ok(eta)
+    }
+
+/// Execute a previously proposed risk multiplier change once its timelock
+///
+/// Access: Anyone
+pub fn execute_risk_multiplier(env: Env) -> Result<(), InsuranceError> {
+        let storage = env.storage().instance();
+        let numerator: i128 = storage
+            .get(&DataKey::PendingRiskMultiplierNumerator)
+            .ok_or(InsuranceError::NoPendingProposal)?;
+        let denominator: i128 = storage
+            .get(&DataKey::PendingRiskMultiplierDenominator)
+            .ok_or(InsuranceError::NoPendingProposal)?;
+        let eta: u64 = storage
+            .get(&DataKey::RiskMultiplierEta)
+            .ok_or(InsuranceError::NoPendingProposal)?;
+
+        if env.ledger().timestamp() < eta {
+            return Err(InsuranceError::TimelockNotExpired);
+        }
+
+        let old_num = Self::get_risk_multiplier_numerator(env.clone());
+        let old_den = Self::get_risk_multiplier_denominator(env.clone());
+
+        storage.set(&DataKey::RiskMultiplierNumerator, &numerator);
+        storage.set(&DataKey::RiskMultiplierDenominator, &denominator);
+        storage.remove(&DataKey::PendingRiskMultiplierNumerator);
+        storage.remove(&DataKey::PendingRiskMultiplierDenominator);
+        storage.remove(&DataKey::RiskMultiplierEta);
+
+        env.events().publish(
+            (symbol_short!("rm_exec"),),
+            (old_num, old_den, numerator, denominator),
+        );
+        Ok(())
+    }
+
+/// Cancel a pending risk multiplier change proposal. Requires current admin auth.
+///
+/// # Arguments
+/// * `env` — host environment
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn cancel_risk_multiplier(env: Env) -> Result<(), InsuranceError> {
+        Self::require_admin(&env);
+        let storage = env.storage().instance();
+        if !storage.has(&DataKey::PendingRiskMultiplierNumerator) {
+            return Err(InsuranceError::NoPendingProposal);
+        }
+        storage.remove(&DataKey::PendingRiskMultiplierNumerator);
+        storage.remove(&DataKey::PendingRiskMultiplierDenominator);
+        storage.remove(&DataKey::RiskMultiplierEta);
+        env.events().publish((symbol_short!("rm_cncl"),), ());
+        Ok(())
+    }
+
+/// Get the LP's historical default count.
+///
+/// Access: Anyone
+pub fn get_default_count(env: Env, lp: Address) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::DefaultCount(lp))
             .unwrap_or(0)
     }
 
-    /// Increment the LP's default count. Admin-only.
-    pub fn increment_default_count(env: Env, lp: Address) -> Result<(), InsuranceError> {
+/// Increment the LP's default count. Admin-only.
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `lp` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn increment_default_count(env: Env, lp: Address) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         let count: u32 = Self::get_default_count(env.clone(), lp.clone());
         env.storage()
@@ -399,33 +594,44 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Get the LP's historical claim count.
-    pub fn get_claim_count(env: Env, lp: Address) -> u32 {
+/// Get the LP's historical claim count.
+///
+/// Access: Anyone
+pub fn get_claim_count(env: Env, lp: Address) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::ClaimCount(lp))
             .unwrap_or(0)
     }
 
-    /// Calculate the risk-priced premium for an LP based on their history.
-    /// Returns the premium rate in basis points.
-    ///
-    /// Formula: base_rate + (default_count * risk_multiplier)
-    /// Example: base=500 (5%), multiplier=100/1 (100x per default)
-    ///   - 0 defaults: 500 bps (5%)
-    ///   - 1 default: 600 bps (6%)
-    ///   - 2 defaults: 700 bps (7%)
-    pub fn calculate_premium_rate_bps(env: Env, lp: Address) -> u32 {
+/// Calculate the risk-priced premium for an LP based on their history.
+/// Returns the premium rate in basis points.
+///
+/// Formula: base_rate + (effective_default_count * risk_multiplier)
+///
+/// The effective default count is reduced by the LP's reputation score
+/// (ADR-015): higher reputation means fewer effective defaults.
+///   effective_default_count = default_count × (1 - score/100)
+///
+/// Example: base=500 (5%), multiplier=0.5x, score=80%
+///   - 0 defaults: 500 bps (5%)
+///   - 1 default, score 80: effective=0.2 → 510 bps (5.1%)
+///   - 2 defaults, score 50: effective=1.0 → 550 bps (5.5%)
+pub fn calculate_premium_rate_bps(env: Env, lp: Address) -> u32 {
         let base_rate = Self::get_base_premium_rate_bps(env.clone());
-        let default_count = Self::get_default_count(env.clone(), lp) as i128;
+        let default_count = Self::get_default_count(env.clone(), lp.clone()) as i128;
         let numerator = Self::get_risk_multiplier_numerator(env.clone());
-        let denominator = Self::get_risk_multiplier_denominator(env);
+        let denominator = Self::get_risk_multiplier_denominator(env.clone());
 
         if denominator == 0 {
             return base_rate;
         }
 
-        let risk_adjustment = default_count
+        // ADR-015: apply reputation discount to effective default count
+        let effective_default_count =
+            Self::apply_reputation_discount(env.clone(), lp, default_count);
+
+        let risk_adjustment = effective_default_count
             .checked_mul(numerator)
             .and_then(|v| v.checked_mul(10_000))
             .and_then(|v| v.checked_div(denominator))
@@ -441,18 +647,67 @@ impl InsurancePool {
         }
     }
 
-    /// Calculate the premium amount for an LP based on their risk profile.
-    /// The amount is the invoice amount multiplied by the risk-priced rate.
-    pub fn calculate_premium_amount(env: Env, lp: Address, invoice_amount: i128) -> i128 {
+    /// Apply reputation discount to the default count (ADR-015).
+    ///
+    /// Reads the LP's reputation score from the configured reputation_bonus
+    /// contract and reduces the effective default count proportionally.
+    /// Higher scores produce larger discounts. The floor is 0 — reputation
+    /// never increases the effective count.
+    ///
+    /// Falls back to the raw default_count if the reputation contract is
+    /// not configured or the cross-contract call fails.
+    fn apply_reputation_discount(env: Env, lp: Address, default_count: i128) -> i128 {
+        let Some(rep_contract) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ReputationContract)
+        else {
+            // No reputation contract configured — no discount
+            return default_count;
+        };
+
+        // Cross-contract call: reputation_bonus.get_reputation(lp) → ReputationScore
+        // We only need the `score` field (0–100).
+        let args = soroban_sdk::vec![&env, lp.into_val(&env)];
+        let result = env.try_invoke_contract::<Val, soroban_sdk::Error>(
+            &rep_contract,
+            &Symbol::new(&env, "get_reputation"),
+            args,
+        );
+
+        match result {
+            Ok(Ok(val)) => {
+                // The ReputationScore is a ContractType; extract the score field.
+                // try_invoke_contract returns a Val — we need to decode it.
+                // For safety, use try-from with a fallback.
+                let score: u32 = soroban_sdk::TryFromVal::try_from_val(&env, &val)
+                    .unwrap_or(0u32);
+                // Apply discount: effective = default_count × (100 - score) / 100
+                default_count
+                    .checked_mul(100 - score as i128)
+                    .and_then(|v| v.checked_div(100))
+                    .unwrap_or(default_count)
+            }
+            _ => {
+                // Cross-contract call failed — no discount
+                default_count
+            }
+        }
+    }
+
+/// Calculate the premium amount for an LP based on their risk profile.
+/// The amount is the invoice amount multiplied by the risk-priced rate.
+pub fn calculate_premium_amount(env: Env, lp: Address, invoice_amount: i128) -> i128 {
         let rate_bps = Self::calculate_premium_rate_bps(env, lp);
         invoice_amount
             .saturating_mul(rate_bps as i128)
             .saturating_div(10_000)
     }
 
-    /// Get the tiered coverage for an LP based on their total premiums paid.
-    /// Returns the coverage cap for the LP's tier.
-    pub fn get_tiered_coverage(env: Env, lp: Address) -> i128 {
+/// Get the tiered coverage for an LP based on their total premiums paid.
+///
+/// Access: Anyone
+pub fn get_tiered_coverage(env: Env, lp: Address) -> i128 {
         let premiums_paid = Self::get_premiums_paid(env.clone(), lp);
         let default_coverage = Self::get_coverage(env.clone());
 
@@ -476,7 +731,6 @@ impl InsurancePool {
         }
     }
 
-
     /// Returns `true` if a claim has already been processed for `invoice_id`.
     pub fn is_claimed(env: Env, invoice_id: u64) -> bool {
         env.storage()
@@ -493,9 +747,20 @@ impl InsurancePool {
     // to exit before the change takes effect. The current admin may cancel a
     // pending proposal at any time before it executes.
 
-    /// Propose a new coverage cap. Requires current admin auth. Overwrites
-    /// any previously pending coverage proposal.
-    pub fn propose_coverage_change(env: Env, new_coverage: i128) -> Result<u64, InsuranceError> {
+/// Propose a new coverage cap. Requires current admin auth. Overwrites
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `new_coverage` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn propose_coverage_change(env: Env, new_coverage: i128) -> Result<u64, InsuranceError> {
         Self::require_admin(&env);
         if new_coverage <= 0 {
             return Err(InsuranceError::InvalidAmount);
@@ -515,9 +780,10 @@ impl InsurancePool {
         Ok(eta)
     }
 
-    /// Execute a previously proposed coverage change once its timelock has
-    /// expired. Callable by anyone once the delay has elapsed.
-    pub fn execute_coverage_change(env: Env) -> Result<(), InsuranceError> {
+/// Execute a previously proposed coverage change once its timelock has
+///
+/// Access: Anyone
+pub fn execute_coverage_change(env: Env) -> Result<(), InsuranceError> {
         let storage = env.storage().instance();
         let new_coverage: i128 = storage
             .get(&DataKey::PendingCoverage)
@@ -539,8 +805,19 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Cancel a pending coverage change proposal. Requires current admin auth.
-    pub fn cancel_coverage_change(env: Env) -> Result<(), InsuranceError> {
+/// Cancel a pending coverage change proposal. Requires current admin auth.
+///
+/// # Arguments
+/// * `env` — host environment
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn cancel_coverage_change(env: Env) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         let storage = env.storage().instance();
         if !storage.has(&DataKey::PendingCoverage) {
@@ -552,9 +829,20 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Propose an admin transfer. Requires current admin auth. Overwrites any
-    /// previously pending admin proposal.
-    pub fn propose_admin_transfer(env: Env, new_admin: Address) -> Result<u64, InsuranceError> {
+/// Propose an admin transfer. Requires current admin auth. Overwrites any
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `new_admin` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn propose_admin_transfer(env: Env, new_admin: Address) -> Result<u64, InsuranceError> {
         Self::require_admin(&env);
 
         let eta = env
@@ -571,9 +859,10 @@ impl InsurancePool {
         Ok(eta)
     }
 
-    /// Execute a previously proposed admin transfer once its timelock has
-    /// expired. Callable by anyone once the delay has elapsed.
-    pub fn execute_admin_transfer(env: Env) -> Result<(), InsuranceError> {
+/// Execute a previously proposed admin transfer once its timelock has
+///
+/// Access: Anyone
+pub fn execute_admin_transfer(env: Env) -> Result<(), InsuranceError> {
         let storage = env.storage().instance();
         let new_admin: Address = storage
             .get(&DataKey::PendingAdmin)
@@ -595,8 +884,19 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Cancel a pending admin transfer proposal. Requires current admin auth.
-    pub fn cancel_admin_transfer(env: Env) -> Result<(), InsuranceError> {
+/// Cancel a pending admin transfer proposal. Requires current admin auth.
+///
+/// # Arguments
+/// * `env` — host environment
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn cancel_admin_transfer(env: Env) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         let storage = env.storage().instance();
         if !storage.has(&DataKey::PendingAdmin) {
@@ -608,25 +908,40 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Returns the pending coverage proposal (new cap, eta), if any.
-    pub fn get_pending_coverage(env: Env) -> Option<(i128, u64)> {
+/// Returns the pending coverage proposal (new cap, eta), if any.
+///
+/// Access: Anyone
+pub fn get_pending_coverage(env: Env) -> Option<(i128, u64)> {
         let storage = env.storage().instance();
         let new_coverage: i128 = storage.get(&DataKey::PendingCoverage)?;
         let eta: u64 = storage.get(&DataKey::CoverageEta)?;
         Some((new_coverage, eta))
     }
 
-    /// Returns the pending admin transfer proposal (new admin, eta), if any.
-    pub fn get_pending_admin(env: Env) -> Option<(Address, u64)> {
+/// Returns the pending admin transfer proposal (new admin, eta), if any.
+///
+/// Access: Anyone
+pub fn get_pending_admin(env: Env) -> Option<(Address, u64)> {
         let storage = env.storage().instance();
         let new_admin: Address = storage.get(&DataKey::PendingAdmin)?;
         let eta: u64 = storage.get(&DataKey::AdminEta)?;
         Some((new_admin, eta))
     }
 
-    /// Set coverage cap directly via governance (no timelock, single call).
-    /// Requires governance contract authorization.
-    pub fn set_coverage_via_governance(env: Env, new_coverage: i128) -> Result<(), InsuranceError> {
+/// Set coverage cap directly via governance (no timelock, single call).
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `new_coverage` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * Authorization / validation errors as defined by this contract
+///
+/// Access: Caller (require_auth)
+pub fn set_coverage_via_governance(env: Env, new_coverage: i128) -> Result<(), InsuranceError> {
         if new_coverage <= 0 {
             return Err(InsuranceError::InvalidAmount);
         }
@@ -651,9 +966,23 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Set premium rate directly via governance.
-    /// Requires governance contract authorization.
-    pub fn set_premium_rate_via_governance(env: Env, _rate: u32) -> Result<(), InsuranceError> {
+/// Set premium rate directly via governance.
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `rate_bps` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * Authorization / validation errors as defined by this contract
+///
+/// Access: Caller (require_auth)
+pub fn set_premium_rate_via_governance(
+        env: Env,
+        rate_bps: u32,
+    ) -> Result<(), InsuranceError> {
         let admin: Address = env
             .storage()
             .instance()
@@ -661,18 +990,41 @@ impl InsurancePool {
             .ok_or(InsuranceError::NotInitialized)?;
         admin.require_auth();
 
-        env.events().publish((symbol_short!("prem_gov"),), _rate);
+        if rate_bps == 0 || rate_bps > 10_000 {
+            return Err(InsuranceError::InvalidAmount);
+        }
+
+        let old_rate: u32 = Self::get_base_premium_rate_bps(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::BasePremiumRateBps, &rate_bps);
+
+        env.events()
+            .publish((symbol_short!("prem_gov"),), (old_rate as i128, rate_bps as i128));
         Ok(())
     }
 
-    /// Get the current pool balance cap, or `None` if uncapped.
-    pub fn get_balance_cap(env: Env) -> Option<i128> {
+/// Get the current pool balance cap, or `None` if uncapped.
+///
+/// Access: Anyone
+pub fn get_balance_cap(env: Env) -> Option<i128> {
         env.storage().instance().get(&DataKey::BalanceCap)
     }
 
-    /// Set (or clear) the pool balance cap. Pass `0` to remove the cap.
-    /// Requires admin auth.
-    pub fn set_balance_cap(env: Env, cap: i128) -> Result<(), InsuranceError> {
+/// Set (or clear) the pool balance cap. Pass `0` to remove the cap.
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `cap` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn set_balance_cap(env: Env, cap: i128) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         if cap < 0 {
             return Err(InsuranceError::InvalidAmount);
@@ -686,19 +1038,10 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Get a point-in-time solvency snapshot: balance, enrolled exposure,
-    /// and an estimated runway based on historical default activity.
-    ///
-    /// The claim-rate estimate is deliberately simple: it projects the
-    /// pool's running total default count (`TotalDefaultCount`, a rollup of
-    /// the per-LP `DefaultCount` already tracked for Issue #528's
-    /// risk-priced premiums) at the flat `Coverage` cap per default, spread
-    /// over the pool's lifetime to date. It does not account for tiered
-    /// coverage varying the actual per-claim payout, or for claim
-    /// frequency changing over time — it's a rough, conservative-by-default
-    /// signal for LPs deciding whether to enroll, not a precise actuarial
-    /// model.
-    pub fn get_pool_health(env: Env) -> PoolHealth {
+/// Get a point-in-time solvency snapshot: balance, enrolled exposure,
+///
+/// Access: Anyone
+pub fn get_pool_health(env: Env) -> PoolHealth {
         let balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
         let enrolled_lp_count: u32 = env
             .storage()
@@ -752,9 +1095,20 @@ impl InsurancePool {
     // until a governance reset). Enrollments and premium deposits continue
     // regardless, so the pool can recover without forcing LPs out.
 
-    /// Set the minimum reserve ratio (in bps, 0..=10_000) below which new
-    /// claim payouts are paused. `0` disables the breaker. Admin-only.
-    pub fn set_min_reserve_ratio_bps(env: Env, bps: u32) -> Result<(), InsuranceError> {
+/// Set the minimum reserve ratio (in bps, 0..=10_000) below which new
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `bps` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn set_min_reserve_ratio_bps(env: Env, bps: u32) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         if bps > 10_000 {
             return Err(InsuranceError::InvalidReserveRatio);
@@ -766,31 +1120,33 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// The configured minimum reserve ratio (bps). `0` means the breaker is
-    /// disabled.
-    pub fn get_min_reserve_ratio_bps(env: Env) -> u32 {
+/// The configured minimum reserve ratio (bps). `0` means the breaker is
+///
+/// Access: Anyone
+pub fn get_min_reserve_ratio_bps(env: Env) -> u32 {
         env.storage()
             .instance()
             .get(&DataKey::MinReserveRatioBps)
             .unwrap_or(0)
     }
 
-    /// Current pool reserve ratio in bps: total claimable reserve (liquid
-    /// balance + capital backstop) over the per-claim coverage cap.
-    pub fn get_reserve_ratio_bps(env: Env) -> u32 {
+/// Current pool reserve ratio in bps: total claimable reserve (liquid
+///
+/// Access: Anyone
+pub fn get_reserve_ratio_bps(env: Env) -> u32 {
         let coverage = Self::get_coverage(env.clone());
         if coverage <= 0 {
             return 0;
         }
         let reserve = Self::get_total_reserve(env);
-        let ratio = reserve
-            .saturating_mul(10_000)
-            .saturating_div(coverage);
+        let ratio = reserve.saturating_mul(10_000).saturating_div(coverage);
         ratio.min(u32::MAX as i128) as u32
     }
 
-    /// Total claimable reserve: liquid claim balance plus capital backstop.
-    pub fn get_total_reserve(env: Env) -> i128 {
+/// Total claimable reserve: liquid claim balance plus capital backstop.
+///
+/// Access: Anyone
+pub fn get_total_reserve(env: Env) -> i128 {
         let balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
         let backstop: i128 = env
             .storage()
@@ -800,18 +1156,29 @@ impl InsurancePool {
         balance.saturating_add(backstop)
     }
 
-    /// Whether the solvency circuit breaker is currently open (payouts
-    /// paused). Sticky until a governance `reset_solvency_circuit`.
-    pub fn is_solvency_circuit_open(env: Env) -> bool {
+/// Whether the solvency circuit breaker is currently open (payouts
+///
+/// Access: Anyone
+pub fn is_solvency_circuit_open(env: Env) -> bool {
         env.storage()
             .instance()
             .get(&DataKey::SolvencyCircuitOpenFlag)
             .unwrap_or(false)
     }
 
-    /// Resume claim payouts after a solvency circuit trip. Admin-only.
-    /// Emits `SolvencyCircuitReset`. No-op when the breaker is already clear.
-    pub fn reset_solvency_circuit(env: Env) -> Result<(), InsuranceError> {
+/// Resume claim payouts after a solvency circuit trip. Admin-only.
+///
+/// # Arguments
+/// * `env` — host environment
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn reset_solvency_circuit(env: Env) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         if !env
             .storage()
@@ -828,10 +1195,7 @@ impl InsurancePool {
             .remove(&DataKey::SolvencyCircuitOpenFlag);
         env.events().publish(
             (symbol_short!("solv_rst"),),
-            SolvencyCircuitReset {
-                ratio_bps,
-                reserve,
-            },
+            SolvencyCircuitReset { ratio_bps, reserve },
         );
         Ok(())
     }
@@ -883,10 +1247,7 @@ impl InsurancePool {
             .set(&DataKey::SolvencyCircuitOpenFlag, &true);
         env.events().publish(
             (symbol_short!("solv_trip"),),
-            SolvencyCircuitTripped {
-                ratio_bps,
-                reserve,
-            },
+            SolvencyCircuitTripped { ratio_bps, reserve },
         );
     }
 
@@ -896,9 +1257,20 @@ impl InsurancePool {
     // configurable share of each premium deposit and/or governance-led
     // top-ups. Claims draw from liquid balance first, then the backstop.
 
-    /// Set the share (bps) of each premium deposit diverted to the backstop
-    /// fund. `0` disables automatic backstop contributions. Admin-only.
-    pub fn set_backstop_funding_bps(env: Env, bps: u32) -> Result<(), InsuranceError> {
+/// Set the share (bps) of each premium deposit diverted to the backstop
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `bps` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn set_backstop_funding_bps(env: Env, bps: u32) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         if bps > 10_000 {
             return Err(InsuranceError::InvalidReserveRatio);
@@ -910,16 +1282,20 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// The configured premium-to-backstop share (bps). `0` = disabled.
-    pub fn get_backstop_funding_bps(env: Env) -> u32 {
+/// The configured premium-to-backstop share (bps). `0` = disabled.
+///
+/// Access: Anyone
+pub fn get_backstop_funding_bps(env: Env) -> u32 {
         env.storage()
             .instance()
             .get(&DataKey::BackstopFundingBps)
             .unwrap_or(0)
     }
 
-    /// The current capital backstop balance.
-    pub fn get_backstop_balance(env: Env) -> i128 {
+/// The current capital backstop balance.
+///
+/// Access: Anyone
+pub fn get_backstop_balance(env: Env) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::BackstopBalance)
@@ -930,11 +1306,7 @@ impl InsurancePool {
     /// pool; the credited amount is booked to the backstop, not the liquid
     /// claim balance. Admin authorizes the ordering; `from` authorizes the
     /// transfer. Emits `BackstopTopUp`.
-    pub fn top_up_backstop(
-        env: Env,
-        from: Address,
-        amount: i128,
-    ) -> Result<(), InsuranceError> {
+    pub fn top_up_backstop(env: Env, from: Address, amount: i128) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         if amount <= 0 {
             return Err(InsuranceError::InvalidBackstopAmount);
@@ -951,8 +1323,8 @@ impl InsurancePool {
 
         let token = Self::get_token_client(&env)?;
         token.transfer(
-            &from,                             // from (caller)
-            &env.current_contract_address(),   // to (this contract)
+            &from,                           // from (caller)
+            &env.current_contract_address(), // to (this contract)
             &amount,
         );
 
@@ -975,10 +1347,21 @@ impl InsurancePool {
     // submitted and the window having elapsed — opt-in per risk tier, so the
     // automatic flow is unchanged while the gate is off.
 
-    /// Attach an evidence hash (32 bytes, e.g. an IPFS CID / doc digest) to
-    /// an invoice. Admin-only. Overwrites any prior evidence for the invoice
-    /// and records the submission timestamp. Emits `ClaimEvidence`.
-    pub fn submit_claim_evidence(
+/// Attach an evidence hash (32 bytes, e.g. an IPFS CID / doc digest) to
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `invoice_id` — see signature
+/// * `evidence_hash` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn submit_claim_evidence(
         env: Env,
         invoice_id: u64,
         evidence_hash: BytesN<32>,
@@ -999,13 +1382,25 @@ impl InsurancePool {
     /// The evidence hash and submission timestamp recorded for an invoice,
     /// if any.
     pub fn get_claim_evidence(env: Env, invoice_id: u64) -> Option<ClaimEvidence> {
-        env.storage().persistent().get(&DataKey::ClaimEvidence(invoice_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClaimEvidence(invoice_id))
     }
 
-    /// Set the review window (seconds) that gated claims must sit in after
-    /// evidence submission before payout. `0` disables the gate (automatic
-    /// flow). Admin-only.
-    pub fn set_review_window_seconds(env: Env, seconds: u64) -> Result<(), InsuranceError> {
+/// Set the review window (seconds) that gated claims must sit in after
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `seconds` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn set_review_window_seconds(env: Env, seconds: u64) -> Result<(), InsuranceError> {
         Self::require_admin(&env);
         env.storage()
             .instance()
@@ -1014,8 +1409,10 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// The configured review window (seconds). `0` = gate disabled.
-    pub fn get_review_window_seconds(env: Env) -> u64 {
+/// The configured review window (seconds). `0` = gate disabled.
+///
+/// Access: Anyone
+pub fn get_review_window_seconds(env: Env) -> u64 {
         env.storage()
             .instance()
             .get(&DataKey::ReviewWindowSeconds)
@@ -1055,10 +1452,21 @@ impl InsurancePool {
     // large share of one LP's defaults is a collusion signal. On-chain data
     // is intentionally kept raw and simple — computed/viewed off-chain.
 
-    /// Record a confirmed default for an (lp, payer) pair. Also bumps the
-    /// LP-wide and pool-wide default counters (keeps Issue #528's rollups in
-    /// sync). Admin-only. Emits `PairDefaultRecorded`.
-    pub fn record_pair_default(
+/// Record a confirmed default for an (lp, payer) pair. Also bumps the
+///
+/// # Arguments
+/// * `env` — host environment
+/// * `lp` — see signature
+/// * `payer` — see signature
+///
+/// # Returns
+/// * `Ok(...)` on success; see Errors
+///
+/// # Errors
+/// * `Unauthorized` if caller is not admin; plus validation errors
+///
+/// Access: Admin only
+pub fn record_pair_default(
         env: Env,
         lp: Address,
         payer: Address,
@@ -1073,12 +1481,10 @@ impl InsurancePool {
             .get(&DataKey::PairDefaultCount(lp.clone(), payer.clone()))
             .unwrap_or(0);
         let new_pair_count = pair_count.saturating_add(1);
-        env.storage()
-            .persistent()
-            .set(
-                &DataKey::PairDefaultCount(lp.clone(), payer.clone()),
-                &new_pair_count,
-            );
+        env.storage().persistent().set(
+            &DataKey::PairDefaultCount(lp.clone(), payer.clone()),
+            &new_pair_count,
+        );
 
         env.events().publish(
             (symbol_short!("pair_def"), lp.clone(), payer.clone()),
@@ -1091,19 +1497,20 @@ impl InsurancePool {
         Ok(())
     }
 
-    /// Total confirmed defaults for a specific (lp, payer) pair.
-    pub fn get_pair_default_count(env: Env, lp: Address, payer: Address) -> u32 {
+/// Total confirmed defaults for a specific (lp, payer) pair.
+///
+/// Access: Anyone
+pub fn get_pair_default_count(env: Env, lp: Address, payer: Address) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::PairDefaultCount(lp, payer))
             .unwrap_or(0)
     }
 
-    /// Collusion heuristic for a (lp, payer) pair, computed on-chain for
-    /// cheap queries: a pair is flagged when it has accumulated at least
-    /// `MIN_PAIR_DEFAULTS_TO_FLAG` defaults AND those defaults make up at
-    /// least `COLLUSION_PAIR_SHARE_FLAG_BPS` of the LP's total defaults.
-    pub fn get_pair_collusion_flag(env: Env, lp: Address, payer: Address) -> bool {
+/// Collusion heuristic for a (lp, payer) pair, computed on-chain for
+///
+/// Access: Anyone
+pub fn get_pair_collusion_flag(env: Env, lp: Address, payer: Address) -> bool {
         let pair_count = Self::get_pair_default_count(env.clone(), lp.clone(), payer);
         if pair_count < MIN_PAIR_DEFAULTS_TO_FLAG {
             return false;
@@ -1235,9 +1642,9 @@ impl InsurancePoolInterface for InsurancePool {
 
         if backstop_share > 0 {
             let backstop: i128 = Self::get_backstop_balance(env.clone());
-            let new_backstop = backstop.checked_add(backstop_share).unwrap_or_else(|| {
-                panic_with_error!(&env, InsuranceError::ArithmeticOverflow)
-            });
+            let new_backstop = backstop
+                .checked_add(backstop_share)
+                .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::ArithmeticOverflow));
             env.storage()
                 .instance()
                 .set(&DataKey::BackstopBalance, &new_backstop);

@@ -1,0 +1,30 @@
+name: Contract Docs & Access Matrix
+
+on:
+  pull_request:
+    paths:
+      - "contracts/**"
+      - "docs/access-control.md"
+      - "docs/access-control-matrix.generated.md"
+      - "scripts/generate-access-control-matrix.py"
+      - "scripts/check-contract-public-docs.py"
+      - ".github/workflows/contract-docs-and-access-matrix.yml"
+  push:
+    branches: [dev, main]
+  workflow_dispatch: {}
+
+jobs:
+  access-matrix-and-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check access-control matrix drift (Issue #856)
+        run: python3 scripts/generate-access-control-matrix.py --check
+
+      - name: Check public entry-point docs (Issue #857)
+        run: python3 scripts/check-contract-public-docs.py

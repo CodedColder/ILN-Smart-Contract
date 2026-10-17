@@ -50,7 +50,10 @@ fn test_one_year_idle_partial_decay() {
 
     establish_reputation(&t, &payer);
     let score_before = t.contract.payer_score(&payer);
-    assert!(score_before > 50, "score should have increased after payment");
+    assert!(
+        score_before > 50,
+        "score should have increased after payment"
+    );
 
     // Advance 1 year: ~24 decay periods
     let one_year_ledgers = (365 * 24 * 60 * 60 / 5) as u32; // ~6,307,200
@@ -128,7 +131,7 @@ fn test_hundred_year_idle_floor() {
     establish_reputation(&t, &payer);
 
     // Advance 100 years: ~2,443,200 ledgers — way beyond MAX_REPUTATION_DECAY_PERIODS
-    let hundred_year_ledgers = (100 * 365 * 24 * 60 * 60 / 5) as u32;
+    let hundred_year_ledgers = (100u64 * 365 * 24 * 60 * 60 / 5) as u32;
     advance_ledgers(&t, hundred_year_ledgers);
 
     let score_after = t.contract.payer_score(&payer);
@@ -157,7 +160,7 @@ fn test_decay_no_overflow_at_max_score() {
 
     let score = t.contract.payer_score(&payer);
     assert!(score <= 100, "score must never exceed 100");
-    assert!(score >= 0, "score must never go negative (u32 unsigned)");
+    // score: u32 — cannot go negative (clippy absurd_extreme_comparisons)
 }
 
 /// Verify decay converges to 0 correctly (not stuck at 1).

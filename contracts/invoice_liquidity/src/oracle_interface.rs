@@ -54,6 +54,14 @@ pub const ORACLE_STALENESS_THRESHOLD_SECS: u64 = 7 * 24 * 60 * 60;
 /// - Returns `false` if the oracle's timestamp is older than
 ///   `ORACLE_STALENESS_THRESHOLD_SECS`.
 /// - Returns `true` when verified and the data is fresh.
+///
+/// **Dead code (Issue #860 enumeration):** no caller inside or outside this
+/// crate resolves payer verification through this helper — `fund_invoice`
+/// routes payer checks through `oracle_registry::resolve_oracle_for_verification`
+/// (which consults circuit/health state) instead. Kept as the legacy
+/// boolean-check API; note that unlike every live path, this function does
+/// *not* consult the health gate, which is precisely why it must not be
+/// reconnected to a price-dependent flow without adding that check.
 pub fn check_payer_verified(env: &Env, payer: &Address) -> bool {
     let config = match crate::storage::get_config(env) {
         Some(c) => c,

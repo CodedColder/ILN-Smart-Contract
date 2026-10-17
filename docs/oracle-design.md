@@ -93,3 +93,14 @@ A closely related, less obvious limitation: **with exactly two sources, a single
 - The admin key that controls `set_price_oracle` is a single point of control. A compromised admin can register a malicious oracle. Governance timelock on oracle registration changes is recommended.
 - Fail-open behaviour (no oracle → all pass) is appropriate for the MVP. High-security deployments should consider fail-closed defaults.
 - Oracle address changes take effect immediately. There is no delay between registering a new oracle and it being used for checks. Consider adding a timelock.
+
+---
+
+## Migration Plan for TWAP Feeds
+
+As part of the rollout of TWAP oracle feeds, clients and the protocol must migrate in a controlled manner:
+
+1. **Deployment**: Upgrade the `invoice_liquidity` contract with the TWAP features. TWAP is disabled by default, meaning all feeds continue to operate using spot/boolean logic.
+2. **Data Seeding**: An automated bot or indexer must invoke `record_twap_sample` for the desired `feed_type` and `token`. The buffer must reach the `MIN_TWAP_OBSERVATIONS` limit (default 2) spanning the configured window.
+3. **Activation**: The admin invokes `set_twap_enabled(env, feed_type, true)`. Once enabled, price reads (`get_twap_aware_price`) strictly enforce the TWAP bounds and sample counts. If the minimum observations aren't met, an `InsufficientTwapObservations` error will be returned, refusing to silently fall back to spot prices.
+4. **Monitoring**: Operators should monitor for `TwapInsufficientData` events to detect stalling feeds and ensure data automation continues submitting samples.

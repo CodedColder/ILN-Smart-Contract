@@ -7,6 +7,13 @@ interface WebhookDeliveryOptions {
   http?: (url: string, init: any) => Promise<{ status: number }>;
 }
 
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Operational contact address used for subscription-health notices. */
+function isValidEmail(value: unknown): value is string {
+  return typeof value === 'string' && EMAIL_PATTERN.test(value);
+}
+
 async function validateWebhookUrl(url: string, opts?: WebhookDeliveryOptions): Promise<boolean> {
   const httpClient = opts?.http;
   if (!httpClient) {
@@ -88,9 +95,13 @@ export function createWebhooksRouter(
   });
 
   router.post('/webhooks', async (req, res) => {
-    const { url, secret, eventTypes, endpointId } = req.body ?? {};
+    const { url, secret, eventTypes, endpointId, contactEmail } = req.body ?? {};
     if (!url || !secret || !Array.isArray(eventTypes) || eventTypes.length === 0) {
       res.status(400).json({ error: 'invalid_body' });
+      return;
+    }
+    if (contactEmail !== undefined && contactEmail !== null && !isValidEmail(contactEmail)) {
+      res.status(400).json({ error: 'invalid_contact_email' });
       return;
     }
 
@@ -105,6 +116,7 @@ export function createWebhooksRouter(
       url,
       secret,
       eventTypes,
+      contactEmail: contactEmail ?? null,
     });
     res.status(201).json({
       id: sub.id,
@@ -121,7 +133,7 @@ export function createWebhooksRouter(
       return;
     }
 
-    const { url, secret, eventTypes } = req.body ?? {};
+    const { url, secret, eventTypes, contactEmail } = req.body ?? {};
     const patch: any = {};
 
     if (url !== undefined) {
@@ -131,6 +143,15 @@ export function createWebhooksRouter(
         return;
       }
       patch.url = url;
+    }
+
+    if (contactEmail !== undefined) {
+      // null clears the contact so the subscriber stops receiving notices.
+      if (contactEmail !== null && !isValidEmail(contactEmail)) {
+        res.status(400).json({ error: 'invalid_contact_email' });
+        return;
+      }
+      patch.contactEmail = contactEmail ?? null;
     }
 
     if (secret !== undefined) {

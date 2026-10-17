@@ -72,21 +72,41 @@ fn measure<F: FnOnce()>(env: &Env, name: &str, action: F) -> (u64, u64) {
     (cpu, mem)
 }
 
+fn submit_bench_invoice(bench: &BaseBenchEnv) -> u64 {
+    let due_date = bench.env.ledger().timestamp() + 86_400;
+    bench.contract.submit_invoice(
+        &bench.freelancer,
+        &bench.payer,
+        &BENCH_INVOICE_AMOUNT,
+        &due_date,
+        &BENCH_DISCOUNT_RATE,
+        &bench.token,
+        &ReferralCode::None,
+    )
+}
+
 #[test]
 fn benchmark_submit_invoice() {
     let bench = setup_benchmark_env();
     let due_date = bench.env.ledger().timestamp() + 86_400;
 
     measure(&bench.env, "submit_invoice", || {
-        bench.contract.submit_invoice(&ReferralCode::None);
+        bench.contract.submit_invoice(
+            &bench.freelancer,
+            &bench.payer,
+            &BENCH_INVOICE_AMOUNT,
+            &due_date,
+            &BENCH_DISCOUNT_RATE,
+            &bench.token,
+            &ReferralCode::None,
+        );
     });
 }
 
 #[test]
 fn benchmark_fund_invoice() {
     let bench = setup_benchmark_env();
-    let due_date = bench.env.ledger().timestamp() + 86_400;
-    let id = bench.contract.submit_invoice(&ReferralCode::None);
+    let id = submit_bench_invoice(&bench);
 
     measure(&bench.env, "fund_invoice", || {
         bench
@@ -98,14 +118,84 @@ fn benchmark_fund_invoice() {
 #[test]
 fn benchmark_mark_paid() {
     let bench = setup_benchmark_env();
-    let due_date = bench.env.ledger().timestamp() + 86_400;
-    let id = bench.contract.submit_invoice(&ReferralCode::None);
+    let id = submit_bench_invoice(&bench);
     bench
         .contract
         .fund_invoice(&bench.lp, &id, &BENCH_INVOICE_AMOUNT, &false);
 
     measure(&bench.env, "mark_paid", || {
         bench.contract.mark_paid(&id, &BENCH_INVOICE_AMOUNT);
+    });
+}
+
+#[test]
+fn benchmark_join_fund_queue_max_depth() {
+    let bench = setup_benchmark_env();
+    let id = submit_bench_invoice(&bench);
+    let usdc_client = StellarAssetClient::new(&bench.env, &bench.token);
+
+    // Populate queue up to MAX_FUND_QUEUE_LEN (50 entries)
+    for i in 0..crate::constants::MAX_FUND_QUEUE_LEN {
+        let lp = Address::generate(&bench.env);
+        usdc_client.mint(&lp, &1_000_000_000_000);
+        bench.env.as_contract(&bench.contract.address, || {
+            crate::invoice::set_lp_score(&bench.env, &lp, 50 + i);
+        });
+        bench.contract.join_fund_queue(&lp, &id);
+    }
+
+    // High-score LP joins at maximum depth (50), displacing the lowest-scored tail.
+    let competitor_lp = Address::generate(&bench.env);
+    usdc_client.mint(&competitor_lp, &1_000_000_000_000);
+    bench.env.as_contract(&bench.contract.address, || {
+        crate::invoice::set_lp_score(&bench.env, &competitor_lp, 200);
+    });
+
+    measure(&bench.env, "join_fund_queue_max_depth", || {
+        bench.contract.join_fund_queue(&competitor_lp, &id);
+    });
+}
+
+#[test]
+fn benchmark_resolve_fund_queue_max_depth() {
+    let bench = setup_benchmark_env();
+    let id = submit_bench_invoice(&bench);
+    let usdc_client = StellarAssetClient::new(&bench.env, &bench.token);
+
+    for i in 0..crate::constants::MAX_FUND_QUEUE_LEN {
+        let lp = Address::generate(&bench.env);
+        usdc_client.mint(&lp, &1_000_000_000_000);
+        bench.env.as_contract(&bench.contract.address, || {
+            crate::invoice::set_lp_score(&bench.env, &lp, 50 + i);
+        });
+        bench.contract.join_fund_queue(&lp, &id);
+    }
+
+    let mut ledger = bench.env.ledger().get();
+    ledger.sequence_number += crate::constants::QUEUE_DELAY_LEDGERS + 1;
+    bench.env.ledger().set(ledger);
+
+    measure(&bench.env, "resolve_fund_queue_max_depth", || {
+        bench.contract.resolve_fund_queue(&id);
+    });
+}
+
+#[test]
+fn benchmark_extension_cost_at_maximum_depth() {
+    let bench = setup_benchmark_env();
+    let id = 100u64;
+    let mut queue = soroban_sdk::Vec::new(&bench.env);
+    for i in 0..crate::constants::MAX_FUND_QUEUE_LEN {
+        queue.push_back(crate::invoice::LpFundRequest {
+            lp: Address::generate(&bench.env),
+            score: 50 + i,
+        });
+    }
+
+    bench.env.as_contract(&bench.contract.address, || {
+        measure(&bench.env, "extension_cost_at_maximum_depth", || {
+            crate::invoice::save_fund_queue(&bench.env, id, &queue);
+        });
     });
 }
 
@@ -117,10 +207,18 @@ fn benchmark_all_functions_summary() {
     let due_date = bench.env.ledger().timestamp() + 86_400;
 
     results.push(measure(&bench.env, "submit_invoice", || {
-        bench.contract.submit_invoice(&ReferralCode::None);
+        bench.contract.submit_invoice(
+            &bench.freelancer,
+            &bench.payer,
+            &BENCH_INVOICE_AMOUNT,
+            &due_date,
+            &BENCH_DISCOUNT_RATE,
+            &bench.token,
+            &ReferralCode::None,
+        );
     }));
 
-    let id = bench.contract.submit_invoice(&ReferralCode::None);
+    let id = submit_bench_invoice(&bench);
     results.push(measure(&bench.env, "fund_invoice", || {
         bench
             .contract
@@ -130,14 +228,56 @@ fn benchmark_all_functions_summary() {
         bench.contract.mark_paid(&id, &BENCH_INVOICE_AMOUNT);
     }));
 
-    std::println!("\n| Function       | CPU Instructions | Memory (bytes) |");
-    std::println!("| -------------- | ---------------- | -------------- |");
+    let usdc_client = StellarAssetClient::new(&bench.env, &bench.token);
+    let queue_inv_id = submit_bench_invoice(&bench);
+    for i in 0..crate::constants::MAX_FUND_QUEUE_LEN {
+        let lp = Address::generate(&bench.env);
+        usdc_client.mint(&lp, &1_000_000_000_000);
+        bench.env.as_contract(&bench.contract.address, || {
+            crate::invoice::set_lp_score(&bench.env, &lp, 50 + i);
+        });
+        bench.contract.join_fund_queue(&lp, &queue_inv_id);
+    }
+    let competitor_lp = Address::generate(&bench.env);
+    usdc_client.mint(&competitor_lp, &1_000_000_000_000);
+    bench.env.as_contract(&bench.contract.address, || {
+        crate::invoice::set_lp_score(&bench.env, &competitor_lp, 200);
+    });
+    results.push(measure(&bench.env, "join_fund_queue_max_depth", || {
+        bench.contract.join_fund_queue(&competitor_lp, &queue_inv_id);
+    }));
+
+    let mut ledger = bench.env.ledger().get();
+    ledger.sequence_number += crate::constants::QUEUE_DELAY_LEDGERS + 1;
+    bench.env.ledger().set(ledger);
+    results.push(measure(&bench.env, "resolve_fund_queue_max_depth", || {
+        bench.contract.resolve_fund_queue(&queue_inv_id);
+    }));
+
+    let mut queue = soroban_sdk::Vec::new(&bench.env);
+    for i in 0..crate::constants::MAX_FUND_QUEUE_LEN {
+        queue.push_back(crate::invoice::LpFundRequest {
+            lp: Address::generate(&bench.env),
+            score: 50 + i,
+        });
+    }
+    bench.env.as_contract(&bench.contract.address, || {
+        results.push(measure(&bench.env, "extension_cost_at_maximum_depth", || {
+            crate::invoice::save_fund_queue(&bench.env, 999u64, &queue);
+        }));
+    });
+
+    std::println!("\n| Function                       | CPU Instructions | Memory (bytes) |");
+    std::println!("| ------------------------------ | ---------------- | -------------- |");
     for (name, (cpu, mem)) in [
         ("submit_invoice", results[0]),
         ("fund_invoice", results[1]),
         ("mark_paid", results[2]),
+        ("join_fund_queue_max_depth", results[3]),
+        ("resolve_fund_queue_max_depth", results[4]),
+        ("extension_cost_at_maximum_depth", results[5]),
     ] {
-        std::println!("| {name:<14} | {cpu:>16} | {mem:>14} |");
+        std::println!("| {name:<30} | {cpu:>16} | {mem:>14} |");
     }
 }
 

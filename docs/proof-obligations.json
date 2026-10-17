@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "issue": "#1100",
+  "title": "Cross-contract proof obligations",
+  "spec": "docs/formal-verification-cross-contract.md",
+  "description": "Machine-readable registry of the system-level (cross-contract) proof obligations specified in docs/formal-verification-cross-contract.md. Each obligation names the executable code path it constrains (source_file / source_symbols) and the integration test that discharges it (test_file / verified_by). scripts/check-proof-obligations.py and contracts/iln_governance/src/tests_proof_obligations.rs validate this registry against the tree so an obligation cannot silently lose its evidence or drift away from the code it bounds.",
+  "obligations": [
+    {
+      "id": "X1",
+      "title": "Funding notifies distribution",
+      "property": "After set_distribution_contract and a successful fund_invoice, iln_distribution.get_accrual(lp) is strictly greater than its pre-fund value.",
+      "doc": "docs/formal-verification-cross-contract.md",
+      "source_file": "contracts/invoice_liquidity/src/lib.rs",
+      "source_symbols": [
+        "set_distribution_contract",
+        "fund_invoice",
+        "notify_distribution_funding"
+      ],
+      "test_file": "contracts/tests/cross_contract_invariants_test.rs",
+      "verified_by": ["x1_funding_increases_lp_distribution_accrual"],
+      "status": "enforced"
+    },
+    {
+      "id": "X2",
+      "title": "Settlement notifies distribution",
+      "property": "After a successful on-time mark_paid, freelancer (and payer, when rates are non-zero) distribution accruals are strictly greater than their pre-settlement values.",
+      "doc": "docs/formal-verification-cross-contract.md",
+      "source_file": "contracts/invoice_liquidity/src/lib.rs",
+      "source_symbols": ["mark_paid", "notify_distribution_settlement"],
+      "test_file": "contracts/tests/cross_contract_invariants_test.rs",
+      "verified_by": ["x2_settlement_increases_freelancer_distribution_accrual"],
+      "status": "enforced"
+    },
+    {
+      "id": "X3",
+      "title": "Insurance claim payout is bounded by pool and enrollment",
+      "property": "For a defaulted, insurance-wired invoice whose LP is enrolled with a solvent pool, claim_default succeeds and insurance_pool.get_pool_balance() afterwards equals the pre-claim balance minus the paid compensation (or is unchanged when compensation is zero / not enrolled); the pool balance never goes negative.",
+      "doc": "docs/formal-verification-cross-contract.md",
+      "source_file": "contracts/invoice_liquidity/src/lib.rs",
+      "source_symbols": ["claim_default", "get_insurance_pool", "set_insurance_pool"],
+      "test_file": "contracts/tests/cross_contract_invariants_test.rs",
+      "verified_by": ["x3_default_claim_reduces_insurance_pool_by_payout"],
+      "status": "enforced"
+    },
+    {
+      "id": "X4",
+      "title": "Escrow plus insurance reserves do not exceed tracked inflows",
+      "property": "After any sequence of fund / premium-deposit / settle / claim operations, the ILN escrow balance plus the insurance pool balance plus the tracked user balances equals the total minted payment-token supply: neither the pool nor escrow can manufacture tokens.",
+      "doc": "docs/formal-verification-cross-contract.md",
+      "source_file": "contracts/invoice_liquidity/src/lib.rs",
+      "source_symbols": ["fund_invoice", "claim_default"],
+      "test_file": "contracts/tests/cross_contract_invariants_test.rs",
+      "verified_by": ["x4_payment_token_conserved_across_iln_and_insurance"],
+      "status": "enforced"
+    },
+    {
+      "id": "X5",
+      "title": "Cross-module default compensation is single-shot per invoice",
+      "property": "After a successful claim_default that pulled insurance compensation for invoice_id, a second claim_default for the same id fails without reducing the pool again, and the pool rejects a second claim(invoice_id) with already-claimed semantics.",
+      "doc": "docs/formal-verification-cross-contract.md",
+      "source_file": "contracts/invoice_liquidity/src/lib.rs",
+      "source_symbols": ["claim_default"],
+      "test_file": "contracts/tests/cross_contract_invariants_test.rs",
+      "verified_by": ["x5_insurance_compensation_not_paid_twice_for_same_invoice"],
+      "status": "enforced"
+    }
+  ]
+}

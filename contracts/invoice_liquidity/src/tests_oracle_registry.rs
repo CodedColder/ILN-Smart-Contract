@@ -59,14 +59,12 @@ impl MockRegistryOracle {
     }
 }
 
-/// `set_price_oracle` / `set_max_oracle_age` are rate-limited
-/// (`check_rate_limit`, cooldown = `DEFAULT_RATE_LIMIT_LEDGERS` = 120
-/// ledgers). Since the last-call ledger defaults to 0 when never called,
-/// and `setup()` starts the ledger at sequence 100, calling either of these
-/// immediately after `setup()` incorrectly trips the cooldown on its very
-/// first-ever call. Advance the ledger past the cooldown first — this is a
-/// pre-existing rate-limiting quirk unrelated to Issue #532, worked around
-/// here rather than fixed since fixing `check_rate_limit` is out of scope.
+/// `set_price_oracle` / `set_max_oracle_age` / the oracle-registry admin
+/// fns are rate-limited (`check_rate_limit`, cooldown =
+/// `DEFAULT_RATE_LIMIT_LEDGERS` = 120 ledgers). Advance the ledger past
+/// that cooldown so back-to-back rate-limited calls in one test don't trip
+/// each other. (`check_rate_limit` allows a function's first-ever call
+/// unconditionally, so this is only needed to space *repeats*.)
 fn advance_past_rate_limit_cooldown(env: &Env) {
     let mut info = env.ledger().get();
     info.sequence_number += 150;
@@ -639,9 +637,9 @@ fn test_fund_invoice_paused_never_reaches_oracle_registry() {
     // fund_invoice must fail fast on the pause guard, before it ever
     // resolves or queries the oracle registry — even with oracle
     // verification requested and a healthy oracle registered.
-    let result =
-        t.contract
-            .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    let result = t
+        .contract
+        .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
     assert_eq!(result, Err(Ok(ContractError::ContractPaused)));
 
     // No health snapshot was ever recorded — proof the oracle was never
@@ -666,11 +664,8 @@ fn test_oracle_registry_mutations_unaffected_by_core_contract_pause() {
     // the core contract's operational pause and must go through unaffected.
     t.contract
         .register_oracle(&OracleFeedType::Identity, &default_oracle);
-    t.contract.register_token_oracle(
-        &OracleFeedType::Identity,
-        &t.token.address,
-        &token_oracle,
-    );
+    t.contract
+        .register_token_oracle(&OracleFeedType::Identity, &t.token.address, &token_oracle);
     assert_eq!(
         t.contract
             .get_oracle_for_token(&OracleFeedType::Identity, &t.token.address),
@@ -788,9 +783,9 @@ fn test_fund_invoice_rejects_when_circuit_open_with_no_fallback() {
         .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address));
 
     let invoice_id = make_invoice(&t);
-    let result =
-        t.contract
-            .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    let result = t
+        .contract
+        .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
     assert_eq!(
         result,
         Err(Ok(ContractError::OracleCircuitOpen)),
@@ -812,11 +807,8 @@ fn test_fund_invoice_falls_back_to_feed_type_default_when_override_tripped() {
 
     // ...and a per-token override (higher priority) that will go stale.
     let bad_oracle = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
-    t.contract.register_token_oracle(
-        &OracleFeedType::Identity,
-        &t.token.address,
-        &bad_oracle,
-    );
+    t.contract
+        .register_token_oracle(&OracleFeedType::Identity, &t.token.address, &bad_oracle);
 
     // Advance the ledger so the override's timestamp reads as stale.
     let mut info = t.env.ledger().get();
@@ -844,9 +836,9 @@ fn test_fund_invoice_falls_back_to_feed_type_default_when_override_tripped() {
     // override and fall back to the healthy feed-type default, rather than
     // rejecting the funding.
     let invoice_id = make_invoice(&t);
-    let result =
-        t.contract
-            .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    let result = t
+        .contract
+        .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
     assert!(
         result.is_ok(),
         "fund_invoice must fall back to the healthy feed-type default when the \
@@ -901,9 +893,9 @@ fn test_reset_oracle_circuit_clears_flag_and_restores_verification() {
     oracle_client.set_response(&true, &t.env.ledger().sequence());
 
     let invoice_id = make_invoice(&t);
-    let result =
-        t.contract
-            .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    let result = t
+        .contract
+        .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
     assert!(
         result.is_ok(),
         "funding must resume against the original oracle once governance resets the circuit"
@@ -944,9 +936,9 @@ fn test_circuit_does_not_auto_recover_on_single_fresh_query() {
     // Oracle-gated funding is still rejected (no fallback registered) even
     // though the underlying oracle is, right now, reporting fresh data.
     let invoice_id = make_invoice(&t);
-    let result =
-        t.contract
-            .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    let result = t
+        .contract
+        .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
     assert_eq!(result, Err(Ok(ContractError::OracleCircuitOpen)));
 }
 
@@ -997,7 +989,11 @@ fn test_twap_disabled_by_default_spot_unchanged() {
     assert!(!t.contract.is_twap_enabled(&OracleFeedType::Price));
     // Default window is the 1-hour (720-ledger) documented default.
     assert_eq!(t.contract.get_twap_window(), 720);
-    assert_eq!(t.contract.get_twap_price(&OracleFeedType::Price, &t.token.address), None);
+    assert_eq!(
+        t.contract
+            .get_twap_price(&OracleFeedType::Price, &t.token.address),
+        None
+    );
 }
 
 #[test]
@@ -1009,20 +1005,24 @@ fn test_twap_enabled_feed_reads_windowed_average() {
 
     // Record $20.00 at T0, then $21.00 thirty minutes later; with the
     // default 1-hour window the average over the pair is $20,500.
-    t.contract.record_twap_sample(&OracleFeedType::Price, &t.token.address, &20_000);
+    t.contract
+        .record_twap_sample(&OracleFeedType::Price, &t.token.address, &20_000);
     let mut info = t.env.ledger().get();
     info.timestamp += 1800;
     t.env.ledger().set(info);
-    t.contract.record_twap_sample(&OracleFeedType::Price, &t.token.address, &21_000);
+    t.contract
+        .record_twap_sample(&OracleFeedType::Price, &t.token.address, &21_000);
 
     assert_eq!(
-        t.contract.get_twap_price(&OracleFeedType::Price, &t.token.address),
+        t.contract
+            .get_twap_price(&OracleFeedType::Price, &t.token.address),
         Some(20_500)
     );
     // get_verified_price branches to the TWAP average when enabled (no spot
     // sources registered, so spot alone would error with NoPriceSource).
     assert_eq!(
-        t.contract.get_verified_price(&OracleFeedType::Price, &t.token.address),
+        t.contract
+            .get_verified_price(&OracleFeedType::Price, &t.token.address),
         20_500
     );
 }
@@ -1032,15 +1032,19 @@ fn test_twap_disabled_feed_uses_spot_even_with_samples() {
     use crate::oracle_registry::{OracleFeedType, DEFAULT_MAX_PRICE_DEVIATION_BPS};
     let t = setup();
     // Backfill the same samples as above, but leave the flag off.
-    t.contract.record_twap_sample(&OracleFeedType::Price, &t.token.address, &20_000);
+    t.contract
+        .record_twap_sample(&OracleFeedType::Price, &t.token.address, &20_000);
     let mut info = t.env.ledger().get();
     info.timestamp += 1800;
     t.env.ledger().set(info);
-    t.contract.record_twap_sample(&OracleFeedType::Price, &t.token.address, &21_000);
+    t.contract
+        .record_twap_sample(&OracleFeedType::Price, &t.token.address, &21_000);
     assert!(!t.contract.is_twap_enabled(&OracleFeedType::Price));
     // No spot sources -> spot path errors, proving the TWAP average was NOT
     // consulted while disabled (it would have returned 20_500).
-    let res = t.contract.try_get_verified_price(&OracleFeedType::Price, &t.token.address);
+    let res = t
+        .contract
+        .try_get_verified_price(&OracleFeedType::Price, &t.token.address);
     assert_eq!(res, Err(Ok(crate::errors::ContractError::NoPriceSource)));
     let _ = DEFAULT_MAX_PRICE_DEVIATION_BPS;
 }
@@ -1049,22 +1053,209 @@ fn test_twap_disabled_feed_uses_spot_even_with_samples() {
 fn test_twap_window_bounds_accept_and_reject() {
     use crate::oracle_registry::{MAX_TWAP_WINDOW_LEDGERS, MIN_TWAP_WINDOW_LEDGERS};
     let t = setup();
-    // Bounds themselves are accepted.
+    // Bounds themselves are accepted. Each subsequent call is spaced past
+    // the rate-limit cooldown so the assertion observes the window validation
+    // (or auth) result, never `RateLimited`.
     t.contract.set_twap_window(&MIN_TWAP_WINDOW_LEDGERS);
     assert_eq!(t.contract.get_twap_window(), MIN_TWAP_WINDOW_LEDGERS);
+    advance_past_rate_limit_cooldown(&t.env);
     t.contract.set_twap_window(&MAX_TWAP_WINDOW_LEDGERS);
     assert_eq!(t.contract.get_twap_window(), MAX_TWAP_WINDOW_LEDGERS);
     // Outside bounds rejected with the dedicated error.
+    advance_past_rate_limit_cooldown(&t.env);
     assert_eq!(
-        t.contract.try_set_twap_window(&(MIN_TWAP_WINDOW_LEDGERS - 1)),
+        t.contract
+            .try_set_twap_window(&(MIN_TWAP_WINDOW_LEDGERS - 1)),
         Err(Ok(crate::errors::ContractError::InvalidTwapWindow))
     );
+    advance_past_rate_limit_cooldown(&t.env);
     assert_eq!(
-        t.contract.try_set_twap_window(&(MAX_TWAP_WINDOW_LEDGERS + 1)),
+        t.contract
+            .try_set_twap_window(&(MAX_TWAP_WINDOW_LEDGERS + 1)),
         Err(Ok(crate::errors::ContractError::InvalidTwapWindow))
     );
+    advance_past_rate_limit_cooldown(&t.env);
     assert_eq!(
         t.contract.try_set_twap_window(&0),
         Err(Ok(crate::errors::ContractError::InvalidTwapWindow))
+    );
+}
+
+// ----------------------------------------------------------------
+// Issue #860 — health-gate coverage on price-dependent reads
+// ----------------------------------------------------------------
+
+/// Record a stale health snapshot for `(feed, t.token)` directly through the
+/// registry's health machinery. Storage writes must run as the contract, so
+/// the call is wrapped in `as_contract`. Data is 1_000 ledgers old against a
+/// 10-ledger max age → `is_stale = true`.
+fn record_stale_health(t: &crate::test::TestEnv, feed: OracleFeedType, oracle: &Address) {
+    let seq = t.env.ledger().sequence();
+    t.env.as_contract(&t.contract.address, || {
+        crate::oracle_registry::record_oracle_health(
+            &t.env,
+            feed,
+            &t.token.address,
+            oracle,
+            seq.saturating_sub(1_000),
+            10,
+        );
+    });
+}
+
+/// A tripped circuit must reject `get_verified_price` with
+/// `OracleCircuitOpen` — before the price-source search runs (with no
+/// sources registered, an ungated read would surface `NoPriceSource`, so
+/// the asserted error proves the gate fires first).
+#[test]
+fn test_get_verified_price_rejects_tripped_circuit() {
+    let t = setup();
+    let oracle = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+    for _ in 0..crate::oracle_registry::MAX_CONSECUTIVE_STALE_QUERIES {
+        record_stale_health(&t, OracleFeedType::Price, &oracle);
+    }
+    assert!(t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Price, &t.token.address));
+
+    let res = t
+        .contract
+        .try_get_verified_price(&OracleFeedType::Price, &t.token.address);
+    assert_eq!(
+        res,
+        Err(Ok(crate::errors::ContractError::OracleCircuitOpen))
+    );
+}
+
+/// A single stale health snapshot (below the trip threshold — circuit still
+/// closed) must reject `get_verified_price` with `OracleDataStale`.
+#[test]
+fn test_get_verified_price_rejects_stale_health() {
+    let t = setup();
+    let oracle = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+    record_stale_health(&t, OracleFeedType::Price, &oracle);
+    assert!(!t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Price, &t.token.address));
+
+    let res = t
+        .contract
+        .try_get_verified_price(&OracleFeedType::Price, &t.token.address);
+    assert_eq!(res, Err(Ok(crate::errors::ContractError::OracleDataStale)));
+}
+
+/// `get_twap_price` collapses both health-gate rejections to `None`
+/// (its `Option` signature has no error channel): stale snapshot → `None`;
+/// tripped circuit → `None`.
+#[test]
+fn test_get_twap_price_none_when_health_degraded() {
+    let t = setup();
+    let oracle = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+
+    record_stale_health(&t, OracleFeedType::Price, &oracle);
+    assert_eq!(
+        t.contract
+            .get_twap_price(&OracleFeedType::Price, &t.token.address),
+        None,
+        "stale health snapshot must yield None"
+    );
+
+    for _ in 1..crate::oracle_registry::MAX_CONSECUTIVE_STALE_QUERIES {
+        record_stale_health(&t, OracleFeedType::Price, &oracle);
+    }
+    assert!(t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Price, &t.token.address));
+    assert_eq!(
+        t.contract
+            .get_twap_price(&OracleFeedType::Price, &t.token.address),
+        None,
+        "tripped circuit must yield None"
+    );
+}
+
+/// Price oracle that answers every query with 10_000 (1.00 USD in bps) —
+/// used to observe whether `get_contract_stats` normalized with it.
+#[contract]
+struct MockPriceOracle;
+
+#[contractimpl]
+impl MockPriceOracle {
+    pub fn get_price(_env: Env, _token: Address) -> i128 {
+        10_000
+    }
+}
+
+/// `get_contract_stats` must stop USD-normalizing a token's volume once the
+/// `(Price, token)` health gate rejects the feed — the bare legacy
+/// `invoke_contract` bypass this regression test guards against would keep
+/// trusting (or panic on) the degraded oracle.
+#[test]
+fn test_contract_stats_skips_stale_price_normalization() {
+    let t = setup();
+    let price_oracle = t.env.register_contract(None, MockPriceOracle);
+    t.contract.set_price_oracle(&price_oracle);
+
+    let token = t.token.address.clone();
+    t.env.as_contract(&t.contract.address, || {
+        crate::invoice::add_volume(&t.env, &token, 10_000);
+    });
+
+    // Healthy (no health record yet): volume × 10_000 bps / 10_000 = 10_000.
+    let stats = t.contract.get_contract_stats();
+    assert_eq!(
+        stats.total_volume_usd_normalized, 10_000,
+        "healthy feed must be used for USD normalization"
+    );
+
+    // Degrade the (Price, token) feed → normalization skipped, raw volume
+    // untouched.
+    let oracle = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+    record_stale_health(&t, OracleFeedType::Price, &oracle);
+    let stats = t.contract.get_contract_stats();
+    assert_eq!(
+        stats.total_volume_usd_normalized, 0,
+        "stale feed must not be trusted for USD normalization"
+    );
+    let mut raw = None;
+    for (addr, vol) in stats.token_volumes.iter() {
+        if addr == token {
+            raw = Some(vol);
+        }
+    }
+    assert_eq!(raw, Some(10_000), "raw per-token volume must be preserved");
+}
+
+// ----------------------------------------------------------------
+// Issue #859 — rate-limit coverage on oracle-registry admin fns
+// ----------------------------------------------------------------
+
+/// First-ever call of a rate-limited admin fn is allowed; an immediate
+/// repeat is `RateLimited`; after the cooldown the call succeeds again.
+#[test]
+fn test_oracle_admin_functions_rate_limited() {
+    let t = setup();
+    let o1 = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+    let o2 = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+
+    t.contract.register_oracle(&OracleFeedType::Identity, &o1);
+    let res = t
+        .contract
+        .try_register_oracle(&OracleFeedType::Identity, &o2);
+    assert_eq!(
+        res,
+        Err(Ok(crate::errors::ContractError::RateLimited)),
+        "second register_oracle within cooldown must be RateLimited"
+    );
+    advance_past_rate_limit_cooldown(&t.env);
+    t.contract.register_oracle(&OracleFeedType::Identity, &o2);
+
+    // Independent key: add_price_source is limited on its own clock.
+    t.contract.add_price_source(&OracleFeedType::Price, &o1);
+    let res = t.contract.try_add_price_source(&OracleFeedType::Price, &o2);
+    assert_eq!(
+        res,
+        Err(Ok(crate::errors::ContractError::RateLimited)),
+        "second add_price_source within cooldown must be RateLimited"
     );
 }

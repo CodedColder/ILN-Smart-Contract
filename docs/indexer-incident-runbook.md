@@ -61,6 +61,13 @@ During a recovery operation (especially Full Resync or extended Option A/B), the
 **User-Facing Template**:
 > "We are currently experiencing degraded performance with the ILN dashboard data. On-chain operations are unaffected and smart contracts are fully operational. Our team is restoring the indexer service. Expected resolution in [Time]. Thank you for your patience."
 
-## 5. Cross-References
+## 5. Reorg-specific response
+
+A reorg alert is a chain-integrity incident rather than a normal service outage. When `indexer_reorg_detected` fires, follow the deep replay workflow in [Indexer Reorg Handling](indexer-reorg-handling.md): confirm the fork depth and divergence ledger, verify the database is blocked by the halt latch, and only resume ingestion after rollback-and-replay completes without a second divergence.
+
+If the automatic recovery path times out or the reorg is deeper than the live detector’s bounded walk, escalate to manual ledger rollback from the last known-good ancestor, then replay the affected ledger range before clearing `pending_reorg`.
+
+## 6. Cross-References
 - [Incident Response Runbook (Section 12)](incident-response-runbook.md)
+- [Indexer Reorg Handling](indexer-reorg-handling.md)
 - Backup and Replay Mechanics (Issues 78-79)

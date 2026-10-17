@@ -57,6 +57,10 @@ interface CanaryConfig {
   indexerReflectWindowMs: number;
   alertWebhookUrl: string;
   dryRun: boolean;
+  /** Insurance pool contract address for solvency health checks. */
+  insurancePoolContractId: string;
+  /** Oracle contract address for TWAP feed reads. */
+  oracleContractId: string;
 }
 
 interface CanaryStep {
@@ -101,6 +105,8 @@ function loadConfig(argv: string[]): CanaryConfig {
     indexerReflectWindowMs: Number(process.env.INDEXER_REFLECT_WINDOW_MS || 60_000),
     alertWebhookUrl: process.env.ALERT_WEBHOOK_URL || "",
     dryRun,
+    insurancePoolContractId: process.env.INSURANCE_POOL_CONTRACT_ID || '',
+    oracleContractId: process.env.ORACLE_CONTRACT_ID || '',
   };
 }
 
@@ -493,6 +499,124 @@ async function stepCheckLatencyThresholds(
   return stepComplete(step, true, { thresholdMs, checked: steps.length });
 }
 
+// ── TWAP and Insurance Pool Canary Steps ─────────────────────────────────────
+
+/**
+ * Step: Read a TWAP-enabled price feed from the oracle contract.
+ * Verifies that the oracle is responsive and returning valid data.
+ */
+async function stepReadTwapFeed(
+  cfg: CanaryConfig,
+  server: rpc.Server
+): Promise<CanaryStep> {
+  const step = stepStart('read_twap_feed');
+  const start = Date.now();
+  try {
+    if (!cfg.oracleContractId) {
+      return stepComplete(step, true, { skipped: true, reason: 'ORACLE_CONTRACT_ID not set' });
+    }
+
+    const contract = new Contract(cfg.oracleContractId);
+    // Read the TWAP price for XLM/USD — a simple read-only call
+    const args = [
+      nativeToScVal('XLM', { type: 'symbol' }),
+      nativeToScVal('USD', { type: 'symbol' }),
+    ];
+
+    const tx = new TransactionBuilder(
+      await server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'),
+      { fee: '100', networkPassphrase: cfg.networkPassphrase }
+    )
+      .addOperation(contract.call('get_twap', ...args))
+      .setTimeout(30)
+      .build();
+
+    const simulated = await server.simulateTransaction(tx);
+    const latencyMs = Date.now() - start;
+
+    if (rpc.Api.isSimulateTransactionError(simulated)) {
+      return stepComplete(step, false, { latencyMs }, `TWAP simulation failed: ${JSON.stringify(simulated.error)}`);
+    }
+
+    if (!rpc.Api.isSimulationSuccess(simulated)) {
+      return stepComplete(step, false, { latencyMs }, 'TWAP simulation returned non-success status');
+    }
+
+    const retval = simulated.result?.retval;
+    const value = retval ? scValToNative(retval) : null;
+
+    return stepComplete(step, true, {
+      latencyMs,
+      oracleContract: cfg.oracleContractId,
+      twapValue: value,
+    });
+  } catch (e) {
+    return stepComplete(step, false, { latencyMs: Date.now() - start }, errMsg(e));
+  }
+}
+
+/**
+ * Step: Check insurance pool solvency health.
+ * Reads the pool's solvency ratio and verifies the circuit breaker is not tripped.
+ */
+async function stepCheckInsurancePoolHealth(
+  cfg: CanaryConfig,
+  server: rpc.Server
+): Promise<CanaryStep> {
+  const step = stepStart('check_insurance_pool_health');
+  const start = Date.now();
+  try {
+    if (!cfg.insurancePoolContractId) {
+      return stepComplete(step, true, { skipped: true, reason: 'INSURANCE_POOL_CONTRACT_ID not set' });
+    }
+
+    const contract = new Contract(cfg.insurancePoolContractId);
+    const tx = new TransactionBuilder(
+      await server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'),
+      { fee: '100', networkPassphrase: cfg.networkPassphrase }
+    )
+      .addOperation(contract.call('get_solvency_info'))
+      .setTimeout(30)
+      .build();
+
+    const simulated = await server.simulateTransaction(tx);
+    const latencyMs = Date.now() - start;
+
+    if (rpc.Api.isSimulateTransactionError(simulated)) {
+      return stepComplete(step, false, { latencyMs }, `Insurance pool simulation failed: ${JSON.stringify(simulated.error)}`);
+    }
+
+    if (!rpc.Api.isSimulationSuccess(simulated)) {
+      return stepComplete(step, false, { latencyMs }, 'Insurance pool simulation returned non-success status');
+    }
+
+    const retval = simulated.result?.retval;
+    const solvencyInfo = retval ? scValToNative(retval) : null;
+
+    // Check if circuit breaker is tripped (solvency ratio < 1.0 or explicit flag)
+    let isHealthy = true;
+    if (solvencyInfo && typeof solvencyInfo === 'object') {
+      const info = solvencyInfo as Record<string, unknown>;
+      if ('solvency_ratio' in info) {
+        const ratio = Number(info.solvency_ratio);
+        isHealthy = ratio >= 1.0;
+      }
+      if ('circuit_tripped' in info) {
+        isHealthy = isHealthy && !Boolean(info.circuit_tripped);
+      }
+    }
+
+    return stepComplete(step, isHealthy, {
+      latencyMs,
+      poolContract: cfg.insurancePoolContractId,
+      solvencyInfo,
+      healthy: isHealthy,
+    }, isHealthy ? undefined : 'Insurance pool solvency circuit is tripped or ratio below 1.0');
+  } catch (e) {
+    return stepComplete(step, false, { latencyMs: Date.now() - start }, errMsg(e));
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function runCanaryOnce(cfg: CanaryConfig): Promise<CanaryReport> {
@@ -564,7 +688,17 @@ async function runCanaryOnce(cfg: CanaryConfig): Promise<CanaryReport> {
   steps.push(indexerStep);
   console.log(`  [${indexerStep.success ? "PASS" : "FAIL"}] verify_indexer: ${indexerStep.latencyMs ?? "?"}ms`);
 
-  // Step 6: Check latency thresholds
+  // Step 6: Read TWAP feed from oracle
+  const twapStep = await stepReadTwapFeed(cfg, server);
+  steps.push(twapStep);
+  console.log(`  [${twapStep.success ? "PASS" : "FAIL"}] read_twap_feed: ${twapStep.latencyMs ?? "?"}ms`);
+
+  // Step 7: Check insurance pool solvency health
+  const insuranceStep = await stepCheckInsurancePoolHealth(cfg, server);
+  steps.push(insuranceStep);
+  console.log(`  [${insuranceStep.success ? "PASS" : "FAIL"}] check_insurance_pool: ${insuranceStep.latencyMs ?? "?"}ms`);
+
+  // Step 8: Check latency thresholds
   const latencyStep = await stepCheckLatencyThresholds(steps, cfg.latencyThresholdMs);
   steps.push(latencyStep);
   console.log(`  [${latencyStep.success ? "PASS" : "FAIL"}] check_latency: ${latencyStep.latencyMs ?? "?"}ms`);

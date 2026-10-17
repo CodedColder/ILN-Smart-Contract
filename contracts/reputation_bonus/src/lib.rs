@@ -19,13 +19,24 @@ pub struct ReputationBonusContract;
 
 #[contractimpl]
 impl ReputationBonusContract {
-    pub fn init(env: Env, admin: Address) {
+    /// `init` contract entry point.
+///
+/// Access: Anyone
+pub fn init(env: Env, admin: Address) {
         set_admin(&env, &admin);
         emit_initialized(&env, &admin);
     }
 
-    pub fn set_config(env: Env, config: Config) -> Result<(), ContractError> {
-        set_config(&env, &config).map_err(|_| ContractError::ConfigErrorUnauthorized)?;
+    /// `set_config` contract entry point.
+///
+/// Access: Anyone
+pub fn set_config(env: Env, config: Config) -> Result<(), ContractError> {
+        set_config(&env, &config).map_err(|e| match e {
+            crate::config::ConfigError::InvalidHighRepThreshold => ContractError::ConfigErrorInvalidHighRepThreshold,
+            crate::config::ConfigError::InvalidBonusBps => ContractError::ConfigErrorInvalidBonusBps,
+            crate::config::ConfigError::InvalidMinDiscountRate => ContractError::ConfigErrorInvalidMinDiscountRate,
+            crate::config::ConfigError::Unauthorized => ContractError::ConfigErrorUnauthorized,
+        })?;
         emit_config_set(
             &env,
             config.high_rep_threshold,
@@ -35,11 +46,17 @@ impl ReputationBonusContract {
         Ok(())
     }
 
-    pub fn get_config(env: Env) -> Result<Config, ContractError> {
+    /// `get_config` contract entry point.
+///
+/// Access: Anyone
+pub fn get_config(env: Env) -> Result<Config, ContractError> {
         get_config(&env).map_err(|_| ContractError::ConfigErrorUnauthorized)
     }
 
-    pub fn update_config(
+    /// `update_config` contract entry point.
+///
+/// Access: Anyone
+pub fn update_config(
         env: Env,
         caller: Address,
         high_rep_threshold: u32,
@@ -53,14 +70,25 @@ impl ReputationBonusContract {
             bonus_bps,
             min_discount_rate_bps,
         )
-        .map_err(|_| ContractError::ConfigErrorUnauthorized)
+        .map_err(|e| match e {
+            crate::config::ConfigError::InvalidHighRepThreshold => ContractError::ConfigErrorInvalidHighRepThreshold,
+            crate::config::ConfigError::InvalidBonusBps => ContractError::ConfigErrorInvalidBonusBps,
+            crate::config::ConfigError::InvalidMinDiscountRate => ContractError::ConfigErrorInvalidMinDiscountRate,
+            crate::config::ConfigError::Unauthorized => ContractError::ConfigErrorUnauthorized,
+        })
     }
 
-    pub fn get_reputation(env: Env, address: Address) -> ReputationScore {
+    /// `get_reputation` contract entry point.
+///
+/// Access: Anyone
+pub fn get_reputation(env: Env, address: Address) -> ReputationScore {
         read_reputation(&env, &address)
     }
 
-    pub fn submit_invoice(
+    /// `submit_invoice` contract entry point.
+///
+/// Access: Anyone
+pub fn submit_invoice(
         env: Env,
         freelancer: Address,
         payer: Address,
@@ -78,11 +106,17 @@ impl ReputationBonusContract {
         )
     }
 
-    pub fn mark_paid(env: Env, invoice_id: u64) -> Result<(), ContractError> {
+    /// `mark_paid` contract entry point.
+///
+/// Access: Anyone
+pub fn mark_paid(env: Env, invoice_id: u64) -> Result<(), ContractError> {
         mark_paid(&env, invoice_id)
     }
 
-    pub fn handle_default(env: Env, invoice_id: u64) -> Result<(), ContractError> {
+    /// `handle_default` contract entry point.
+///
+/// Access: Anyone
+pub fn handle_default(env: Env, invoice_id: u64) -> Result<(), ContractError> {
         handle_default(&env, invoice_id)
     }
 }

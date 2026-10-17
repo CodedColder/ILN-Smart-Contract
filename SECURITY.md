@@ -41,3 +41,24 @@ See [docs/security.md](docs/security.md) for full details including safe harbor,
 |---------|-----------|
 | Experimental/testnet | Best-effort security fixes |
 | Mainnet | Not yet launched |
+
+## Bug Bounty Program (Post-Mainnet)
+
+We operate a continuous bug bounty program to reward researchers for finding vulnerabilities in ILN Smart Contracts.
+
+### Scope
+- In-scope: All production Soroban contracts (`contracts/*`) deployed to mainnet.
+- Out-of-scope: CLI utilities, off-chain indexers, demo scripts.
+
+### Reward Tiers (USDC)
+- **Critical:** Up to $50,000
+- **High:** Up to $15,000
+- **Medium:** Up to $5,000
+- **Low:** Up to $1,000
+
+Rewards are funded directly from the ILN DAO Treasury multi-sig.
+
+### Safe Harbor
+Good faith security research that follows this disclosure policy will be considered authorized. We will not pursue civil or criminal action against researchers who comply with these guidelines.
+
+----

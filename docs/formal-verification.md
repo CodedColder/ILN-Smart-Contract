@@ -2,6 +2,8 @@
 
 ## 1. Overview
 
+Cross-contract system invariants spanning `invoice_liquidity`, `iln_distribution`, and `insurance_pool` are specified separately in [`formal-verification-cross-contract.md`](formal-verification-cross-contract.md).
+
 This document defines formal invariants, valid state transitions, and authorization properties for the protocol's core state machines. These specifications serve as the basis for formal verification, property-based testing, and audit review.
 
 Two independent state machines are covered:
@@ -289,14 +291,14 @@ Unlike the invoice lifecycle (one enum field on a mutable record), a `Governance
 ## 9. Vote & Weight Invariants
 
 ### Invariant V1: Vote weight is fixed at cast time
-**Property:** `cast_vote` uses `own_balance` (snapshotted at `create_proposal` time, or on first read if unset) plus the caller's current `DelegatedToMe` tally; once recorded, `AppliedVoteWeight(proposal_id, voter)` never changes for that voter/proposal pair.
+**Property:** `cast_vote` uses `own_balance` (snapshotted at `create_proposal` time for the proposer, or checkpoint-proven on first vote for others: requires a `BalanceCheckpoint` predating the proposal's creation ledger by `MIN_VOTE_HOLD_LEDGERS`, carrying `min(checkpoint, current)` — Issue #805) plus the caller's current `DelegatedToMe` tally; once recorded, `AppliedVoteWeight(proposal_id, voter)` never changes for that voter/proposal pair.
 
-**Enforcement:** `src/lib.rs:830-859` (snapshot read) and `src/lib.rs:879-885` (vote receipt write to temporary storage).
+**Enforcement:** `cast_vote`'s snapshot branch (proposer fast path) and `proven_own_balance` gate (first-vote path) in `contracts/iln_governance/src/lib.rs`, plus the vote receipt written to temporary storage and mirrored durably to `VoteReceipt` (Issue #1099).
 
 ### Invariant V2: One vote per address per proposal
 **Property:** A given `(proposal_id, voter)` pair can only increment `votes_for`/`votes_against` once.
 
-**Enforcement:** `HasVoted(proposal_id, voter)` guard at `src/lib.rs:823-826`, checked before any tally mutation.
+**Enforcement:** `HasVoted(proposal_id, voter)` guard checked before any tally mutation, OR'd with the durable `VoteReceipt(proposal_id, voter)` mirror (Issue #1099) so a host-archived temporary receipt cannot reopen the double-vote window.
 
 ### Invariant V3: Delegation is acyclic and depth-bounded
 **Property:** The `Delegation` forward-pointer graph never contains a cycle, and no delegation chain exceeds `MaxDelegationDepth` hops.
@@ -321,6 +323,13 @@ Unlike the invoice lifecycle (one enum field on a mutable record), a `Governance
 **Rationale:** Guarantees `execute_proposal` is safely retriable and that `Executed` status is a reliable signal that the action actually took effect (Issue #531).
 
 **Enforcement:** `invoke_and_check()` (`src/lib.rs:1396-1408`) uses `try_invoke_contract`; the `!succeeded` branch emits `proposal_execution_failed` and returns `Ok` (Issue #1007: an `Err` would roll the event back) without touching persistent proposal storage.
+
+### Invariant V7: Receipts are archival-resilient (fail-closed)
+**Property:** Archival/eviction of a temporary vote or veto receipt by the host cannot resurrect a stale authorization. `has_voted` and `get_applied_vote_weight` fall back to the durable `VoteReceipt` mirror; the veto threshold tally is derived from durable per-signer `VetoApprovalReceipt` flags. Presence in *either* store blocks a repeat action.
+
+**Rationale:** Temporary storage entries have a finite TTL and may be archived; a guard that only consults temporary storage would fail open, allowing a double vote or a reset of a partially-collected veto multisig (Issue #1099).
+
+**Enforcement:** `cast_vote` guard (temporary `HasVoted` **or** persistent `VoteReceipt`), persistent `VoteReceipt` write, `has_voted`/`get_applied_vote_weight` fallbacks, and `veto_proposals_from_persistent`/`VetoApprovalReceipt` per-signer durability in `contracts/iln_governance/src/lib.rs`. Tests: `test_vote_receipt_survives_temporary_archival`, `test_vote_receipt_persistent_mirror_written_with_ttl`, `test_veto_approval_receipt_survives_archival_and_dedups`.
 
 ---
 
@@ -391,7 +400,7 @@ There is no single `check_invariants()` helper analogous to the invoice contract
 
 ## 12. Storage Isolation Guarantee
 
-**Property:** Each proposal occupies an independent storage key (`StorageKey::Proposal(id)`), each vote receipt an independent key (`StorageKey::HasVoted(proposal_id, voter)` / `StorageKey::AppliedVoteWeight(proposal_id, voter)`), and each delegation edge an independent key (`StorageKey::Delegation(address)` / `StorageKey::DelegatedToMe(address)`). Operations on proposal `i` never modify the storage of proposal `j` for `i ≠ j`, and voting on one proposal never touches another proposal's tallies.
+**Property:** Each proposal occupies an independent storage key (`StorageKey::Proposal(id)`), each vote receipt an independent key (`StorageKey::HasVoted(proposal_id, voter)` / `StorageKey::AppliedVoteWeight(proposal_id, voter)` / durable `StorageKey::VoteReceipt(proposal_id, voter)`), each veto approval an independent key (`StorageKey::VetoApprovals(id)` / durable `StorageKey::VetoApprovalReceipt(proposal_id, signer)`), and each delegation edge an independent key (`StorageKey::Delegation(address)` / `StorageKey::DelegatedToMe(address)`). Operations on proposal `i` never modify the storage of proposal `j` for `i ≠ j`, and voting on one proposal never touches another proposal's tallies.
 
 **Enforcement:** All proposal mutations load and store a single `GovernanceProposal` by `id`; all vote/delegation storage keys are keyed by `(proposal_id, voter)` or `address` respectively, giving each pair disjoint storage slots.
 
@@ -406,6 +415,8 @@ There is no single `check_invariants()` helper analogous to the invoice contract
 | Timelock (`eta_ledger`) enforcement | `contracts/iln_governance/src/test.rs` |
 | Execution retry on cross-contract failure (Issue #531) | `contracts/iln_governance/src/test.rs` |
 | Veto path and `disable_veto_power` one-way switch (Issue #68) | `contracts/iln_governance/src/test.rs` |
+| Archival-resilient vote/veto receipts (fail-closed mirror, Issue #1099) | `contracts/iln_governance/src/test.rs`, `contracts/iln_governance/src/tests_differential.rs` |
+| Differential (legacy vs remediated) governance behaviour (Issues #68, #531, #622, #805, #1098) | `contracts/iln_governance/src/tests_differential.rs` |
 | Delegation cycle/depth prevention (Issue #64) | `contracts/iln_governance/src/test.rs` |
 | Quadratic voting weight transform (Issue #530) | `contracts/iln_governance/src/test.rs` |
 | Access control (admin / ILN-contract-gated setters) | `contracts/iln_governance/src/test.rs` |
@@ -420,10 +431,10 @@ This section extends the governance formal verification to explicitly specify sn
 ### 14.1 Vote-Weight Snapshot Invariants
 
 **Invariant SN1: Snapshot monotonicity for a given proposal**
-**Property:** For a given `proposal_id`, once a `voter` address has cast a vote (checked via `HasVoted(proposal_id, voter)`), that voter's recorded vote weight (`AppliedVoteWeight(proposal_id, voter)`) never changes for the duration of that proposal's lifetime (through terminal status).
+**Property:** For a given `proposal_id`, once a `voter` address has cast a vote (checked via `HasVoted(proposal_id, voter)` and its durable `VoteReceipt(proposal_id, voter)` mirror), that voter's recorded vote weight (`AppliedVoteWeight(proposal_id, voter)`, mirrored in `VoteReceipt`) never changes for the duration of that proposal's lifetime (through terminal status).
 
-**Enforcement:** 
-- Snapshot read at first vote: `src/lib.rs:830-859` loads `own_balance` at proposal creation (proposer) or first vote (other voters)
+**Enforcement:**
+- Snapshot read at first vote: `cast_vote` loads `own_balance` at proposal creation (proposer) or via the Issue #805 checkpoint gate for other voters — a `BalanceCheckpoint` predating the proposal's creation ledger by `MIN_VOTE_HOLD_LEDGERS`, carrying `min(checkpoint, current)`; otherwise `InsufficientHoldingPeriod`
 - Write-once guarantee: `AppliedVoteWeight` is written only on the first `cast_vote` call for a (proposal, voter) pair
 - Immutability: Subsequent balance changes to the `voter` do not affect the recorded weight
 
@@ -450,7 +461,7 @@ for voter in voters_who_cast_vote_on(proposal_id) {
 
 **Enforcement:**
 - Guard check: `HasVoted(proposal_id, voter)` is checked before any tally mutation (`src/lib.rs:823-826`)
-- Idempotence: Once `HasVoted(proposal_id, voter)` is written, subsequent `cast_vote` calls by the same voter on the same proposal return `AlreadyVoted` without changing tallies
+- Idempotence: Once `HasVoted(proposal_id, voter)` (or the durable `VoteReceipt(proposal_id, voter)` mirror, Issue #1099) is present, subsequent `cast_vote` calls by the same voter on the same proposal return `AlreadyVoted` without changing tallies — even if the temporary receipt has been archived
 
 **Specification:**
 ```rust
@@ -516,8 +527,11 @@ assert!(!has_cycle(all_delegations()));
 **Property:** For any address `A`, the chain of delegations from `A` (following `delegated_to` pointers until reaching a non-delegating address) contains at most `MaxDelegationDepth` edges (default: 10).
 
 **Enforcement:**
-- Depth check on store: `src/lib.rs:712-727` counts hops during the forward-walk cycle check and rejects if depth would exceed `MaxDelegationDepth`
-- Rejection code: `src/lib.rs:728-730` returns `MaxDelegationDepthExceeded`
+- Reverse adjacency: `delegate_votes` maintains `StorageKey::Delegators(delegate)` — the set of addresses whose forward `Delegation` pointer targets `delegate` (`src/lib.rs`, helpers `get_delegators` / `add_delegator` / `remove_delegator`). `undelegate_votes` and re-delegation keep it in sync.
+- Exact resulting-depth check on store: before mutating, `delegate_votes` computes `longest_inbound_depth(delegator)` (iterative, memoized walk over the reverse adjacency) and `forward_delegation_depth(delegate)`, and rejects when `longest_inbound + 1 + forward > MaxDelegationDepth`. This covers **every** insertion order — including chains grown by appending at the leaf, which a forward-only walk from the delegate cannot observe (the delegate is a fresh leaf each time).
+- Cycle detection walks the forward chain from `delegate` and returns `DelegationCyclePrevented`; the walk is bounded by `MaxDelegationDepth` so pre-existing over-deep/cyclic data cannot spin forever.
+- All validation runs **before any storage mutation**, so a rejected call leaves no partial state.
+- Rejection code: `MaxDelegationDepthExceeded`.
 
 **Specification:**
 ```rust
@@ -645,3 +659,34 @@ assert!(total_weight <= total_supply);
 | Vote weight = isqrt(own_balance + DelegatedToMe) (quadratic) | `contracts/iln_governance/src/test.rs` | #810 |
 | Sum of vote weights ≤ total supply | `contracts/iln_governance/src/test.rs` | #810 |
 | Combined adversarial attack suite (flash-loan + Sybil + delegation + voting) | `contracts/tests/tests_adversarial_governance.rs` | #813 |
+
+---
+
+## 16. CI gate on formal counterexamples (Issue #1101)
+
+The invariants above are defended by two layers of executable evidence, both
+run as a hard CI gate:
+
+1. **Property-based counterexample hunt** — `mod counterexample_invariants` in
+   `contracts/iln_governance/src/test.rs`. Randomized operation sequences try to
+   *falsify* the invariants:
+   - `prop_no_double_vote_even_after_temporary_archival` (V2 + V7): random vote
+     orders with interleaved temporary-receipt archival; the test keeps its own
+     tally model and asserts the contract matches it after every operation.
+   - `prop_delegation_graph_never_cycles_or_exceeds_depth` (DEL2): random
+     `delegate`/`undelegate` sequences over 13 accounts (> the depth cap); after
+     every operation it walks the forward delegation graph and asserts it is
+     acyclic and no chain exceeds `MaxDelegationDepth`.
+2. **Pairwise legacy/remediated differential tests** —
+   `contracts/iln_governance/src/tests_differential.rs` (Issues #68, #531,
+   #622, #805, #1098).
+
+The gate is executed by `scripts/run-formal-verification.sh` (also
+`make test-formal`) and by the `formal-verification` GitHub Actions workflow
+(`.github/workflows/formal-verification.yml`). Any counterexample found by the
+randomized hunt fails the build. The same script also runs
+`scripts/check-proof-obligations.py`, so the published cross-contract
+obligation registry (Issue #1100) cannot drift.
+
+A failure of either layer is treated as an invariant violation, not flakiness:
+the shrunken input from `proptest` is the counterexample to triage.
