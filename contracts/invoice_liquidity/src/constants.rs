@@ -76,6 +76,25 @@ pub const FUND_QUEUE_TTL_EXTEND_TO: u32 = 2_000_000;
 /// refresh TTLs before retrying.
 pub const TTL_MIN_LEDGERS_BEFORE_UPGRADE: u32 = 500_000;
 
+/// Issue #1064: maximum number of price sources that may be registered for a
+/// single `OracleFeedType`.
+///
+/// `add_price_source` appended to a per-feed `Vec` with no upper bound, and
+/// `get_verified_price` iterates that whole vector on every price read,
+/// emitting one `PriceOutlierRejected` event *per* source that deviates past
+/// the configured threshold. An unbounded source list therefore makes the
+/// number of events a single `get_verified_price` invocation can emit — and
+/// the storage/CPU cost of the iteration — unbounded, so governance (or a
+/// compromised admin key) could grow a feed until a price read exceeds
+/// Soroban's per-transaction resource limits and the price path fails for
+/// every token on that feed.
+///
+/// Capping the list bounds the worst-case event fan-out and loop cost of a
+/// price read to a fixed, measurable maximum. Deviation checking only needs a
+/// handful of independent sources to establish a median, so the cap is set
+/// well above any realistic quorum.
+pub const MAX_PRICE_SOURCES_PER_FEED: u32 = 20;
+
 /// Issue #1082: number of the most-recent invoice IDs to sample during the
 /// pre-upgrade TTL check.  Bounded to cap the resource cost of the check;
 /// the most-recently-written invoices are the most likely to still be

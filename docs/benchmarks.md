@@ -152,6 +152,176 @@ warning is accurate, not a false positive — treat it as the intended
 early signal to investigate, not something to silence by raising the
 ratio.
 
+## TTL cost at maximum queue size (Issue #1062)
+
+Issues #1091/#1095 bounded a single invoice's fund queue to
+`MAX_FUND_QUEUE_LEN` (50) entries, admitting a new LP only if it strictly
+outscores the current tail (which it then displaces). That bound is what
+keeps the serialized `FundQueue(id)` entry — and therefore the per-write
+`extend_ttl` host call that keeps the queue alive (Issue #1011) — inside
+Soroban's per-transaction resource limits. Nothing previously measured that
+worst case.
+
+**Before:** the [`invoice_liquidity` baseline table](#baseline-execution-results)
+covered only the three single-invoice flows (`submit_invoice`, `fund_invoice`,
+`mark_paid`). No benchmark filled a fund queue at all, so the maximum-size
+admission (`join_fund_queue`'s displacing path), resolution, and TTL
+extension were entirely unmeasured — a change that enlarged a queue entry
+could push the maximum-size write past the network limit with nothing in CI
+to catch it.
+
+**After:** `contracts/invoice_liquidity/src/tests_benchmarks.rs` adds five
+benchmarks under Issue #1062, each asserting against the same absolute
+ceilings as the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | What it measures |
+| ---------------------------- | ---------------- |
+| `join_fund_queue_at_max_queue_size` | admission into a *full* queue (scan, pop, insert, full re-serialize, TTL extension) |
+| `resolve_fund_queue_at_max_queue_size` | `resolve_fund_queue` over a full queue |
+| `extend_ttl_fund_queue_at_max_queue_size` | the isolated `extend_ttl` host call on the queue key at 50 entries |
+| `extend_ttl_fund_queue_at_one_entry` | the same isolated call at 1 entry (minimum) |
+| `extend_ttl_fund_queue_len_{1,10,50}` | the isolated call at 1 / 10 / 50 entries (emitted by `benchmark_ttl_cost_across_queue_sizes`), printed as a table |
+
+The TTL measurements first age the ledger below `FUND_QUEUE_TTL_THRESHOLD`,
+because `extend_ttl` short-circuits to a no-op while the entry still has
+`>= FUND_QUEUE_TTL_THRESHOLD` ledgers left — without that, the measurement
+would understate the cost it exists to capture. Because the TTL target is
+key-based (not value-based), the entry-size-dependent part of the cost shows
+up in the *write/serialization* portion, which the
+`extend_ttl_fund_queue_across_sizes` table isolates.
+
+Run them with:
+
+```bash
+cd contracts/invoice_liquidity
+cargo test --target x86_64-unknown-linux-gnu benchmark_ -- --nocapture
+```
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record these as a tracked baseline,
+run the command above and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+three entries.
+
+## Concurrent settlement stress (Issue #1063)
+
+Settlement (`mark_paid`) is the contract's highest-value entry point, and it
+touches several pieces of *shared* state on every call: the reentrancy lock
+(`StorageKey::ReentrancyLock`), the aggregate counter (`StorageKey::TotalPaid`),
+and `ContractStats` (`total_paid`, `total_volume_*`). Soroban executes one
+invocation at a time, so "concurrent" settlement — independent payers settling
+their invoices in the same ledger — is really a *same-ledger batch* of
+`mark_paid` calls.
+
+**Before:** the [`invoice_liquidity` baseline table](#baseline-execution-results)
+measured `mark_paid` only in isolation, against a freshly-submitted invoice. No
+benchmark settled a batch, so a per-settlement cost that grew with the size of
+the surrounding batch (e.g. re-serializing a shared structure that accumulates,
+or an unbounded counter read) was invisible to CI.
+
+**After:** `contracts/invoice_liquidity/src/tests_benchmarks.rs` adds two
+benchmarks under Issue #1063, each asserting against the same absolute ceilings
+as the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | What it measures |
+| ---------------------------- | ---------------- |
+| `settle_batch_same_ledger` | the *per-invocation* cost of the last settlement in a 25-invoice same-ledger burst |
+| `mark_paid_in_batch_len_{1,10,25}` | the same per-invocation cost at batch sizes 1 / 10 / 25 (emitted by `benchmark_settle_cost_across_batch_sizes`), printed as a table |
+
+The per-invocation cost is the figure mainnet's resource limit actually applies
+to: each `mark_paid` is its own transaction regardless of how many other
+settlements land in the same ledger. The `mark_paid_in_batch_len_*` table makes
+any batch-size dependence directly visible — a flat row set confirms settlement
+cost stays O(1) in the surrounding burst, which is what the shared-counter and
+per-invoice-index design depends on. The behavioural counterpart (per-invoice
+isolation, rejection isolation, authorization, and the `paid_on_time`
+boundary) lives in `tests_storage.rs`.
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record these as a tracked baseline, run
+the command above and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Price-read event fan-out (Issue #1064)
+
+`get_verified_price` queries *every* registered source for a feed
+(`DataKey::PriceSources`) and publishes one `PriceOutlierRejected` event **per
+source** that deviates from the cross-source median beyond the configured
+threshold. `add_price_source` appended to that list with no upper bound, so both
+the number of events a single price read could emit and the CPU/storage cost of
+iterating the list were unbounded.
+
+**Before:** no benchmark in this file measured the `get_verified_price` path at
+all. The cost of a price read — and its per-deviating-source event fan-out — grew
+without bound with the registry, so a feed grown large enough (by governance or a
+compromised admin key) would only reveal itself by exceeding mainnet's
+per-invocation resource limit, failing the price path for every token on that
+feed.
+
+**After:** `add_price_source` caps each feed at `MAX_PRICE_SOURCES_PER_FEED`
+(20 — see [`oracle-design.md`](oracle-design.md)), which bounds the worst-case
+cost of a price read to a fixed maximum.
+`contracts/invoice_liquidity/src/tests_benchmarks.rs` adds two benchmarks under
+Issue #1064, each asserting against the same absolute ceilings as the rest of the
+file:
+
+| Benchmark (`BENCHMARK` name) | What it measures |
+| ---------------------------- | ---------------- |
+| `get_verified_price_sources_{1,10,20}` | the per-invocation cost of a price read at 1 / half-cap / full-cap source counts (emitted by `benchmark_price_read_across_source_counts`), printed as a table |
+| `get_verified_price_outlier_fan_out_at_max_sources` | the worst case for event payloads: a full 20-source feed with a deviating minority (one `PriceOutlierRejected` per deviating source), read succeeding on the agreeing majority |
+
+The `get_verified_price_sources_*` table makes any source-count dependence
+directly visible; `get_verified_price_outlier_fan_out_at_max_sources` pins the
+event-payload worst case at the cap. The behavioural counterpart (the cap itself,
+per-feed isolation, idempotent re-registration, slot recovery on removal,
+authorization, and the assertion that a single read emits at most one outlier
+event per registered source) lives in `tests_storage.rs`.
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record these as a tracked baseline, run
+the command above and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Safe resource envelope read cost (Issue #1065)
+
+The contract stays inside Soroban's per-invocation CPU/memory budget only if every
+on-chain collection it iterates or rewrites is bounded. Those bounds are now
+declared in one place — `storage::RESOURCE_ENVELOPE` in
+`contracts/invoice_liquidity/src/storage.rs` (see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)).
+Issue #1065 ties that declaration to a measured figure.
+
+**Before:** the caps were enforced across five modules with no single artifact
+declaring the envelope, and no benchmark in this file measured the *read*-side cost
+of a **full** (cap-sized) collection — only writes into a full collection (the
+#1062 section above) had a figure.
+
+**After:** `contracts/invoice_liquidity/src/tests_benchmarks.rs` adds one
+benchmark, `benchmark_envelope_read_views_at_cap`, that reads the largest bounded
+collections at their declared caps, each measurement asserted against the same
+absolute ceilings as the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | Collection read at its cap |
+| ---------------------------- | -------------------------- |
+| `envelope_read_price_sources_at_cap` | `PriceSources(Price)` at `MAX_PRICE_SOURCES_PER_FEED` (20) |
+| `envelope_read_fund_queue_at_cap` | `FundQueue` at `MAX_FUND_QUEUE_LEN` (50) |
+| `envelope_read_admin_action_log_at_cap` | `AdminActionLog` ring buffer at `ADMIN_ACTION_LOG_CAPACITY` (50) |
+| `envelope_read_top_payers_at_cap` | `TopPayersHeap` at `TOP_PAYERS_CAPACITY` (50) |
+
+The test prints these as a table and asserts each is within budget, which is what
+"safe" means here: reading the fullest collection the contract can hold stays far
+inside the per-invocation limit. The declaration itself is kept honest by the
+Issue #1065 tests in `tests_storage.rs` (drift, well-formedness, a live
+ledger-boundary cap, and an authorization case).
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record these as a tracked baseline, run the
+command below and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
 ## Updating Baselines
 
 After an intentional optimisation or contract change:

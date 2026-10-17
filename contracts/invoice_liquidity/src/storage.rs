@@ -171,6 +171,85 @@ pub enum DataKey {
 }
 
 // ----------------------------------------------------------------
+// Safe resource envelope (Issue #1065)
+// ----------------------------------------------------------------
+//
+// Soroban enforces a per-invocation CPU-instruction and memory budget, and a
+// per-entry size limit on every ledger entry. The contract can only stay
+// inside that budget on *every* path if every on-chain collection it iterates
+// or rewrites is bounded, and if the bound is documented in one place. This
+// module is that place: [`RESOURCE_ENVELOPE`] is the single, self-contained
+// declaration of every bounded on-chain collection — the storage key that
+// holds it, the constant that caps it, and (implicitly) the worst-case
+// per-invocation cost of touching it.
+//
+// **Before:** the bounds existed but were scattered across the modules that
+// enforced them (`MAX_FUND_QUEUE_LEN` and `MAX_PRICE_SOURCES_PER_FEED` in
+// `constants.rs`, `ADMIN_ACTION_LOG_CAPACITY` in `access.rs`,
+// `TOP_PAYERS_CAPACITY` in `constants.rs`, `MAX_TWAP_SAMPLES` in `twap.rs`),
+// with no single artifact stating "these are *all* of the unbounded-by-design
+// collections, and these are their caps". A reader (or auditor) had to
+// reconstruct the envelope by grepping; a newly-added unbounded collection
+// was easy to miss.
+//
+// **After:** the envelope is declared here in one place. A focused test
+// (`tests_storage.rs`, Issue #1065) asserts every declared cap equals the
+// constant that actually enforces it, so the declaration cannot silently
+// drift from the code. A benchmark (`tests_benchmarks.rs`) records the
+// read-side cost of the largest bounded collections, tying the declaration to
+// a measured, budget-checked figure. The authoritative value is *always* the
+// enforcing constant — this table is documentation that a test keeps honest,
+// never a second source of truth to be edited on its own.
+//
+// Adding a new unbounded-by-design collection without an entry here is the
+// exact regression this split exists to surface.
+
+/// The safe resource envelope: every bounded on-chain collection (or bounded
+/// per-invocation loop), as `(name, cap)` pairs.
+///
+/// `name` is a stable identifier used by the drift test in `tests_storage.rs`
+/// and by `docs/storage-layout.md`; `cap` is the authoritative constant that
+/// actually bounds the collection (never a hand-written literal).
+pub const RESOURCE_ENVELOPE: &[(&str, u32)] = &[
+    // Fund queue entries per invoice — `DataKey::FundQueue(u64)`, bounded by
+    // `constants::MAX_FUND_QUEUE_LEN` (Issue #1091/#1095).
+    ("fund_queue_entries", crate::constants::MAX_FUND_QUEUE_LEN),
+    // Price sources per feed — `DataKey::PriceSources(OracleFeedType)`,
+    // bounded by `constants::MAX_PRICE_SOURCES_PER_FEED` (Issue #1064).
+    (
+        "price_sources_per_feed",
+        crate::constants::MAX_PRICE_SOURCES_PER_FEED,
+    ),
+    // Admin action audit log slots — `DataKey::AdminActionLog(u32)`, a ring
+    // buffer bounded by `access::ADMIN_ACTION_LOG_CAPACITY` (Issue #645).
+    (
+        "admin_action_log_entries",
+        crate::access::ADMIN_ACTION_LOG_CAPACITY,
+    ),
+    // Top-payers min-heap — `DataKey::TopPayersHeap`, bounded by
+    // `constants::TOP_PAYERS_CAPACITY` (Issue #77).
+    ("top_payers_entries", crate::constants::TOP_PAYERS_CAPACITY),
+    // TWAP samples per feed + token — `DataKey::TwapSamples(feed, token)`,
+    // bounded by `twap::MAX_TWAP_SAMPLES` (Issue #815/#816).
+    (
+        "twap_samples_per_feed_token",
+        crate::twap::MAX_TWAP_SAMPLES,
+    ),
+    // Pre-upgrade TTL-check sample — the most-recent invoice ids sampled per
+    // upgrade, bounded by `constants::TTL_UPGRADE_SAMPLE_SIZE` (Issue #1082).
+    (
+        "ttl_upgrade_sample",
+        crate::constants::TTL_UPGRADE_SAMPLE_SIZE as u32,
+    ),
+    // Rollback-rehearsal sample — mirror of the above for rollbacks, bounded
+    // by `constants::ROLLBACK_SAMPLE_SIZE` (Issue #1083).
+    (
+        "rollback_sample",
+        crate::constants::ROLLBACK_SAMPLE_SIZE as u32,
+    ),
+];
+
+// ----------------------------------------------------------------
 // Config Helpers
 // ----------------------------------------------------------------
 

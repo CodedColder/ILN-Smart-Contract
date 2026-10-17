@@ -170,4 +170,9 @@ pub enum ContractError {
     /// the MEV-mitigation maturity delay instead of rejecting the call; it is
     /// now a hard failure so corrupted/archived queue state fails closed.
     QueueStateArchived = 75,
+    /// Issue #1064: `add_price_source` rejected because the feed already has
+    /// `MAX_PRICE_SOURCES_PER_FEED` sources registered. Bounding the list
+    /// bounds the number of `PriceOutlierRejected` events a single
+    /// `get_verified_price` invocation can emit.
+    TooManyPriceSources = 76,
 }
