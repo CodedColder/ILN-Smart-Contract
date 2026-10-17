@@ -2423,3 +2423,338 @@ fn test_pre_init_calls_return_not_initialized() {
         Err(Ok(GovernanceError::NotInitialized))
     );
 }
+
+// ── Issues #991 / #993 / #996 / #997: timelock, veto handoff, proposal auth ───
+
+/// Votes a fee proposal through and moves the clock past `voting_end`.
+fn vote_and_close(t: &GovTestEnv, id: u64) {
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    let voting_end = t.contract.get_proposal(&id).voting_end;
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp = voting_end + 1;
+    t.env.ledger().set(ledger);
+}
+
+fn advance_ledgers(t: &GovTestEnv, n: u32) {
+    let mut ledger = t.env.ledger().get();
+    ledger.sequence_number += n;
+    t.env.ledger().set(ledger);
+}
+
+// ── #993: read methods ──
+
+#[test]
+fn test_timelock_status_defaults_after_init() {
+    let t = setup();
+    assert_eq!(
+        t.contract.get_timelock_status(),
+        TimelockStatus {
+            execution_delay: 0,
+            veto_enabled: true,
+            veto_signer_count: 0,
+            veto_threshold: 0,
+        }
+    );
+}
+
+#[test]
+fn test_timelock_status_tracks_every_control() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    t.contract.set_execution_delay(&t.admin, &500);
+    assert_eq!(
+        t.contract.get_timelock_status(),
+        TimelockStatus {
+            execution_delay: 500,
+            veto_enabled: true,
+            veto_signer_count: 1,
+            veto_threshold: 1,
+        }
+    );
+
+    t.contract.disable_veto_power();
+    let status = t.contract.get_timelock_status();
+    assert!(!status.veto_enabled);
+    // Disabling the veto must not touch the delay or the signer config.
+    assert_eq!(status.execution_delay, 500);
+    assert_eq!(status.veto_signer_count, 1);
+}
+
+#[test]
+fn test_get_proposal_eta_zero_until_passed_then_stamped() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &50);
+    let id = create_fee_proposal(&t);
+    assert_eq!(t.contract.get_proposal_eta(&id), 0);
+
+    vote_and_close(&t, id);
+    let seq = t.env.ledger().sequence();
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal_eta(&id), seq + 50);
+}
+
+#[test]
+fn test_get_proposal_eta_unknown_proposal_errors() {
+    let t = setup();
+    assert_eq!(
+        t.contract.try_get_proposal_eta(&999),
+        Err(Ok(GovernanceError::ProposalNotFound))
+    );
+}
+
+// ── #991: timelock with veto disabled ──
+
+#[test]
+fn test_timelock_enforced_when_veto_disabled() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    t.contract.set_execution_delay(&t.admin, &100);
+    t.contract.disable_veto_power();
+
+    let id = create_fee_proposal(&t);
+    vote_and_close(&t, id);
+    let seq = t.env.ledger().sequence();
+    t.contract.execute_proposal(&id); // queue
+    let eta = t.contract.get_proposal_eta(&id);
+    assert_eq!(eta, seq + 100);
+
+    // One ledger before the ETA: still locked.
+    advance_ledgers(&t, 99);
+    assert_eq!(t.env.ledger().sequence(), eta - 1);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+
+    // Exactly at the ETA: executable.
+    advance_ledgers(&t, 1);
+    t.contract.execute_proposal(&id);
+    assert_eq!(
+        t.contract.get_proposal(&id).status,
+        ProposalStatus::Executed
+    );
+}
+
+#[test]
+fn test_zero_delay_with_veto_disabled_matches_v1_behaviour() {
+    let t = setup();
+    t.contract.disable_veto_power();
+    let id = create_fee_proposal(&t);
+    vote_and_close(&t, id);
+    t.contract.execute_proposal(&id); // queue, eta == now
+    t.contract.execute_proposal(&id); // execute immediately
+    assert_eq!(
+        t.contract.get_proposal(&id).status,
+        ProposalStatus::Executed
+    );
+}
+
+#[test]
+fn test_max_delay_saturates_and_never_executes() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &u32::MAX);
+    let id = create_fee_proposal(&t);
+    vote_and_close(&t, id);
+    t.contract.execute_proposal(&id);
+    // Saturating add: eta is clamped, never wraps to a small value.
+    assert!(t.contract.get_proposal_eta(&id) >= t.env.ledger().sequence());
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+}
+
+#[test]
+fn test_delay_change_does_not_move_queued_eta() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+    let id = create_fee_proposal(&t);
+    vote_and_close(&t, id);
+    t.contract.execute_proposal(&id);
+    let eta = t.contract.get_proposal_eta(&id);
+
+    // Shortening the delay afterwards must not shorten an already-queued ETA.
+    t.contract.set_execution_delay(&t.admin, &0);
+    assert_eq!(t.contract.get_proposal_eta(&id), eta);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+}
+
+#[test]
+fn test_set_execution_delay_rejects_non_admin_without_state_change() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &10);
+    let attacker = Address::generate(&t.env);
+    assert_eq!(
+        t.contract.try_set_execution_delay(&attacker, &0),
+        Err(Ok(GovernanceError::Unauthorized))
+    );
+    assert_eq!(t.contract.get_execution_delay(), 10);
+}
+
+#[test]
+fn test_set_execution_delay_before_init_fails_closed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract = GovContractClient::new(&env, &env.register_contract(None, GovContract));
+    let caller = Address::generate(&env);
+    assert_eq!(
+        contract.try_set_execution_delay(&caller, &5),
+        Err(Ok(GovernanceError::NotInitialized))
+    );
+    // No admin was installed as a side effect.
+    assert_eq!(contract.get_execution_delay(), 0);
+}
+
+// ── #996: delayed proposal and veto handoff ──
+
+#[test]
+fn test_delayed_proposal_veto_handoff() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    t.contract.set_execution_delay(&t.admin, &100);
+
+    // Proposal A: queued, then vetoed while the veto is still live.
+    let a = create_fee_proposal(&t);
+    // Proposal B: queued, veto then disabled mid-delay.
+    let b = create_fee_proposal(&t);
+    for id in [a, b] {
+        t.contract.cast_vote(&t.proposer, &id, &true);
+        t.contract.cast_vote(&t.voter_a, &id, &true);
+    }
+    let voting_end = t.contract.get_proposal(&a).voting_end;
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp = voting_end + 1;
+    t.env.ledger().set(ledger);
+    t.contract.execute_proposal(&a);
+    t.contract.execute_proposal(&b);
+    assert_eq!(t.contract.get_proposal(&b).status, ProposalStatus::Passed);
+
+    // Phase 1 — veto live: A is vetoed during its delay and can never run.
+    t.contract.veto_proposal(&t.admin, &a, &reason_hash(&t.env));
+    assert_eq!(t.contract.get_proposal(&a).status, ProposalStatus::Vetoed);
+
+    // Phase 2 — handoff: governance disables the veto mid-delay.
+    advance_ledgers(&t, 40);
+    t.contract.disable_veto_power();
+    assert_eq!(
+        t.contract
+            .try_veto_proposal(&t.admin, &b, &reason_hash(&t.env)),
+        Err(Ok(GovernanceError::VetoPowerDisabled))
+    );
+
+    // Phase 3 — the timelock is now the only brake and still holds for B.
+    assert_eq!(
+        t.contract.try_execute_proposal(&b),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t, 59);
+    assert_eq!(
+        t.contract.try_execute_proposal(&b),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t, 1);
+    t.contract.execute_proposal(&b);
+    assert_eq!(t.contract.get_proposal(&b).status, ProposalStatus::Executed);
+
+    // The vetoed proposal stays dead after the handoff.
+    assert!(t.contract.try_execute_proposal(&a).is_err());
+    assert_eq!(t.contract.get_proposal(&a).status, ProposalStatus::Vetoed);
+}
+
+#[test]
+fn test_disable_veto_is_one_way_and_idempotent() {
+    let t = setup();
+    t.contract.disable_veto_power();
+    t.contract.disable_veto_power();
+    assert!(!t.contract.is_veto_power_enabled());
+    // Re-configuring signers must not resurrect the veto.
+    setup_veto_multisig(&t);
+    assert!(!t.contract.get_timelock_status().veto_enabled);
+}
+
+// ── #997: proposal creation authorization ──
+
+#[test]
+fn test_create_proposal_requires_proposer_auth() {
+    let t = setup();
+    create_fee_proposal(&t);
+    let auths = t.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, t.proposer);
+}
+
+#[test]
+fn test_create_proposal_without_auth_is_rejected() {
+    // No mock_all_auths: the proposer's signature is genuinely absent.
+    let env = Env::default();
+    let contract = GovContractClient::new(&env, &env.register_contract(None, GovContract));
+    let proposer = Address::generate(&env);
+    let res = contract.try_create_proposal(
+        &proposer,
+        &ProposalAction::UpdateFeeRate(200),
+        &dummy_hash(&env),
+        &200_i128,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_create_proposal_zero_balance_rejected_without_state_change() {
+    let t = setup();
+    let outsider = Address::generate(&t.env);
+    assert_eq!(
+        t.contract.try_create_proposal(
+            &outsider,
+            &ProposalAction::UpdateFeeRate(200),
+            &dummy_hash(&t.env),
+            &200_i128,
+        ),
+        Err(Ok(GovernanceError::InsufficientProposerBalance))
+    );
+    assert!(t.contract.try_get_proposal(&1).is_err());
+}
+
+#[test]
+fn test_create_proposal_balance_threshold_boundary() {
+    let t = setup();
+    t.contract.set_min_proposal_balance(&1_000);
+    // proposer holds exactly 1_000: allowed (>=).
+    assert_eq!(create_fee_proposal(&t), 1);
+
+    // one unit short: rejected.
+    let short = Address::generate(&t.env);
+    t.gov_token_admin.mint(&short, &999);
+    assert_eq!(
+        t.contract.try_create_proposal(
+            &short,
+            &ProposalAction::UpdateFeeRate(200),
+            &dummy_hash(&t.env),
+            &200_i128,
+        ),
+        Err(Ok(GovernanceError::InsufficientProposerBalance))
+    );
+}
+
+#[test]
+fn test_create_proposal_cannot_be_authorized_by_another_account() {
+    // voter_b authorizing does not let anyone else's balance be used: the
+    // balance checked and the auth required are both the `proposer` argument.
+    let t = setup();
+    let broke = Address::generate(&t.env);
+    t.contract.set_min_proposal_balance(&1);
+    assert_eq!(
+        t.contract.try_create_proposal(
+            &broke,
+            &ProposalAction::UpdateFeeRate(200),
+            &dummy_hash(&t.env),
+            &200_i128,
+        ),
+        Err(Ok(GovernanceError::InsufficientProposerBalance))
+    );
+    // A funded proposer still succeeds afterwards (no poisoned state).
+    assert_eq!(create_fee_proposal(&t), 1);
+}

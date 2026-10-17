@@ -77,5 +77,8 @@ A timelock **must be introduced before the admin veto power is disabled**
 - **Action required:** A timelock must be implemented and activated via a
   governance upgrade before `disable_veto_power()` is called. Failure to do
   so leaves the protocol without any execution delay after full decentralisation.
-- The `TimelockNotExpired` error is reserved but unimplemented; contributors
-  must not assume it is enforced.
+- **Update (Issues #991/#993/#996/#997):** `TimelockNotExpired` is enforced via
+  `set_execution_delay`; the veto-disabled handoff is tested end to end and
+  `get_timelock_status` / `get_proposal_eta` expose the state. See
+  `docs/governance.md`. The delay still defaults to `0`, so the pre-mainnet
+  checklist item is to set it before `disable_veto_power()`.

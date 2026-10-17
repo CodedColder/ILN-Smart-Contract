@@ -208,6 +208,22 @@ pub struct GovernanceProposal {
     pub eta_ledger: u32,
 }
 
+/// Issues #991/#993: single-call snapshot of the timelock / veto controls, so
+/// operators and indexers can confirm the post-handoff posture (veto off,
+/// timelock on) without stitching together several reads.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimelockStatus {
+    /// Ledgers a passed proposal must wait before it can execute.
+    pub execution_delay: u32,
+    /// `true` while the multisig veto can still block proposals.
+    pub veto_enabled: bool,
+    /// Configured veto signer count (0 if unconfigured).
+    pub veto_signer_count: u32,
+    /// Configured veto approval threshold (0 if unconfigured).
+    pub veto_threshold: u32,
+}
+
 // ================================================================
 // Events
 // ================================================================
@@ -856,7 +872,8 @@ impl GovContract {
         env.storage()
             .persistent()
             .remove(&StorageKey::ProposalDeposit(proposal_id));
-        let token_addr = Self::get_gov_token(env)?;
+        let token_addr = Self::get_gov_token(env)
+            .unwrap_or_else(|e| soroban_sdk::panic_with_error!(env, e));
         let token = TokenClient::new(env, &token_addr);
         let this = env.current_contract_address();
         token.transfer(&this, proposer, &amount);
@@ -901,7 +918,8 @@ impl GovContract {
             .remove(&StorageKey::ProposalDeposit(proposal_id));
         let sink: Option<Address> = env.storage().instance().get(&StorageKey::ProposalDepositSink);
         if let Some(dest) = sink.clone() {
-            let token_addr = Self::get_gov_token(env)?;
+            let token_addr = Self::get_gov_token(env)
+            .unwrap_or_else(|e| soroban_sdk::panic_with_error!(env, e));
             let token = TokenClient::new(env, &token_addr);
             let this = env.current_contract_address();
             token.transfer(&this, &dest, &amount);
@@ -1248,16 +1266,16 @@ impl GovContract {
     ) -> Result<(), GovernanceError> {
         admin.require_auth();
 
-        if let Some(stored_admin) = env
+        // Issue #997: fail closed. The admin is only ever seeded by
+        // `initialize`; an uninitialized contract must not let the first
+        // caller install themselves as admin via this entry point.
+        let stored_admin: Address = env
             .storage()
             .instance()
-            .get::<StorageKey, Address>(&StorageKey::Admin)
-        {
-            if admin != stored_admin {
-                return Err(GovernanceError::Unauthorized);
-            }
-        } else {
-            env.storage().instance().set(&StorageKey::Admin, &admin);
+            .get(&StorageKey::Admin)
+            .ok_or(GovernanceError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(GovernanceError::Unauthorized);
         }
 
         let old_value: u32 = env
@@ -1286,6 +1304,23 @@ impl GovContract {
             .instance()
             .get(&StorageKey::ExecutionDelay)
             .unwrap_or(0)
+    }
+
+    /// Issue #993: combined read of the timelock and veto controls.
+    pub fn get_timelock_status(env: Env) -> TimelockStatus {
+        TimelockStatus {
+            execution_delay: Self::get_execution_delay(env.clone()),
+            veto_enabled: Self::is_veto_power_enabled(env.clone()),
+            veto_signer_count: Self::get_veto_signers(env.clone()).len(),
+            veto_threshold: Self::get_veto_threshold(env),
+        }
+    }
+
+    /// Issue #993: earliest ledger at which `proposal_id` may execute.
+    /// `0` until the proposal has passed (the ETA is only stamped on the
+    /// Active -> Passed transition).
+    pub fn get_proposal_eta(env: Env, proposal_id: u64) -> Result<u32, GovernanceError> {
+        Ok(Self::get_proposal(env, proposal_id)?.eta_ledger)
     }
 
     // ── execute_proposal ─────────────────────────────────────────

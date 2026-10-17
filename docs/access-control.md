@@ -208,6 +208,8 @@ This isolation ensures that the insurance pool cannot be drained except through 
 | `get_gov_token_total_supply` | Anyone | Reads current governance token total supply |
 | `set_execution_delay` | Admin | Sets timelock delay before proposal execution (in ledgers) |
 | `get_execution_delay` | Anyone | Reads current execution delay setting |
+| `get_timelock_status` | Anyone | Reads delay, veto-enabled flag, signer count and threshold in one call |
+| `get_proposal_eta` | Anyone | Reads the earliest executable ledger of a proposal (`0` until it has passed) |
 | `set_quadratic_voting_enabled` | Admin | Toggles quadratic voting mode on/off |
 | `is_quadratic_voting_enabled` | Anyone | Checks if quadratic voting is currently enabled |
 
