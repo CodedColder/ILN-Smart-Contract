@@ -116,6 +116,16 @@ pub enum GovernanceError {
     VetoPowerAlreadyDisabled = 37,
     /// Issue #990: Consent reason hash is required and cannot be empty.
     ConsentRequired = 38,
+    /// Issue #992: the proposal (or stored delay) predates the timelock and
+    /// carries no usable eta; call `rebase_legacy_proposal_eta` /
+    /// `migrate_legacy_execution_delay` before it can be executed.
+    LegacyDelayMigrationRequired = 39,
+    /// Issue #998: the proposer recorded on the proposal does not match the
+    /// proposer bound at creation time; the lifecycle transition is refused.
+    ProposerIdentityMismatch = 40,
+    /// Issue #1001: the proposal has no recorded snapshot ledger, so no
+    /// checkpoint can be bound to it (fail-closed, no fallback to "now").
+    SnapshotLedgerMissing = 41,
 }
 
 // ================================================================
@@ -233,6 +243,24 @@ pub struct GovernanceProposal {
     pub votes_against: i128,
     pub created_at: u64,
     pub voting_end: u64,
+    pub eta_ledger: u32,
+}
+
+/// Issue #992: audit record of the one-time legacy zero-delay migration.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacyDelayMigration {
+    pub migrated_by: Address,
+    pub migrated_at_ledger: u32,
+    pub old_delay: u32,
+    pub new_delay: u32,
+}
+
+/// Issue #992: emitted when a legacy proposal's eta is rebased.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct LegacyEtaRebased {
+    pub proposal_id: u64,
     pub eta_ledger: u32,
 }
 
@@ -572,6 +600,16 @@ pub enum StorageKey {
     VetoState(u64),
     /// Issue #990: Record of veto power disable authorization and reason.
     VetoDisableRecord,
+    /// Issue #992: audit record of `migrate_legacy_execution_delay`.
+    LegacyDelayMigration,
+    /// Issue #998: proposer bound at `create_proposal`, immutable thereafter.
+    /// Stored beside `Proposal` so the `GovernanceProposal` schema is unchanged.
+    ProposalProposer(u64),
+    /// Issue #1001: the checkpoint a voter's latest `checkpoint_balance`
+    /// replaced. Together with `BalanceCheckpoint` this bounds history to two
+    /// slots per voter while letting a refresh after a proposal's snapshot
+    /// ledger leave the older, eligible checkpoint usable for that proposal.
+    PriorBalanceCheckpoint(Address),
 }
 
 // ================================================================
@@ -929,6 +967,10 @@ pub fn create_proposal(
         env.storage()
             .persistent()
             .set(&StorageKey::Proposal(id), &proposal);
+        // Issue #998: bind the proposer identity immutably at creation.
+        env.storage()
+            .persistent()
+            .set(&StorageKey::ProposalProposer(id), &proposer);
         env.storage()
             .instance()
             .set(&StorageKey::ProposalCount, &id);
@@ -1092,8 +1134,24 @@ pub fn checkpoint_balance(env: Env, voter: Address) -> Result<(), GovernanceErro
         let token_addr = Self::get_gov_token(&env)?;
         let token = TokenClient::new(&env, &token_addr);
         let balance = token.balance(&voter);
+        // Issue #1001: a refresh must not destroy the proof backing proposals
+        // whose snapshot ledger predates it. Demote the replaced checkpoint
+        // into the single prior slot (state stays bounded at two entries per
+        // voter). A same-ledger refresh just overwrites the latest slot.
+        let latest_key = StorageKey::BalanceCheckpoint(voter.clone());
+        if let Some(old) = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, BalanceCheckpoint>(&latest_key)
+        {
+            if old.ledger < env.ledger().sequence() {
+                env.storage()
+                    .persistent()
+                    .set(&StorageKey::PriorBalanceCheckpoint(voter.clone()), &old);
+            }
+        }
         env.storage().persistent().set(
-            &StorageKey::BalanceCheckpoint(voter),
+            &latest_key,
             &BalanceCheckpoint {
                 balance,
                 ledger: env.ledger().sequence(),
@@ -1109,6 +1167,40 @@ pub fn get_voter_checkpoint(env: Env, voter: Address) -> Option<BalanceCheckpoin
         env.storage()
             .persistent()
             .get(&StorageKey::BalanceCheckpoint(voter))
+    }
+
+/// Issue #1001: the checkpoint replaced by the voter's latest refresh, if any.
+///
+/// Access: Anyone
+pub fn get_voter_prior_checkpoint(env: Env, voter: Address) -> Option<BalanceCheckpoint> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::PriorBalanceCheckpoint(voter))
+    }
+
+/// Issue #1001: the checkpoint that would back `voter`'s vote on
+/// `proposal_id` (bound to the proposal's snapshot ledger), if any.
+///
+/// Access: Anyone
+pub fn get_eligible_checkpoint(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+    ) -> Option<BalanceCheckpoint> {
+        let snapshot: u32 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::ProposalCreatedLedger(proposal_id))?;
+        Self::eligible_checkpoint(&env, &voter, snapshot)
+    }
+
+/// Issue #998: the proposer bound to `proposal_id` at creation.
+///
+/// Access: Anyone
+pub fn get_proposal_proposer(env: Env, proposal_id: u64) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ProposalProposer(proposal_id))
     }
 
 /// Returns the ledger sequence at which `proposal_id` was created
@@ -1582,14 +1674,14 @@ pub fn cast_vote(
             Some(w) => w,
             None => {
                 let current = token.balance(&voter);
-                // Proposals created before `ProposalCreatedLedger` tracking
-                // existed fall back to the current ledger (strictest
-                // reading: only already-aged checkpoints qualify).
+                // Issue #1001: the checkpoint is bound to the proposal's
+                // snapshot ledger. A proposal with no recorded snapshot
+                // ledger fails closed instead of silently using "now".
                 let created_ledger: u32 = env
                     .storage()
                     .persistent()
                     .get(&StorageKey::ProposalCreatedLedger(proposal_id))
-                    .unwrap_or(env.ledger().sequence());
+                    .ok_or(GovernanceError::SnapshotLedgerMissing)?;
                 let proven = Self::proven_own_balance(&env, &voter, current, created_ledger)?;
                 env.storage().persistent().set(&snapshot_key, &proven);
                 proven
@@ -1762,6 +1854,98 @@ pub fn get_execution_delay(env: Env) -> u32 {
         delay >= MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS && delay <= MAX_EXECUTION_DELAY_LEDGERS
     }
 
+    /// Issue #992: delay applied to newly passed proposals (stored value,
+    /// raised to the production floor once veto power is retired).
+    /// Access: Anyone
+    pub fn get_effective_execution_delay(env: Env) -> u32 {
+        Self::effective_execution_delay(&env)
+    }
+
+    /// Issue #992: persist the production minimum delay over a legacy
+    /// (unset or sub-minimum) stored delay. Admin only, idempotent: when the
+    /// stored delay already meets the floor nothing is written.
+    /// Access: Admin (require_auth)
+    pub fn migrate_legacy_execution_delay(env: Env, admin: Address) -> Result<u32, GovernanceError> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(GovernanceError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(GovernanceError::Unauthorized);
+        }
+        let old_delay: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ExecutionDelay)
+            .unwrap_or(0_u32);
+        if old_delay >= MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS {
+            return Ok(old_delay);
+        }
+        let new_delay = MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS;
+        env.storage()
+            .instance()
+            .set(&StorageKey::ExecutionDelay, &new_delay);
+        env.storage().instance().set(
+            &StorageKey::LegacyDelayMigration,
+            &LegacyDelayMigration {
+                migrated_by: admin.clone(),
+                migrated_at_ledger: env.ledger().sequence(),
+                old_delay,
+                new_delay,
+            },
+        );
+        let pn = Symbol::new(&env, "execution_delay");
+        env.events().publish(
+            (Symbol::new(&env, "parameter_updated"), pn.clone()),
+            GovernanceParameterUpdated {
+                param_name: pn,
+                old_value: old_delay as i128,
+                new_value: new_delay as i128,
+            },
+        );
+        Ok(new_delay)
+    }
+
+    /// Issue #992: the recorded legacy-delay migration, if one happened.
+    /// Access: Anyone
+    pub fn get_legacy_delay_migration(env: Env) -> Option<LegacyDelayMigration> {
+        env.storage().instance().get(&StorageKey::LegacyDelayMigration)
+    }
+
+    /// Issue #992: give a legacy `Passed` proposal (eta 0) a real eta of
+    /// `now + effective delay`. Permissionless because it can only postpone
+    /// execution; it refuses anything that is not a legacy Passed proposal.
+    /// Access: Anyone
+    pub fn rebase_legacy_proposal_eta(env: Env, proposal_id: u64) -> Result<u32, GovernanceError> {
+        let mut proposal: GovernanceProposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .ok_or(GovernanceError::ProposalNotFound)?;
+        if proposal.status != ProposalStatus::Passed {
+            return Err(GovernanceError::ProposalNotActive);
+        }
+        if proposal.eta_ledger != 0 {
+            return Err(GovernanceError::AlreadyResolved);
+        }
+        let delay = Self::effective_execution_delay(&env);
+        let eta = Self::compute_eta(env.ledger().sequence(), delay);
+        proposal.eta_ledger = eta;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "legacy_eta_rebased"), proposal_id),
+            LegacyEtaRebased {
+                proposal_id,
+                eta_ledger: eta,
+            },
+        );
+        Ok(eta)
+    }
+
     /// Issue #987: Verify eta comparisons across ledger rollover using
     /// RFC 1982 serial number arithmetic.
     /// Returns `true` if `current_ledger` has reached or passed `eta_ledger`.
@@ -1790,6 +1974,9 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
             .persistent()
             .get(&StorageKey::Proposal(proposal_id))
             .ok_or(GovernanceError::ProposalNotFound)?;
+        // Issue #998: refuse any transition on a proposal whose proposer
+        // no longer matches the identity bound at creation.
+        Self::verified_proposer(&env, &proposal)?;
 
         let now = env.ledger().timestamp();
         if now < proposal.voting_end {
@@ -1844,13 +2031,13 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
 
             proposal.status = ProposalStatus::Passed;
 
-            let delay = env
-                .storage()
-                .instance()
-                .get(&StorageKey::ExecutionDelay)
-                .unwrap_or(0_u32);
+            // Issue #992: legacy zero-delay state is clamped to the
+            // production floor once veto power is retired.
+            let delay = Self::effective_execution_delay(&env);
             // Issue #987: Calculate eta using wrapping_add to cleanly support ledger rollover.
-            proposal.eta_ledger = env.ledger().sequence().wrapping_add(delay);
+            // Issue #992: 0 is the "legacy, no eta" sentinel; a wrap landing
+            // exactly on 0 moves one ledger later (never earlier).
+            proposal.eta_ledger = Self::compute_eta(env.ledger().sequence(), delay);
 
             env.storage()
                 .persistent()
@@ -1862,6 +2049,12 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
         }
 
         if proposal.status == ProposalStatus::Passed {
+            // Issue #992: a Passed proposal with no eta predates the timelock.
+            // It may only skip the wait while the delay regime is still the
+            // legacy zero-delay one; otherwise it must be rebased first.
+            if proposal.eta_ledger == 0 && Self::effective_execution_delay(&env) > 0 {
+                return Err(GovernanceError::LegacyDelayMigrationRequired);
+            }
             let current_ledger = env.ledger().sequence();
             // Issue #987: Verify eta comparison across ledger rollover.
             if !Self::check_eta_reached(current_ledger, proposal.eta_ledger) {
@@ -2214,6 +2407,9 @@ pub fn veto_proposal(
             .persistent()
             .get(&StorageKey::Proposal(proposal_id))
             .ok_or(GovernanceError::ProposalNotFound)?;
+
+        // Issue #998: proposer identity must match the creation-time binding.
+        Self::verified_proposer(&env, &proposal)?;
 
         // ── Guard: only Active or Passed proposals are vetoable ───
         match proposal.status {
@@ -2759,15 +2955,75 @@ pub fn has_voted(env: Env, voter: Address, proposal_id: u64) -> bool {
         current: i128,
         ref_ledger: u32,
     ) -> Result<i128, GovernanceError> {
-        let cp: Option<BalanceCheckpoint> = env
+        match Self::eligible_checkpoint(env, voter, ref_ledger) {
+            Some(c) => Ok(c.balance.min(current)),
+            None => Err(GovernanceError::InsufficientHoldingPeriod),
+        }
+    }
+
+    /// Issue #1001: newest of the latest/prior checkpoint slots recorded at
+    /// least `MIN_VOTE_HOLD_LEDGERS` before `ref_ledger`.
+    fn eligible_checkpoint(env: &Env, voter: &Address, ref_ledger: u32) -> Option<BalanceCheckpoint> {
+        let latest: Option<BalanceCheckpoint> = env
             .storage()
             .persistent()
             .get(&StorageKey::BalanceCheckpoint(voter.clone()));
-        match cp {
-            Some(c) if c.ledger.saturating_add(MIN_VOTE_HOLD_LEDGERS) <= ref_ledger => {
-                Ok(c.balance.min(current))
+        let prior: Option<BalanceCheckpoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::PriorBalanceCheckpoint(voter.clone()));
+        [latest, prior]
+            .into_iter()
+            .flatten()
+            .filter(|c| c.ledger.saturating_add(MIN_VOTE_HOLD_LEDGERS) <= ref_ledger)
+            .max_by_key(|c| c.ledger)
+    }
+
+    /// Issue #998: returns the proposer bound at creation, refusing the
+    /// transition if the stored proposal disagrees. Proposals created before
+    /// the binding existed are backfilled once from the persisted proposal.
+    fn verified_proposer(
+        env: &Env,
+        proposal: &GovernanceProposal,
+    ) -> Result<Address, GovernanceError> {
+        let key = StorageKey::ProposalProposer(proposal.id);
+        match env.storage().persistent().get::<StorageKey, Address>(&key) {
+            Some(bound) if bound == proposal.proposer => Ok(bound),
+            Some(_) => Err(GovernanceError::ProposerIdentityMismatch),
+            None => {
+                env.storage().persistent().set(&key, &proposal.proposer);
+                Ok(proposal.proposer.clone())
             }
-            _ => Err(GovernanceError::InsufficientHoldingPeriod),
+        }
+    }
+
+    /// Issues #987/#992: `sequence + delay` with rollover wrap, never 0 (the
+    /// legacy "no eta" sentinel); a wrap onto 0 moves one ledger later.
+    pub fn compute_eta(sequence: u32, delay: u32) -> u32 {
+        match sequence.wrapping_add(delay) {
+            0 => 1,
+            eta => eta,
+        }
+    }
+
+    /// Issue #992: delay actually applied to new `Passed` proposals. Once
+    /// veto power is retired the production floor is enforced even if the
+    /// stored (legacy) value is lower.
+    fn effective_execution_delay(env: &Env) -> u32 {
+        let stored: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ExecutionDelay)
+            .unwrap_or(0_u32);
+        let veto_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&StorageKey::VetoPowerEnabled)
+            .unwrap_or(false);
+        if !veto_enabled && stored < MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS {
+            MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS
+        } else {
+            stored
         }
     }
 
