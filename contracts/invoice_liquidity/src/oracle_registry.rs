@@ -23,7 +23,7 @@
 use soroban_sdk::{contracttype, vec, Address, Env, IntoVal, Symbol};
 
 use crate::access::{check_rate_limit, require_admin};
-use crate::constants::DEFAULT_RATE_LIMIT_LEDGERS;
+use crate::constants::{DEFAULT_RATE_LIMIT_LEDGERS, MAX_PRICE_SOURCES_PER_FEED};
 use crate::errors::ContractError;
 use crate::events::{
     OracleCircuitReset, OracleCircuitTripped, OracleHealthRecorded, OracleRegistered,
@@ -552,6 +552,13 @@ pub const DEFAULT_MAX_PRICE_DEVIATION_BPS: u32 = 500;
 /// simply excluded from the sample at query time (see `query_price`)
 /// rather than rejected at registration.
 ///
+/// Issue #1064: the per-feed source list is capped at
+/// `MAX_PRICE_SOURCES_PER_FEED` — a genuinely new source is rejected with
+/// `TooManyPriceSources` once the feed is full. This bounds the number of
+/// `PriceOutlierRejected` events `get_verified_price` can emit in a single
+/// invocation (one per deviating source), which was previously unbounded
+/// because the list itself was.
+///
 /// Access: Admin only (governance-controlled via the same
 /// admin=governance-contract convention used throughout this registry).
 pub fn add_price_source(
@@ -568,6 +575,12 @@ pub fn add_price_source(
         .get(&key)
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
     if !sources.iter().any(|existing| existing == oracle) {
+        // Issue #1064: bound the per-feed source list. Only a genuinely new
+        // source can push the list past the cap — re-registering an existing
+        // one stays a no-op so idempotency is preserved.
+        if sources.len() >= MAX_PRICE_SOURCES_PER_FEED {
+            return Err(ContractError::TooManyPriceSources);
+        }
         sources.push_back(oracle.clone());
         env.storage().instance().set(&key, &sources);
     }

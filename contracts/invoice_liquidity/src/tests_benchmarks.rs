@@ -61,10 +61,17 @@
 
 use super::*;
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,
     Address, Env,
 };
+use crate::access::ADMIN_ACTION_LOG_CAPACITY;
+use crate::constants::{
+    DEFAULT_RATE_LIMIT_LEDGERS, FUND_QUEUE_TTL_EXTEND_TO, FUND_QUEUE_TTL_THRESHOLD,
+    MAX_FUND_QUEUE_LEN, MAX_PRICE_SOURCES_PER_FEED, TOP_PAYERS_CAPACITY,
+};
+use crate::oracle_registry::OracleFeedType;
 
 const BENCH_INVOICE_AMOUNT: i128 = 1_000_000_000;
 const BENCH_DISCOUNT_RATE: u32 = 300;
@@ -653,4 +660,588 @@ fn test_stats_without_price_oracle_returns_zero_normalized() {
     // No oracle configured — should return 0 for normalized volume.
     let stats = t.contract.get_contract_stats();
     assert_eq!(stats.total_volume_usd_normalized, 0);
+}
+
+// ================================================================
+// Issue #1062: TTL cost at maximum queue size
+// ================================================================
+//
+// Issue #1091/#1095 bounded a single invoice's fund queue to
+// `MAX_FUND_QUEUE_LEN` (50) entries, admitting a new LP only if it strictly
+// outscores the current tail (which it then displaces). That bound is what
+// keeps the queue's serialized entry — and therefore the per-write
+// `extend_ttl` host call that keeps `FundQueue`, `FundQueueOpenedAt`, and
+// `QueueResolution` alive (Issue #1011) — within Soroban's per-transaction
+// resource limits.
+//
+// **Before:** nothing measured that worst case. The benchmarks in this file
+// only covered single-invoice flows (`submit_invoice` / `fund_invoice` /
+// `mark_paid`), and the queue bounds themselves had no cost coverage at all,
+// so a change that enlarged the queue entry (a new field on `LpFundRequest`,
+// a longer address encoding, …) could silently push the maximum-size write
+// past the network limit with nothing in CI to catch it.
+//
+// **After:** this section measures the maximum queue size end to end:
+//   * `join_fund_queue` admission into a *full* queue (the displacing path —
+//     scan, pop, insert, full re-serialize, then the TTL extension over the
+//     largest entry the contract can hold);
+//   * `resolve_fund_queue` over a full queue;
+//   * the isolated `extend_ttl` host call on the queue key at 1 vs 10 vs 50
+//     entries, isolating the entry-size-dependent TTL cost the issue asked
+//     to measure.
+//
+// Each measurement is asserted against the same absolute ceilings the rest of
+// this file uses (`assert_within_resource_budget`), so a maximum-queue-size
+// regression fails `cargo test -p invoice_liquidity` directly.
+
+/// Fill a freshly-submitted invoice's fund queue to exactly `len` entries with
+/// default-score LPs (score 50 each). Every entry shares the same score, so
+/// insertion appends and the queue ends up in join order. `len` must be
+/// `<= MAX_FUND_QUEUE_LEN`.
+fn setup_queue_of_len(len: u32) -> (BaseBenchEnv, u64) {
+    let bench = setup_benchmark_env();
+    let invoice_id = submit_invoice_bench(&bench);
+    for _ in 0..len {
+        let lp = Address::generate(&bench.env);
+        bench.contract.join_fund_queue(&lp, &invoice_id);
+    }
+    (bench, invoice_id)
+}
+
+fn advance_ledgers(env: &Env, delta: u32) {
+    let mut ledger = env.ledger().get();
+    ledger.sequence_number += delta;
+    env.ledger().set(ledger);
+}
+
+#[test]
+fn benchmark_join_fund_queue_at_max_queue_size() {
+    let (bench, invoice_id) = setup_queue_of_len(MAX_FUND_QUEUE_LEN);
+
+    // A strictly higher-scored LP forces the worst-case admission path: the
+    // queue is already full, so this displaces the tail and rewrites the whole
+    // 50-entry vector before extending its TTL.
+    let displacing_lp = Address::generate(&bench.env);
+    bench.env.as_contract(&bench.contract.address, || {
+        set_lp_score(&bench.env, &displacing_lp, 100);
+    });
+
+    let (cpu, mem) = measure(&bench.env, "join_fund_queue_at_max_queue_size", || {
+        bench.contract.join_fund_queue(&displacing_lp, &invoice_id);
+    });
+    assert_within_resource_budget(
+        "join_fund_queue_at_max_queue_size",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+#[test]
+fn benchmark_resolve_fund_queue_at_max_queue_size() {
+    let (bench, invoice_id) = setup_queue_of_len(MAX_FUND_QUEUE_LEN);
+    advance_ledgers(&bench.env, QUEUE_DELAY_LEDGERS);
+
+    let (cpu, mem) = measure(&bench.env, "resolve_fund_queue_at_max_queue_size", || {
+        bench.contract.resolve_fund_queue(&invoice_id);
+    });
+    assert_within_resource_budget(
+        "resolve_fund_queue_at_max_queue_size",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+/// Age the ledger far enough that `FundQueue(id)`'s remaining TTL has dropped
+/// below `FUND_QUEUE_TTL_THRESHOLD`, so the `extend_ttl` measured next does
+/// real work. `extend_ttl` short-circuits to a no-op while the entry still has
+/// `>= FUND_QUEUE_TTL_THRESHOLD` ledgers left, which would understate the cost
+/// this measurement exists to capture.
+fn age_fund_queue_ttl_below_threshold(env: &Env) {
+    let drop_below_threshold = FUND_QUEUE_TTL_EXTEND_TO - FUND_QUEUE_TTL_THRESHOLD + 1_000;
+    advance_ledgers(env, drop_below_threshold);
+}
+
+/// Measure the isolated `extend_ttl` host call on the `FundQueue` key of a
+/// queue holding `len` entries. Emits a `BENCHMARK` line (via `measure`) and
+/// returns the `(cpu, mem)` result.
+fn measure_fund_queue_ttl_extend(len: u32, name: &str) -> (u64, u64) {
+    let (bench, invoice_id) = setup_queue_of_len(len);
+    age_fund_queue_ttl_below_threshold(&bench.env);
+
+    measure(&bench.env, name, || {
+        bench.env.as_contract(&bench.contract.address, || {
+            bench.env.storage().persistent().extend_ttl(
+                &StorageKey::FundQueue(invoice_id),
+                FUND_QUEUE_TTL_THRESHOLD,
+                FUND_QUEUE_TTL_EXTEND_TO,
+            );
+        });
+    })
+}
+
+#[test]
+fn benchmark_extend_ttl_fund_queue_at_max_queue_size() {
+    let (cpu, mem) = measure_fund_queue_ttl_extend(
+        MAX_FUND_QUEUE_LEN,
+        "extend_ttl_fund_queue_at_max_queue_size",
+    );
+    assert_within_resource_budget(
+        "extend_ttl_fund_queue_at_max_queue_size",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+#[test]
+fn benchmark_extend_ttl_fund_queue_at_one_entry() {
+    let (cpu, mem) = measure_fund_queue_ttl_extend(1, "extend_ttl_fund_queue_at_one_entry");
+    assert_within_resource_budget(
+        "extend_ttl_fund_queue_at_one_entry",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+/// Record the isolated TTL-extension cost across queue sizes side by side.
+/// This is the before/after the issue asks for: before, no such measurement
+/// existed at all; after, the maximum-size cost is printed next to the
+/// (minimum) 1-entry and midpoint 10-entry costs, so the entry-size-dependent
+/// part of the TTL cost is directly visible in the benchmark output.
+#[test]
+fn benchmark_ttl_cost_across_queue_sizes() {
+    let mut results: std::vec::Vec<(u32, (u64, u64))> = std::vec::Vec::new();
+    for len in [1u32, 10, MAX_FUND_QUEUE_LEN] {
+        let name = std::format!("extend_ttl_fund_queue_len_{len}");
+        let measured = measure_fund_queue_ttl_extend(len, &name);
+        results.push((len, measured));
+    }
+
+    std::println!("\n| Queue length | CPU Instructions | Memory (bytes) |");
+    std::println!("| ------------ | ---------------- | -------------- |");
+    for (len, (cpu, mem)) in &results {
+        std::println!("| {len:>12} | {cpu:>16} | {mem:>14} |");
+        assert_within_resource_budget(
+            "extend_ttl_fund_queue_across_sizes",
+            *cpu,
+            *mem,
+            MAX_CPU_INSTRUCTIONS,
+            MAX_MEMORY_BYTES,
+        );
+    }
+}
+
+// ================================================================
+// Issue #1063: stress concurrent invoice settlements
+// ================================================================
+//
+// The settlement path (`mark_paid`) is the contract's highest-value entry
+// point, and it touches several pieces of *shared* state on every call: the
+// reentrancy lock (`StorageKey::ReentrancyLock`), the aggregate counter
+// (`StorageKey::TotalPaid`), and `ContractStats` (`total_paid`,
+// `total_volume_*`). Soroban executes one invocation at a time, so
+// "concurrent" settlement — two payers settling independent invoices in the
+// same ledger — is really a *same-ledger batch* of `mark_paid` calls.
+//
+// **Before:** this file only ever measured `mark_paid` in isolation
+// (`benchmark_mark_paid`, `benchmark_all_functions_summary`), a single
+// settlement against a freshly-submitted invoice. Nothing measured a
+// settlement that runs *after* a burst of other settlements in the same
+// ledger has already mutated the shared counters, so a per-settlement cost
+// that grew with the size of the surrounding batch (e.g. re-serializing a
+// shared structure that accumulates, or an unbounded counter read) would not
+// have been visible here.
+//
+// **After:** the benchmarks below measure the *per-invocation* cost of a
+// settlement executed inside a same-ledger batch of independent invoices —
+// which is the cost mainnet's per-invocation resource limit actually applies
+// to. `benchmark_settle_batch_same_ledger` measures the last settlement in a
+// `SETTLE_BENCH_BATCH`-invoice burst, and
+// `benchmark_settle_cost_across_batch_sizes` records that same
+// per-invocation cost side by side at batch sizes 1, 10, and
+// `SETTLE_BENCH_BATCH`, so a cost that is *not* flat in the surrounding
+// batch size becomes directly visible. Each measurement is asserted against
+// the same absolute ceilings the rest of this file uses
+// (`assert_within_resource_budget`), so a settlement-cost regression fails
+// `cargo test -p invoice_liquidity` directly. The behavioural counterpart
+// (per-invoice isolation, rejection isolation, authorization, and the
+// `paid_on_time` boundary) lives in `tests_storage.rs`.
+
+/// Number of independent invoices settled together in a same-ledger batch.
+/// Large enough that any per-settlement cost accumulating across the batch
+/// would surface, small enough to stay a fast unit test.
+const SETTLE_BENCH_BATCH: u32 = 25;
+
+/// Submit and fund `len` independent invoices, each owned by a fresh payer
+/// minted exactly enough to settle once. Returns the invoice ids in submission
+/// order. The shared `lp` funds every invoice, matching how a single liquidity
+/// provider backstops many independent payers.
+fn setup_settle_batch(bench: &BaseBenchEnv, len: u32) -> std::vec::Vec<u64> {
+    let token_admin = StellarAssetClient::new(&bench.env, &bench.token);
+    let mut ids = std::vec::Vec::new();
+    for _ in 0..len {
+        let payer = Address::generate(&bench.env);
+        token_admin.mint(&payer, &BENCH_INVOICE_AMOUNT);
+
+        let due_date = bench.env.ledger().timestamp() + BENCH_DUE_DATE_OFFSET;
+        let invoice_id = bench.contract.submit_invoice(
+            &bench.freelancer,
+            &payer,
+            &BENCH_INVOICE_AMOUNT,
+            &due_date,
+            &BENCH_DISCOUNT_RATE,
+            &bench.token,
+            &ReferralCode::None,
+        );
+        bench
+            .contract
+            .fund_invoice(&bench.lp, &invoice_id, &BENCH_INVOICE_AMOUNT, &false);
+        ids.push(invoice_id);
+    }
+    ids
+}
+
+/// Settle every invoice in `ids` except the last one, then measure the cost of
+/// settling that last invoice. Everything runs at one ledger
+/// sequence/timestamp, so the measured settlement executes after the rest of
+/// the batch has mutated the shared counters — the "concurrent" case.
+fn measure_last_settlement_in_batch(bench: &BaseBenchEnv, ids: &[u64], name: &str) -> (u64, u64) {
+    let (last, rest) = ids.split_last().expect("batch must be non-empty");
+    for id in rest {
+        bench.contract.mark_paid(id, &BENCH_INVOICE_AMOUNT);
+    }
+
+    measure(&bench.env, name, || {
+        bench.contract.mark_paid(last, &BENCH_INVOICE_AMOUNT);
+    })
+}
+
+#[test]
+fn benchmark_settle_batch_same_ledger() {
+    let bench = setup_benchmark_env();
+    let ids = setup_settle_batch(&bench, SETTLE_BENCH_BATCH);
+
+    let (cpu, mem) = measure_last_settlement_in_batch(&bench, &ids, "settle_batch_same_ledger");
+    assert_within_resource_budget(
+        "settle_batch_same_ledger",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+/// Record the per-invocation settlement cost across batch sizes side by side.
+/// This is the before/after the issue asks for: before, a settlement was only
+/// ever measured against a freshly-submitted invoice (batch size 1 by
+/// construction); after, the cost of a settlement sitting inside a 10- and a
+/// `SETTLE_BENCH_BATCH`-invoice same-ledger burst is printed next to it, so
+/// any batch-size dependence in the per-invocation cost is directly visible.
+#[test]
+fn benchmark_settle_cost_across_batch_sizes() {
+    let mut results: std::vec::Vec<(u32, (u64, u64))> = std::vec::Vec::new();
+    for len in [1u32, 10, SETTLE_BENCH_BATCH] {
+        let bench = setup_benchmark_env();
+        let ids = setup_settle_batch(&bench, len);
+        let name = std::format!("mark_paid_in_batch_len_{len}");
+        let measured = measure_last_settlement_in_batch(&bench, &ids, &name);
+        results.push((len, measured));
+    }
+
+    std::println!("\n| Batch length | CPU Instructions | Memory (bytes) |");
+    std::println!("| ------------ | ---------------- | -------------- |");
+    for (len, (cpu, mem)) in &results {
+        std::println!("| {len:>12} | {cpu:>16} | {mem:>14} |");
+        assert_within_resource_budget(
+            "mark_paid_across_batch_sizes",
+            *cpu,
+            *mem,
+            MAX_CPU_INSTRUCTIONS,
+            MAX_MEMORY_BYTES,
+        );
+    }
+}
+
+// ================================================================
+// Issue #1064: preventing unbounded event payloads
+// ================================================================
+//
+// `add_price_source` appended to a per-feed source list
+// (`DataKey::PriceSources`) with no upper bound, and `get_verified_price`
+// iterates that whole list on every price read, publishing one
+// `PriceOutlierRejected` event *per* source that deviates past the configured
+// threshold. Both the event fan-out of a single read and the storage/CPU cost
+// of the iteration therefore grew without bound with the registry.
+//
+// **Before:** nothing in this file measured the price-read path of
+// `get_verified_price` at all, so the cost of iterating an arbitrarily large
+// source list — and emitting an outlier event per deviating source — was never
+// recorded. A feed grown large enough (by governance or a compromised admin
+// key) would only reveal itself by failing a price read at mainnet's
+// per-invocation resource limit, breaking the price path for every token on
+// that feed.
+//
+// **After:** `add_price_source` caps each feed at `MAX_PRICE_SOURCES_PER_FEED`
+// (see `constants.rs` / `oracle_registry.rs`), so the worst-case cost of a
+// price read is fixed. The benchmarks below measure `get_verified_price` at the
+// cap: `benchmark_price_read_across_source_counts` records the per-invocation
+// cost side by side at 1, half the cap, and the full cap, so any source-count
+// dependence is directly visible; and
+// `benchmark_price_read_outlier_event_fan_out_at_max_sources` measures the
+// worst case for event payloads — a majority that agrees (so the read
+// succeeds) and a deviating minority that is rejected, emitting one
+// `PriceOutlierRejected` event per deviating source. Each measurement is
+// asserted against the same absolute ceilings the rest of this file uses
+// (`assert_within_resource_budget`). The behavioural counterpart (the cap
+// itself, idempotency, per-feed isolation, slot recovery, authorization, and
+// that a single read's event count is bounded by the cap) lives in
+// `tests_storage.rs`.
+
+/// Price every agreeing benchmark source reports.
+const BENCH_PRICE: i128 = 100;
+
+/// Price the deviating benchmark sources report — far enough from
+/// `BENCH_PRICE` to exceed the default max deviation (500 bps) by orders of
+/// magnitude, so they are unambiguously rejected as outliers.
+const BENCH_PRICE_OUTLIER: i128 = 10_000_000;
+
+/// A minimal price oracle the benchmark registers as a price source: stores a
+/// fixed price and returns it from `get_price(token)`, matching the
+/// `get_price(Address) -> i128` shape `query_price` invokes.
+#[contract]
+struct BenchPriceOracle;
+
+#[contractimpl]
+impl BenchPriceOracle {
+    pub fn set_price(env: Env, price: i128) {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("price"), &price);
+    }
+
+    pub fn get_price(env: Env, _token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("price"))
+            .unwrap_or(0)
+    }
+}
+
+fn deploy_bench_price_oracle(bench: &BaseBenchEnv, price: i128) -> Address {
+    let id = bench.env.register_contract(None, BenchPriceOracle);
+    BenchPriceOracleClient::new(&bench.env, &id).set_price(&price);
+    id
+}
+
+/// Register `count` price sources all reporting `price`, advancing the ledger
+/// past `add_price_source`'s `DEFAULT_RATE_LIMIT_LEDGERS` cooldown between
+/// calls so the fill itself is not `RateLimited`.
+fn register_agreeing_price_sources(bench: &BaseBenchEnv, count: u32, price: i128) {
+    for _ in 0..count {
+        let oracle = deploy_bench_price_oracle(bench, price);
+        bench.contract.add_price_source(&OracleFeedType::Price, &oracle);
+        advance_ledgers(&bench.env, DEFAULT_RATE_LIMIT_LEDGERS as u32);
+    }
+}
+
+/// Fill the `Price` feed to `MAX_PRICE_SOURCES_PER_FEED` sources: a majority
+/// reporting `BENCH_PRICE` (so the read succeeds and sets the median) and a
+/// minority reporting the far-off `BENCH_PRICE_OUTLIER` (so they are rejected).
+fn register_outlier_price_sources(bench: &BaseBenchEnv) {
+    let agreers = (MAX_PRICE_SOURCES_PER_FEED / 2) + 1;
+    for i in 0..MAX_PRICE_SOURCES_PER_FEED {
+        let price = if i < agreers {
+            BENCH_PRICE
+        } else {
+            BENCH_PRICE_OUTLIER
+        };
+        let oracle = deploy_bench_price_oracle(bench, price);
+        bench.contract.add_price_source(&OracleFeedType::Price, &oracle);
+        advance_ledgers(&bench.env, DEFAULT_RATE_LIMIT_LEDGERS as u32);
+    }
+}
+
+/// Record the per-invocation price-read cost across source counts side by
+/// side. Before, this path was unmeasured entirely; after, the cost of a read
+/// at 1, half the cap, and the full `MAX_PRICE_SOURCES_PER_FEED` is printed
+/// next to each other, making any source-count dependence in the cost — the
+/// thing the cap bounds — directly visible.
+#[test]
+fn benchmark_price_read_across_source_counts() {
+    let half_cap = MAX_PRICE_SOURCES_PER_FEED / 2;
+    let mut results: std::vec::Vec<(u32, (u64, u64))> = std::vec::Vec::new();
+    for len in [1u32, half_cap, MAX_PRICE_SOURCES_PER_FEED] {
+        let bench = setup_benchmark_env();
+        register_agreeing_price_sources(&bench, len, BENCH_PRICE);
+        assert_eq!(
+            bench.contract.get_price_sources(&OracleFeedType::Price).len(),
+            len
+        );
+
+        let name = std::format!("get_verified_price_sources_{len}");
+        let measured = measure(&bench.env, &name, || {
+            let _ = bench
+                .contract
+                .get_verified_price(&OracleFeedType::Price, &bench.token);
+        });
+        results.push((len, measured));
+    }
+
+    std::println!("\n| Price sources | CPU Instructions | Memory (bytes) |");
+    std::println!("| ------------- | ---------------- | -------------- |");
+    for (len, (cpu, mem)) in &results {
+        std::println!("| {len:>13} | {cpu:>16} | {mem:>14} |");
+        assert_within_resource_budget(
+            "get_verified_price_across_source_counts",
+            *cpu,
+            *mem,
+            MAX_CPU_INSTRUCTIONS,
+            MAX_MEMORY_BYTES,
+        );
+    }
+}
+
+/// The worst case for event payloads: a full feed of
+/// `MAX_PRICE_SOURCES_PER_FEED` sources with a deviating minority, so a single
+/// `get_verified_price` invocation queries every source and publishes one
+/// `PriceOutlierRejected` event per deviating source. Capping the source list
+/// is what bounds this fan-out; measuring it at the cap fixes the number for
+/// the baseline table.
+#[test]
+fn benchmark_price_read_outlier_event_fan_out_at_max_sources() {
+    let bench = setup_benchmark_env();
+    register_outlier_price_sources(&bench);
+    assert_eq!(
+        bench.contract.get_price_sources(&OracleFeedType::Price).len(),
+        MAX_PRICE_SOURCES_PER_FEED
+    );
+
+    let (cpu, mem) = measure(
+        &bench.env,
+        "get_verified_price_outlier_fan_out_at_max_sources",
+        || {
+            let _ = bench
+                .contract
+                .get_verified_price(&OracleFeedType::Price, &bench.token);
+        },
+    );
+    assert_within_resource_budget(
+        "get_verified_price_outlier_fan_out_at_max_sources",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+// ================================================================
+// Issue #1065: documenting safe resource envelopes
+// ================================================================
+//
+// # Before / after
+//
+// **Before:** the caps that keep every on-chain collection — and therefore the
+// per-invocation resource cost of touching it — finite were enforced in five
+// different modules (`constants.rs`, `access.rs`, `twap.rs`, …) with no single
+// artifact declaring the whole envelope, and there was no measurement of the
+// *read*-side cost of a full (cap-sized) collection: only writes into a full
+// collection (the #1062 `join_fund_queue`-at-max-queue-size section above) had
+// a figure.
+//
+// **After:** `storage::RESOURCE_ENVELOPE` declares the entire envelope in one
+// place (see its doc comment, and the drift/well-formedness tests in
+// `tests_storage.rs`), and the benchmark below records the read-side cost of
+// the largest bounded collections *at their caps*, tying the declaration to a
+// measured, budget-checked figure.
+
+/// Fill the admin-action ring buffer to `ADMIN_ACTION_LOG_CAPACITY` so the log
+/// read below exercises a completely full log rather than a near-empty one.
+fn fill_admin_action_log(bench: &BaseBenchEnv) {
+    bench.env.as_contract(&bench.contract.address, || {
+        for _ in 0..ADMIN_ACTION_LOG_CAPACITY {
+            crate::access::record_admin_action(&bench.env, "bench");
+        }
+    });
+}
+
+/// Fill the top-payers min-heap to `TOP_PAYERS_CAPACITY`.
+fn fill_top_payers(bench: &BaseBenchEnv) {
+    bench.env.as_contract(&bench.contract.address, || {
+        for i in 0..TOP_PAYERS_CAPACITY {
+            let payer = Address::generate(&bench.env);
+            crate::top_payers::update_top_payers_on_score_change(&bench.env, &payer, i + 1);
+        }
+    });
+}
+
+/// Record the read-side cost of the largest bounded collections at their
+/// declared caps, and assert each is within the absolute resource ceilings.
+/// This is the figure the #1065 envelope declaration is checked against: as the
+/// table shows, reading the fullest collection the contract can hold stays far
+/// inside the per-invocation budget, which is what makes the declared envelope
+/// "safe".
+#[test]
+fn benchmark_envelope_read_views_at_cap() {
+    let mut results: std::vec::Vec<(&str, u32, (u64, u64))> = std::vec::Vec::new();
+
+    // Price-source list read at the cap (`DataKey::PriceSources`, #1064).
+    let bench = setup_benchmark_env();
+    register_agreeing_price_sources(&bench, MAX_PRICE_SOURCES_PER_FEED, BENCH_PRICE);
+    let price_read = measure(&bench.env, "envelope_read_price_sources_at_cap", || {
+        let _ = bench.contract.get_price_sources(&OracleFeedType::Price);
+    });
+    results.push((
+        "price_sources_per_feed",
+        MAX_PRICE_SOURCES_PER_FEED,
+        price_read,
+    ));
+
+    // Fund-queue read at the cap (`DataKey::FundQueue`, #1091/#1095).
+    let (bench_q, invoice_id) = setup_queue_of_len(MAX_FUND_QUEUE_LEN);
+    let queue_read = measure(&bench_q.env, "envelope_read_fund_queue_at_cap", || {
+        bench_q.env.as_contract(&bench_q.contract.address, || {
+            let _ = crate::invoice::get_fund_queue(&bench_q.env, invoice_id);
+        });
+    });
+    results.push(("fund_queue_entries", MAX_FUND_QUEUE_LEN, queue_read));
+
+    // Admin-action ring-buffer read at the cap (`DataKey::AdminActionLog`, #645).
+    let bench_a = setup_benchmark_env();
+    fill_admin_action_log(&bench_a);
+    let admin_read = measure(
+        &bench_a.env,
+        "envelope_read_admin_action_log_at_cap",
+        || {
+            let _ = bench_a
+                .contract
+                .get_recent_admin_actions(&ADMIN_ACTION_LOG_CAPACITY);
+        },
+    );
+    results.push((
+        "admin_action_log_entries",
+        ADMIN_ACTION_LOG_CAPACITY,
+        admin_read,
+    ));
+
+    // Top-payers heap read at the cap (`DataKey::TopPayersHeap`, #77).
+    let bench_t = setup_benchmark_env();
+    fill_top_payers(&bench_t);
+    let top_read = measure(&bench_t.env, "envelope_read_top_payers_at_cap", || {
+        let _ = bench_t.contract.get_top_payers(&TOP_PAYERS_CAPACITY);
+    });
+    results.push(("top_payers_entries", TOP_PAYERS_CAPACITY, top_read));
+
+    std::println!("\n| Envelope collection | Cap | CPU Instructions | Memory (bytes) |");
+    std::println!("| ------------------- | --- | ---------------- | -------------- |");
+    for (name, cap, (cpu, mem)) in &results {
+        std::println!("| {name} | {cap} | {cpu} | {mem} |");
+        assert_within_resource_budget(*name, *cpu, *mem, MAX_CPU_INSTRUCTIONS, MAX_MEMORY_BYTES);
+    }
 }

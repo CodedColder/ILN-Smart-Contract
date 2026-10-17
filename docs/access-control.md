@@ -132,7 +132,7 @@ Publicly accessible read or state-transition functions that do not require speci
 | `check_oracle_health` | Anyone | Performs live oracle health check and caches result (accessible while paused) |
 | `is_oracle_circuit_tripped` | Anyone | Checks if an oracle's circuit breaker is activated |
 | `reset_oracle_circuit` | Admin | Resets a circuit-tripped oracle's status (rate-limited: ~10min, Issue #859) |
-| `add_price_source` | Admin | Adds a price feed source for an oracle feed type (rate-limited: ~10min, Issue #859) |
+| `add_price_source` | Admin | Adds a price feed source for an oracle feed type (rate-limited: ~10min, Issue #859; capped at `MAX_PRICE_SOURCES_PER_FEED` = 20 sources per feed — further additions fail with `TooManyPriceSources`, Issue #1064) |
 | `remove_price_source` | Admin | Removes a price feed source (rate-limited: ~10min, Issue #859) |
 | `get_price_sources` | Anyone | Reads all registered price sources for a feed type |
 | `set_max_price_deviation_bps` | Admin | Sets maximum acceptable price deviation in basis points (rate-limited: ~10min, Issue #859)

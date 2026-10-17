@@ -217,6 +217,161 @@ after deploying this fix and, for any with a low or negative margin, prompt a
 new LP join (or have the admin re-invoke the relevant `invoice::save_*`
 helper) to refresh the TTL before it actually expires.
 
+### TTL cost at maximum queue size (Issue #1062)
+
+The retention guarantees above were validated only at single-entry scale
+(`tests_queue_archival.rs`), and the cost benchmarks covered only
+single-invoice flows. `FundQueue(id)`'s entry size is bounded by
+`MAX_FUND_QUEUE_LEN` (50) — Issue #1095, with the bound expressed as
+property X7 in
+[`formal-verification-cross-contract.md`](formal-verification-cross-contract.md)
+— so the largest value the contract can ever persist is a 50-entry queue,
+and that is the case the retention policy actually has to survive.
+
+**Before:** nothing asserted or measured the retention policy at that bound.
+`extend_queue_key_ttl` (called by `save_fund_queue` /
+`save_queue_resolution` / `try_set_fund_queue_opened_at`) is key-based and
+therefore independent of the entry's serialized size, but no test confirmed
+that the full-queue admission path — including the displacing-join branch,
+which pops the tail and re-serializes the whole vector before extending — still
+extended the TTL, or where the `get_fund_queue_ttl_margins` boundary fell once
+the queue was at maximum size.
+
+**After:** `tests_storage.rs` fills a queue to exactly `MAX_FUND_QUEUE_LEN`
+and asserts, at that bound: a full-queue join still extends `FundQueue` TTL to
+≥ `FUND_QUEUE_TTL_THRESHOLD`; a strictly higher-scored displacing join refreshes
+it; an equal- or lower-scored joiner is rejected with `ContractError::QueueFull`
+without evicting the retained tail or touching its TTL; `join_fund_queue`
+genuinely enforces the LP's authorization while `get_fund_queue_ttl_margins`
+stays permissionless; and the margin crosses exactly `0 → -1` at
+`TTL_MIN_LEDGERS_BEFORE_UPGRADE` one ledger apart. `tests_benchmarks.rs`
+records the corresponding CPU/memory cost (see
+[`benchmarks.md`](benchmarks.md#ttl-cost-at-maximum-queue-size-issue-1062)).
+
+**Guarantee going forward:** the retention floor above holds irrespective of
+queue length, including at the `MAX_FUND_QUEUE_LEN` bound — the TTL target is
+per-key, so a maximum-size queue is retained for exactly as long as a
+single-entry one.
+
+**Migration note:** behavior-only — no storage layout, key format, or TTL
+constant changed, so no data migration is required.
+
+### Concurrent settlement and shared counters (Issue #1063)
+
+`mark_paid` (the settlement path) is the only entry point that mutates the
+contract's *shared* accounting on every successful call: the instance
+reentrancy lock (`StorageKey::ReentrancyLock`), the persistent aggregate
+counter (`StorageKey::TotalPaid`), and the `ContractStats` aggregate
+(`total_paid`, `total_volume_usdc` / `_eurc` / `_xlm`, and
+`total_volume_usd_normalized`). Per-invoice data (`DataKey::Invoice(id)`) is
+independent by construction (INVARIANT S1 in `invoice.rs`), but the shared
+counters are not, so settling a batch of invoices in one ledger is the case
+where a crossed write would actually show up.
+
+**Before:** settlement was only exercised one invoice at a time (single-invoice
+tests in `test.rs` / `tests_coverage_gate.rs`). No test settled a batch in one
+ledger, so nothing pinned down that the shared counters advance exactly once
+per settlement, that a *rejected* settlement rolls back without disturbing the
+others, or where the `paid_on_time` boundary actually falls.
+
+**After:** `tests_storage.rs` settles a `SETTLE_STRESS_BATCH` (25) batch of
+independent invoices in a single ledger and asserts per-invoice isolation
+(each fresh payer's `invoices_paid` counts exactly its own settlement), exact
+aggregate accounting (`total_paid` / `total_invoices` equal the batch size, not
+more), correctness across a ledger-sequence boundary mid-batch, that a partial
+payment does not count as a settlement, that rejected settlements (double-pay,
+overpayment, unfunded) leave every other invoice settleable and never leak the
+reentrancy lock, that `mark_paid` genuinely requires the payer's authorization,
+and that `paid_on_time` flips exactly at `timestamp == due_date`. The
+per-invocation CPU/memory cost of a settlement inside such a batch — the figure
+mainnet's resource limit applies to — is recorded in `tests_benchmarks.rs` (see
+[`benchmarks.md`](benchmarks.md#concurrent-settlement-stress-issue-1063)).
+
+**Guarantee going forward:** shared counters advance once per completed
+settlement regardless of how many settlements share the ledger, and a rejected
+settlement never leaves shared state (reentrancy lock, counters) in a state
+that blocks a subsequent settlement — i.e. settlement is per-invoice isolated
+in accounting even when batched in one ledger.
+
+**Migration note:** behavior-only — no storage layout, key format, or TTL
+constant changed; no data migration is required.
+
+### Bounding the per-feed price-source list (Issue #1064)
+
+Each feed type's price-source list (`DataKey::PriceSources(OracleFeedType)`,
+instance storage) is appended to by `add_price_source` and iterated in full by
+`get_verified_price` on every price read. That read publishes one
+`PriceOutlierRejected` event *per* source deviating beyond the configured
+threshold, so an unbounded list meant both the event payload and the CPU/storage
+cost of a read were unbounded in the registry's size.
+
+**Before:** `add_price_source` had no upper bound — any number of distinct
+sources could be appended to a feed, so `get_verified_price` could be driven to
+emit an unbounded number of outlier events (and do unbounded iteration work) in a
+single invocation.
+
+**After:** `add_price_source` rejects a genuinely new source with
+`ContractError::TooManyPriceSources` (76) once the feed already holds
+`MAX_PRICE_SOURCES_PER_FEED` (20) sources. Re-registering an *existing* source
+remains a no-op (idempotency preserved), and `remove_price_source` frees a slot.
+The stored value is still the same `Vec<Address>` — only its maximum length is
+now bounded. See `tests_storage.rs` (cap at the boundary, per-feed independence,
+idempotent re-registration at the cap, slot recovery on removal, authorization,
+and that a single read's event count is bounded) and
+[`benchmarks.md`](benchmarks.md#price-read-event-fan-out-issue-1064).
+
+**Guarantee going forward:** the number of `PriceOutlierRejected` events a single
+`get_verified_price` call can emit — and the iteration cost of that call — is
+bounded by `MAX_PRICE_SOURCES_PER_FEED`, independent of how the feed was grown.
+
+**Migration note:** behavior-only — no storage layout, key format, or TTL
+constant changed. An already-over-cap feed (only possible if written by the old
+code) is not truncated; the cap only gates *further* additions, so no backfill is
+required.
+
+### The safe resource envelope (Issue #1065)
+
+Every collection the `invoice_liquidity` contract stores on chain is bounded, so
+the per-invocation CPU/memory cost of *touching* it is bounded too — that is what
+keeps every code path inside Soroban's per-invocation resource budget. Before
+Issue #1065 those bounds lived, unremarked, in the modules that enforced them,
+with no single artifact declaring the whole envelope.
+
+**Before:** the bounds were enforced (and therefore discoverable) one module at a
+time — `MAX_FUND_QUEUE_LEN` and `MAX_PRICE_SOURCES_PER_FEED` in `constants.rs`,
+`ADMIN_ACTION_LOG_CAPACITY` in `access.rs`, `TOP_PAYERS_CAPACITY` in
+`constants.rs`, `MAX_TWAP_SAMPLES` in `twap.rs`. Nothing stated "these are *all*
+of the unbounded-by-design collections, and these are their caps", so adding a new
+one without a bound would not have stood out.
+
+**After:** `storage::RESOURCE_ENVELOPE` (`contracts/invoice_liquidity/src/
+storage.rs`) declares the whole envelope in one place, as `(name, cap)` pairs
+where each `cap` references the authoritative constant that enforces it (never a
+hand-written literal):
+
+| Envelope name | Backing key | Cap (enforcing constant) |
+| ------------- | ----------- | ------------------------ |
+| `fund_queue_entries` | `FundQueue(u64)` | `constants::MAX_FUND_QUEUE_LEN` (50) |
+| `price_sources_per_feed` | `PriceSources(OracleFeedType)` | `constants::MAX_PRICE_SOURCES_PER_FEED` (20) |
+| `admin_action_log_entries` | `AdminActionLog(u32)` | `access::ADMIN_ACTION_LOG_CAPACITY` (50) |
+| `top_payers_entries` | `TopPayersHeap` | `constants::TOP_PAYERS_CAPACITY` (50) |
+| `twap_samples_per_feed_token` | `TwapSamples(feed, token)` | `twap::MAX_TWAP_SAMPLES` (100) |
+| `ttl_upgrade_sample` | (upgrade TTL sweep) | `constants::TTL_UPGRADE_SAMPLE_SIZE` (50) |
+| `rollback_sample` | (rollback rehearsal sweep) | `constants::ROLLBACK_SAMPLE_SIZE` (50) |
+
+**Guarantee going forward:** the declaration cannot silently drift from the code.
+`tests_storage.rs` (Issue #1065) asserts each declared cap equals the constant that
+actually enforces it, and that the declaration is well-formed (non-empty, unique,
+positive caps); a live boundary test fills the fund queue to its declared cap,
+crosses a ledger boundary, and confirms the cap still holds; an authorization test
+confirms an admin with full auth cannot exceed a declared cap. The read-side cost
+of the largest bounded collections *at* their caps is measured and budget-checked
+in `tests_benchmarks.rs` (`benchmark_envelope_read_views_at_cap`; see
+[`benchmarks.md`](benchmarks.md#safe-resource-envelope-read-cost-issue-1065)).
+
+**Migration note:** documentation/measurement-only — no storage key, value
+encoding, TTL constant, or contract behavior changed. No migration is required.
+
 ### Resolving a queue after invoice cleanup (Issue #1017)
 
 Distinct from the TTL/retention guarantees above: `resolve_fund_queue` had

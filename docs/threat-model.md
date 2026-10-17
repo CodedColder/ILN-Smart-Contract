@@ -80,6 +80,20 @@ Standalone contract for default protection. Pool-specific attacks covered in Sec
 
 **Risk:** Network-level attacks (51% attacks, consensus failures) are outside contract scope but catastrophic if realized.
 
+**Resource limits (Issue #1065):** the contract additionally relies on Soroban's
+per-invocation CPU-instruction and memory budget, and its per-entry size limit.
+That reliance is only safe if every on-chain collection the contract iterates or
+rewrites is bounded — an unbounded collection (fund queue, price-source list,
+admin action log, top-payers heap, TWAP samples, upgrade/rollback samples) could
+be grown until a single invocation exceeded the budget and trapped, denying that
+path for every affected invoice or feed. **Mitigation:** every such collection is
+bounded and the bounds are declared in one place, `storage::RESOURCE_ENVELOPE`
+(`contracts/invoice_liquidity/src/storage.rs`) — see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065) —
+with drift/boundary/authorization tests in `tests_storage.rs` and the read-at-cap
+cost measured against the absolute ceilings in `tests_benchmarks.rs` (see
+[`benchmarks.md`](benchmarks.md#safe-resource-envelope-read-cost-issue-1065)).
+
 ### 3. **Token Contracts (USDC, EURC, XLM)**
 - **Assumptions:**
   - Tokens implement Stellar Asset Contract standard correctly

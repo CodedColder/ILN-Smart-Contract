@@ -69,3 +69,95 @@ signal), `QueueFull` error rates, and monitor `ContractPaused` rejections on que
 - At the time of this PR `origin/dev` does not build `insurance_pool` /
   `iln_distribution` (duplicate `DataKey` variants; `initialize` return type),
   which blocks every `invoice_liquidity` integration target. Out of scope.
+
+## 5. Maximum fund-queue TTL cost (Issue #1062)
+
+Follow-up to control C3 above: the queue bound (`MAX_FUND_QUEUE_LEN` = 50) was
+enforced, but the *retention* policy that keeps a bounded queue alive
+(Issue #1011's `extend_queue_key_ttl`) was only ever tested at single-entry
+scale, and the cost benchmarks measured only single-invoice flows.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Retention asserted at `MAX_FUND_QUEUE_LEN` | no | `tests_storage.rs` success/failure/auth/boundary tests |
+| Max-size admission/resolution/TTL cost measured | no | `tests_benchmarks.rs` `*_at_max_queue_size` benchmarks |
+| Isolated `extend_ttl` cost vs. queue length | unmeasured | printed table across 1 / 10 / 50 entries |
+
+**Behaviour.** Unchanged — `extend_ttl` is key-based, so a maximum-size queue
+is retained for exactly as long as a single-entry one. The addition is
+measurement + regression coverage only. No storage layout, key format, TTL
+constant, or error code changed, so no data migration is required (see
+[`storage-layout.md`](storage-layout.md) and
+[`benchmarks.md`](benchmarks.md) for the before/after detail).
+
+## 6. Concurrent invoice settlement (Issue #1063)
+
+Follow-up to control C1 above: settlement (`mark_paid`) mutates *shared* state
+(the reentrancy lock, `StorageKey::TotalPaid`, and the `ContractStats`
+aggregate) while per-invoice data stays independent — but settlement was only
+ever exercised one invoice at a time, so the batched case (independent payers
+settling in one ledger) had no isolation or accounting coverage, and no
+per-invocation cost measurement inside such a batch.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Batch of settlements in one ledger asserted | no | `tests_storage.rs` success / boundary tests (`SETTLE_STRESS_BATCH` = 25) |
+| Shared-counter advancement under batching | untested | exact-count assertions on `total_paid` / `total_invoices` / per-payer `invoices_paid` |
+| Rejected settlement leaving others settleable | untested | double-pay / overpayment / unfunded rejection-isolation tests |
+| `mark_paid` authorization + `paid_on_time` boundary | single-invoice only | explicit auth test and exact `timestamp == due_date` flip test |
+| Per-invocation settlement cost inside a batch | unmeasured | `tests_benchmarks.rs` `settle_batch_same_ledger` + `mark_paid_in_batch_len_{1,10,25}` table |
+
+**Behaviour.** Unchanged — settlement is already per-invoice isolated in
+accounting; the addition is regression coverage + cost measurement only. No
+storage layout, key format, error code, or counting semantics changed, so no
+data migration is required (see [`storage-layout.md`](storage-layout.md) and
+[`benchmarks.md`](benchmarks.md) for the before/after detail).
+
+## 7. Bounded price-source list / event fan-out (Issue #1064)
+
+The per-feed price-source list (`DataKey::PriceSources`) was appended to by
+`add_price_source` with no upper bound, and `get_verified_price` iterates the
+whole list on every price read, publishing one `PriceOutlierRejected` event per
+source that deviates past the threshold. An unbounded list therefore made both
+the event payload a single price read could emit and the CPU/storage cost of the
+iteration unbounded — growth to the point of a resource-limit failure would break
+the price path for every token on that feed.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Per-feed source count bound | none | `MAX_PRICE_SOURCES_PER_FEED` (20), enforced by `add_price_source` |
+| Overflow behaviour | appended indefinitely | `ContractError::TooManyPriceSources` (76) for a new source once full |
+| Idempotent re-registration at the cap | n/a | still a no-op (cap check only applies to a genuinely new source) |
+| Slot recovery | n/a | `remove_price_source` frees a slot |
+| Single read's outlier-event count | unbounded | bounded by the cap; asserted in `tests_storage.rs` |
+| Price-read cost / fan-out measured | unmeasured | `tests_benchmarks.rs` `get_verified_price_sources_{1,10,20}` + `get_verified_price_outlier_fan_out_at_max_sources` |
+
+**Behaviour.** `add_price_source` gains an upper bound (`TooManyPriceSources`,
+error 76) and a new constant `MAX_PRICE_SOURCES_PER_FEED = 20`; the stored value
+stays the same `Vec<Address>` and all reads outside a full feed are unchanged. No
+storage layout, key format, or TTL constant changed, and an already-over-cap feed
+is not truncated (the cap gates only further additions), so no data migration is
+required (see [`storage-layout.md`](storage-layout.md) and
+[`benchmarks.md`](benchmarks.md) for the before/after detail).
+
+## 8. Safe resource envelope (Issue #1065)
+
+The contract only stays inside Soroban's per-invocation CPU/memory budget if every
+on-chain collection it iterates or rewrites is bounded. Those bounds existed but
+were enforced (and discoverable) one module at a time, with no single artifact
+declaring the envelope — so a newly added unbounded-by-design collection would not
+stand out, and no figure tied the declared bounds to a measured read cost.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Envelope declaration | implicit, spread across `constants.rs` / `access.rs` / `twap.rs` | `storage::RESOURCE_ENVELOPE` — one `(name, cap)` table, caps referencing the enforcing constants |
+| Drift protection | none | `tests_storage.rs` asserts each declared cap equals the constant that enforces it, plus well-formedness (non-empty, unique, positive) |
+| Live boundary coverage | none | fund queue filled to its declared cap, ledger boundary crossed, one further join rejected (`QueueFull`), length stays at cap |
+| Authorization coverage | none | admin with `mock_all_auths()` still cannot exceed the price-source cap (`TooManyPriceSources`) |
+| Full-collection **read** cost measured | unmeasured | `tests_benchmarks.rs` `benchmark_envelope_read_views_at_cap` (`envelope_read_{price_sources,fund_queue,admin_action_log,top_payers}_at_cap`), each budget-checked |
+
+**Behaviour.** No contract behavior, storage key, value encoding, or TTL constant
+changed — this is a declaration-plus-measurement remediation. `RESOURCE_ENVELOPE`
+is a `pub const` slice read only by tests and docs, so no migration is required
+(see [`storage-layout.md`](storage-layout.md) and [`benchmarks.md`](benchmarks.md)
+for the before/after detail).

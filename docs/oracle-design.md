@@ -74,11 +74,11 @@ Oracle operators **must** refresh verification records at least every 7 days to 
 
 The single-oracle model above (one resolved address per feed type/token) has no defense against a single misbehaving or compromised oracle reporting a wildly incorrect **price** — there's nothing on-chain to compare it against. `oracle_registry.rs` addresses this with a separate, optional multi-source registration list specifically for numeric price data:
 
-- `add_price_source(feed_type, oracle)` / `remove_price_source(feed_type, oracle)` (admin-gated) maintain a list of price-reporting sources per feed type, independent of the single-oracle `register_oracle`/`register_token_oracle` registry used for boolean payer verification.
+- `add_price_source(feed_type, oracle)` / `remove_price_source(feed_type, oracle)` (admin-gated) maintain a list of price-reporting sources per feed type, independent of the single-oracle `register_oracle`/`register_token_oracle` registry used for boolean payer verification. **Each feed is capped at `MAX_PRICE_SOURCES_PER_FEED` (20) sources** (Issue #1064): a genuinely new source is rejected with `TooManyPriceSources` once the feed is full, while re-registering an existing one stays a no-op and `remove_price_source` frees a slot.
 - `get_verified_price(feed_type, token)` queries every registered source (via `get_price(token) -> i128`, dynamically invoked — a single non-responding or panicking source is excluded from the sample rather than failing the whole query) and:
   - **Zero sources, or all queries failed:** returns an error (`NoPriceSource`).
   - **Exactly one source:** returns its price **unchecked**.
-  - **Two or more sources:** computes the median of all successfully-queried prices, excludes any source deviating from that median beyond `get_max_price_deviation_bps()` (emitting `PriceOutlierRejected` per exclusion), and returns the median of the survivors — or `AllPriceSourcesRejected` if nothing survives.
+  - **Two or more sources:** computes the median of all successfully-queried prices, excludes any source deviating from that median beyond `get_max_price_deviation_bps()` (emitting `PriceOutlierRejected` per exclusion), and returns the median of the survivors — or `AllPriceSourcesRejected` if nothing survives. Because this emits one outlier event per deviating source, the per-feed source cap also bounds the number of events a single price read can publish (Issue #1064).
 - The deviation threshold is governance-configurable via `set_max_price_deviation_bps` (default 500 bps / 5%), the same admin-gated, governance-controlled-in-production pattern used throughout this registry.
 
 ### The single-source risk is explicit, not silent
@@ -93,6 +93,7 @@ A closely related, less obvious limitation: **with exactly two sources, a single
 - The admin key that controls `set_price_oracle` is a single point of control. A compromised admin can register a malicious oracle. Governance timelock on oracle registration changes is recommended.
 - Fail-open behaviour (no oracle → all pass) is appropriate for the MVP. High-security deployments should consider fail-closed defaults.
 - Oracle address changes take effect immediately. There is no delay between registering a new oracle and it being used for checks. Consider adding a timelock.
+- The per-feed price-source list is **capped** (`MAX_PRICE_SOURCES_PER_FEED`, Issue #1064) so that neither a single `get_verified_price` read's CPU/storage cost nor its `PriceOutlierRejected` event fan-out (one per deviating source) can be grown without bound — a feed that grew large enough to exceed Soroban's per-invocation resource limit would otherwise fail the price path for every token on that feed. The cap is a defensive bound on unbounded series, not a limit on any realistic quorum.
 
 ---
 
