@@ -31,6 +31,7 @@ API without reading the indexer source.
   - [GET /reputation/:address](#get-reputationaddress)
   - [GET /leaderboard](#get-leaderboard)
   - [GET /events](#get-events)
+  - [GET /public/health](#get-publichealth)
 - [Enumerations](#enumerations)
 - [Generating an OpenAPI spec](#generating-an-openapi-spec)
 
@@ -556,6 +557,57 @@ curl "http://localhost:3001/events?address=GBBB...PAYER"
 
 # Only funded + paid events, second page
 curl "http://localhost:3001/events?address=GBBB...PAYER&types=funded,paid&page=2&pageSize=20"
+```
+
+---
+
+### GET /public/health
+
+Curated, non-sensitive protocol-health summary. It is the only data source for the
+[public status page](public-status-page.md) and is safe to expose publicly. It never
+returns admin or signer addresses, multisig configuration, admin-action history,
+per-address data or raw amounts.
+
+| | |
+|---|---|
+| **Method / Path** | `GET /public/health` |
+| **Query parameters** | none |
+| **Request body** | none |
+
+Always `200`. If the on-chain status cannot be read, `overall` is `"unknown"`.
+
+**Response `200 OK`**
+
+```json
+{
+  "schemaVersion": 1,
+  "generatedAt": "2027-01-15T12:00:00.000Z",
+  "overall": "operational",
+  "reasons": [],
+  "protocol": { "paused": false, "stale": false },
+  "solvency": {
+    "level": "healthy",
+    "fundedInvoices": 120,
+    "settledInvoices": 110,
+    "defaultedInvoices": 2,
+    "defaultRatePct": 1.8,
+    "outstandingFundedInvoices": 8,
+    "overdueFundedInvoices": 0,
+    "overdueSharePct": 0,
+    "insurancePool": { "enrolledLps": 12, "claimsSharePct": 4.2 }
+  },
+  "oracle": { "circuitsTripped": 0, "healthy": true }
+}
+```
+
+`overall` is one of `operational`, `degraded`, `paused`, `unknown`. `solvency.level` is
+`healthy`, `watch`, `stressed` or `unknown`; rate fields are `null` until enough invoices
+exist (see [public-status-page.md](public-status-page.md#thresholds)).
+
+**curl**
+
+```bash
+curl http://localhost:3001/public/health
 ```
 
 ---

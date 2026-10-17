@@ -1,3 +1,6 @@
+use crate::access::require_admin;
+use crate::errors::ContractError;
+use crate::storage::DataKey;
 /// Multi-signature Admin Module (Issue #124)
 ///
 /// Implements a threshold-based multi-signature scheme for high-security admin operations.
@@ -9,11 +12,7 @@
 /// 2. Signers call sign_admin_action() to approve the proposal
 /// 3. Once threshold is reached, any signer calls execute_admin_action()
 /// 4. Proposals expire after MULTISIG_WINDOW_LEDGERS if not executed
-
 use soroban_sdk::{contracttype, Address, Env, Vec};
-use crate::access::require_admin;
-use crate::errors::ContractError;
-use crate::storage::DataKey;
 
 /// Number of ledgers a multisig proposal remains valid (approximately 24 hours)
 pub const MULTISIG_WINDOW_LEDGERS: u64 = 17_280;
@@ -33,20 +32,19 @@ pub enum AdminAction {
     /// Set maximum discount rate
     SetMaxDiscount(u32),
     /// Update multisig configuration itself (change signers or threshold)
-    UpdateMultisig {
-        new_signers: Vec<Address>,
-        new_threshold: u32,
-    },
+    ///
+    /// Tuple variant `(new_signers, new_threshold)` — `#[contracttype]` does
+    /// not support named-field enum variants.
+    UpdateMultisig(Vec<Address>, u32),
     /// Issue #640: replace `old_signer` with `new_signer` in the signer
     /// set. Executing this proposal does not swap the signer immediately —
     /// it schedules the swap behind a timelock (see `schedule_rotation`),
     /// so a compromised or departing signer's key can be rotated without a
     /// contract upgrade while still giving the team a window to detect and
     /// cancel a malicious or mistaken rotation.
-    RotateSigner {
-        old_signer: Address,
-        new_signer: Address,
-    },
+    ///
+    /// Tuple variant `(old_signer, new_signer)`.
+    RotateSigner(Address, Address),
 }
 
 /// Multi-signature admin configuration
@@ -126,7 +124,7 @@ pub fn threshold_reached(proposal: &MultisigProposal, threshold: u32) -> bool {
 
 /// Check if proposal has expired
 pub fn is_expired(env: &Env, proposal: &MultisigProposal) -> bool {
-    env.ledger().sequence() >= proposal.expires_at
+    u64::from(env.ledger().sequence()) >= proposal.expires_at
 }
 
 // ================================================================
@@ -150,8 +148,12 @@ pub fn initialize(env: &Env, signers: Vec<Address>, threshold: u32) -> Result<()
     require_admin(env)?;
 
     let config = MultisigAdmin { signers, threshold };
-    env.storage().instance().set(&DataKey::MultisigAdmin, &config);
-    env.storage().instance().set(&DataKey::NextProposalId, &1u64);
+    env.storage()
+        .instance()
+        .set(&DataKey::MultisigAdmin, &config);
+    env.storage()
+        .instance()
+        .set(&DataKey::NextProposalId, &1u64);
     Ok(())
 }
 
@@ -162,7 +164,11 @@ fn load_config(env: &Env) -> Result<MultisigAdmin, ContractError> {
         .ok_or(ContractError::MultisigNotConfigured)
 }
 
-fn require_signer(env: &Env, config: &MultisigAdmin, signer: &Address) -> Result<(), ContractError> {
+fn require_signer(
+    env: &Env,
+    config: &MultisigAdmin,
+    signer: &Address,
+) -> Result<(), ContractError> {
     signer.require_auth();
     if !is_signer(env, &config.signers, signer) {
         return Err(ContractError::NotAuthorizedSigner);
@@ -199,7 +205,9 @@ pub fn propose(env: &Env, proposer: &Address, action: AdminAction) -> Result<u64
         .instance()
         .get(&DataKey::NextProposalId)
         .unwrap_or(1);
-    env.storage().instance().set(&DataKey::NextProposalId, &(id + 1));
+    env.storage()
+        .instance()
+        .set(&DataKey::NextProposalId, &(id + 1));
 
     let mut signers_approved = Vec::new(env);
     signers_approved.push_back(proposer.clone());
@@ -266,7 +274,11 @@ pub fn sign(env: &Env, signer: &Address, proposal_id: u64) -> Result<(), Contrac
 /// `caller` must be a configured multisig signer, but does not need to be
 /// one of the proposal's approvers (any signer may trigger execution once
 /// threshold is met).
-pub fn execute(env: &Env, caller: &Address, proposal_id: u64) -> Result<AdminAction, ContractError> {
+pub fn execute(
+    env: &Env,
+    caller: &Address,
+    proposal_id: u64,
+) -> Result<AdminAction, ContractError> {
     let config = load_config(env)?;
     require_signer(env, &config, caller)?;
 
@@ -331,7 +343,11 @@ pub fn schedule_rotation(
     old_signer: Address,
     new_signer: Address,
 ) -> Result<PendingRotation, ContractError> {
-    if env.storage().instance().has(&DataKey::PendingSignerRotation) {
+    if env
+        .storage()
+        .instance()
+        .has(&DataKey::PendingSignerRotation)
+    {
         return Err(ContractError::RotationAlreadyPending);
     }
     let config = load_config(env)?;
@@ -379,7 +395,9 @@ pub fn finalize_rotation(env: &Env, caller: &Address) -> Result<PendingRotation,
     new_signers.push_back(rotation.new_signer.clone());
     config.signers = new_signers;
 
-    env.storage().instance().set(&DataKey::MultisigAdmin, &config);
+    env.storage()
+        .instance()
+        .set(&DataKey::MultisigAdmin, &config);
     env.storage()
         .instance()
         .remove(&DataKey::PendingSignerRotation);

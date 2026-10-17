@@ -37,7 +37,6 @@ fn right_child(index: u32) -> u32 {
     index.saturating_mul(2).saturating_add(2)
 }
 
-
 fn entry_score(entry: &TopPayerEntry) -> u32 {
     entry.score
 }

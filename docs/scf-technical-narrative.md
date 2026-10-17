@@ -2,8 +2,16 @@
 
 This document provides a coherent technical overview of the Invoice Liquidity
 Network protocol for the Stellar Community Fund review. It synthesises the
-protocol design, production-hardening work, and current audit/testing posture
+protocol design, production-hardening work, **this Stellar Wave batch’s
+community/verification deliverables**, and the current audit/testing posture
 into a single narrative.
+
+**Last reviewed:** 2026-09-24 (Issue #901). Evidence links point at in-repo
+dashboards and labeled issue filters rather than aspirational claims.
+
+**Non-author review:** Before any grant submission uses this narrative, a
+maintainer who did **not** author the latest revision should check the
+[Review confirmation](#review-confirmation) box below.
 
 ---
 
@@ -31,6 +39,19 @@ any approved token (EURC, USDC, XLM, and others).
   invoices
 - **The protocol** is governed on-chain with transparent rules for dispute
   resolution, defaults, and parameter updates
+
+### Reputation and NFT lifecycle
+
+Every participant starts at a neutral 50/50 reputation that accrues
+asymmetrically (+1 per on-time settlement, −5 per default, floor 0, appeal
+restores the pre-default score) and decays lazily toward 0 with inactivity —
+no keeper required. Each funded invoice is simultaneously a transferable NFT
+claim (minted on funding, held by the funder, burned on settlement), so *who
+holds the claim* and *how the payer behaved* update atomically. Protocol
+decisions read only `invoice_liquidity` scores; the standalone
+`reputation_bonus` module keeps separate counters for discount bonuses. The
+full cross-referenced walkthrough lives in the
+[Reputation Model lifecycle guide](reputation-model.md#full-lifecycle-guide-issues-854--single-cross-referenced-narrative).
 
 ---
 
@@ -60,8 +81,6 @@ TypeScript SDK, CLI, event indexer, and notifications service.
 
 ### On-Chain State Machine
 
-An invoice progresses through the following states:
-
 ```
 Submitted → Funded → Settled (happy path)
                 ↓
@@ -69,9 +88,6 @@ Submitted → Funded → Settled (happy path)
                 ↓
           Appealed → Resolved
 ```
-
-The LP priority queue allows liquidity providers to compete on discount
-rates, with an appeal mechanism for disputed defaults.
 
 ### Data Flow
 
@@ -86,10 +102,17 @@ rates, with an appeal mechanism for disputed defaults.
 
 ## Production-Hardening Summary
 
-This section summarises the production-hardening work completed across the
-125-issue batch. The work is organised into three pillars.
+Summarises completed hardening (prior batches) plus **this batch’s** readiness
+work. Prefer the linked artifacts over restating status here.
 
 ### Economic Security
+
+Protocol economics, LP risk assumptions, insurance parameters, and oracle-attack
+costing live in the unified
+[Protocol Economics & Risk](index.md#protocol-economics--risk) section of the
+docs index (LP risk guide → governance playbook → token economics → oracle
+attack economics → insurance design/parameters, plus the review cadence). This
+narrative keeps only a short capability summary:
 
 - Multi-token support with token management functions and associated events
 - Discount rate validation and bounds checking
@@ -97,24 +120,31 @@ This section summarises the production-hardening work completed across the
 - Insurance pool for default protection with test coverage
 - Reputation tracking with lazy decay for inactive addresses
 - Incremental vote total caching for gas-efficient governance execution
+- **This batch:** economics/risk documentation set and review cadence — see
+  [`governance-policy-docs` issues](https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/issues?q=label%3Agovernance-policy-docs)
 
 ### Governance Security
 
-- Admin veto with governance-controlled disable mechanism
-- Quorum requirement for proposal passing
-- Timelocked admin actions with configurable delay
-- Delegate votes support for participation without direct token holding
-- Pause/unpause capability with timestamp validation
-- Disaster recovery multisig documentation and runbooks
+- Admin veto, ILN-gated quorum supply, checkpoint-aged snapshots, timelocks,
+  delegation, pause/unpause, disaster-recovery multisig docs
 
 ### Infrastructure Hardening
 
-- Fuzz and property-based test suite for `submit_invoice` input validation
-- Benchmark regression guard with stored baselines
-- CI enforcement of 95% line coverage on `invoice_liquidity`
-- Storage layout documentation and migration compatibility checks
-- Upgrade path testing and rollback documentation
-- Monitoring runbook with health checks, alerting, and on-call routing
+- Fuzz/property tests, benchmark regression guard, 95% line coverage gate on
+  `invoice_liquidity`, storage/upgrade docs, monitoring runbooks
+- **This batch:** automated access-control matrix + public-doc CI gates
+  ([`access-control-matrix.generated.md`](access-control-matrix.generated.md),
+  Issues #856 / #857); cross-contract formal-verification work under
+  [`formal-verification-automation`](https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/issues?q=label%3Aformal-verification-automation)
+
+### SCF & community readiness (this batch)
+
+Tracked in [`scf-grant-milestone-tracker.md`](scf-grant-milestone-tracker.md)
+and label [`scf-community`](https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/issues?q=label%3Ascf-community):
+
+- Public support channel audit, partner onboarding guide, audit-findings
+  summary template, maintainer/emergency ownership (`MAINTAINERS.md`), this
+  narrative refresh
 
 ---
 
@@ -122,53 +152,66 @@ This section summarises the production-hardening work completed across the
 
 ### Audit Status
 
-An external security audit has been completed for all Soroban contracts,
-deployment scripts, SDK transaction builders, indexer APIs, and notifications
-webhooks. The audit covered:
-
-- `invoice_liquidity` — core escrow and multi-token flows
-- `iln_governance` — proposals, voting, and timelocked actions
-- `iln_distribution` — yield distribution logic
-- `reputation_bonus` — reputation-based bonuses
-- `insurance_pool` — default protection pool
-
-The audit readiness dashboard tracks all pre-audit, audit, and post-audit
-items. See [`docs/audit-readiness-dashboard.md`](audit-readiness-dashboard.md)
-for the full reconciliation.
+Per [`mainnet-launch-checklist.md`](mainnet-launch-checklist.md), the
+**external security audit** checklist row is marked **Complete** (Issue #298)
+for contracts, deployment scripts, SDK builders, indexer APIs, and
+notifications webhooks. Day-to-day readiness (coverage gaps, parameter bounds,
+docs) continues on the
+[audit-readiness dashboard](audit-readiness-dashboard.md). Public findings
+will be published via the
+[audit findings summary template](audit-findings-summary.md) when the report
+is disclosable.
 
 ### Test Coverage
 
-| Area | Status |
-|------|--------|
-| Unit tests | Comprehensive across all five contracts |
-| Integration tests | Cross-contract tests with mock tokens and oracles |
-| Fuzz tests | Property-based tests for `submit_invoice` input validation |
-| E2E tests | SDK + live local Stellar node + indexer |
-| Coverage threshold | 95% line coverage enforced on `invoice_liquidity` |
-| Benchmark regression | Guard script checks instruction count baselines |
+| Area | Status (evidence) |
+|------|-------------------|
+| Unit tests | Present across all five contracts |
+| Integration / cross-contract tests | e.g. full-protocol lifecycle + cross-contract invariant suite |
+| Fuzz tests | `iln_fuzz` / property suites for high-risk paths |
+| E2E | SDK + local stack under `tests/e2e` |
+| Coverage threshold | 95% line coverage enforced on `invoice_liquidity` (CI) |
+| Benchmark regression | `scripts/check_benchmark_regression.sh` |
 
-### Known Gaps
+### Known Gaps (honest)
 
-- Insurance pool coverage is expanding (currently covers core default flows)
-- Extended fuzz coverage for `fund_invoice` and `mark_paid` paths is in
-  progress
-- Multi-sig admin error cases need additional test coverage
-- Some `ContractError` variants lack dedicated test cases
+- Insurance pool coverage and extended fuzz paths are still expanding
+  (dashboard/test issues)
+- Mainnet multisig signers list is **empty until appointed**
+  (`mainnet-admin-signers.json`) — expected pre-launch
+- Token-economics projections remain model-based until a durable velocity
+  dashboard export exists
+- Some `ContractError` variants still lack dedicated tests
 
 ### Honest Assessment
 
-The protocol is early-stage and has not yet been deployed to mainnet. The
-audit provides confidence in the contract logic, but real-world usage may
-reveal edge cases not covered by testing. The governance and insurance
-mechanisms are functional but conservative — parameter ranges are bounded,
-and emergency pause capability is available.
+The protocol is **not mainnet-live**. Hardening and documentation for SCF
+review are substantially advanced; residual risk is early-stage usage risk,
+incomplete optional modules, and operational items still “In progress” on the
+launch checklist. Pause/governance controls and staged caps are the intended
+safety net for first mainnet capital.
+
+---
+
+## Review confirmation
+
+- [ ] Non-author maintainer reviewed this narrative against the audit-readiness
+      dashboard and grant milestone tracker on ________ (date) — reviewer: ________
 
 ---
 
 ## Links
 
 - [Architecture](Architecture.md) — full system design
+- [SCF Grant Milestone Tracker](scf-grant-milestone-tracker.md) — issue→deliverable map for this batch (label-linked)
+- [Integration Partner Onboarding](integration-partner-onboarding.md) — external integrator go-live path
+- [Audit Findings Summary](audit-findings-summary.md) — public findings template
+- [Protocol Economics & Risk](index.md#protocol-economics--risk) — LP risk, token economics, insurance, oracle attack model, review cadence
 - [Audit Readiness Dashboard](audit-readiness-dashboard.md) — audit tracking
+- [SCF Grant Milestone Tracker](scf-grant-milestone-tracker.md) — issue→deliverable map
+- [Protocol Economics & Risk](index.md#protocol-economics--risk) — LP/governance/token economics
+- [Access Control (narrative)](access-control.md) · [Generated matrix](access-control-matrix.generated.md)
+- [MAINTAINERS.md](../MAINTAINERS.md) — ownership & emergency contacts
 - [Threat Model](threat-model.md) — security assumptions
 - [Mainnet Launch Checklist](mainnet-launch-checklist.md) — launch readiness
 - [CONTRIBUTING.md](../CONTRIBUTING.md) — contributor workflow

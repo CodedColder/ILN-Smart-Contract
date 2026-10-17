@@ -126,3 +126,44 @@ ILN-Smart-Contract/
 | `codeql.yml` | Code security analysis |
 | `e2e-allure.yml` | End-to-end test reporting |
 | `storybook.yml` | Frontend component tests |
+
+## Consolidated Automated-Audit Dashboard (Issue #862)
+
+Single handoff view of every automated check in the formal-verification /
+cross-contract automation category (Issues #54–#58) plus the repo's standing
+security gates. **Status badges are the source of truth** — each one queries
+the live GitHub Actions run on `dev`, not a point-in-time snapshot. Badges
+point at `Invoice-Liquidity-Network/ILN-Smart-Contract` (the upstream repo,
+where PR CI runs; fork-only badge URLs will not resolve until merge).
+
+| Check | What it verifies | Where it lives | Status | Re-run locally |
+|-------|------------------|----------------|--------|----------------|
+| Event coverage (#854/#858) | Every state-mutating entrypoint across all five contracts emits an event or carries a documented exemption; docs/events.md cannot drift | `scripts/check-event-coverage.ts`, `.github/workflows/event-coverage.yml` | ![event coverage](https://img.shields.io/github/actions/workflow/status/Invoice-Liquidity-Network/ILN-Smart-Contract/event-coverage.yml?branch=dev&label=dev) | `make event-coverage` |
+| Rust unit/integration suite | Contract behavior + regression tests (incl. rate-limit, oracle health-gate, multisig, NFT, reputation, TWAP suites) | `contracts/**`, Makefile | local gate | `make test` (per-crate: `make test-invoice`, `test-governance`, `test-insurance`, `test-distribution`) |
+| Lint & panic-path gate | rustfmt + clippy `-D warnings` + no `unwrap()`/`expect()` in non-test contract source (#845) + event coverage | `make lint` | local gate | `make lint` |
+| Dependency audit | Advisories, license compliance, duplicate/forbidden crates | `.github/workflows/cargo-deny.yml` | ![cargo deny](https://img.shields.io/github/actions/workflow/status/Invoice-Liquidity-Network/ILN-Smart-Contract/cargo-deny.yml?branch=dev&label=dev) | `cargo deny check` |
+| CodeQL | Semantic code security analysis | `.github/workflows/codeql.yml` | ![codeql](https://img.shields.io/github/actions/workflow/status/Invoice-Liquidity-Network/ILN-Smart-Contract/codeql.yml?branch=dev&label=dev) | GitHub → Security → Code scanning |
+| Admin signer / CODEOWNERS drift | On-chain admin signer set matches `CODEOWNERS` + mainnet env (daily cron) | `.github/workflows/admin-signer-check.yml` | ![admin signer](https://img.shields.io/github/actions/workflow/status/Invoice-Liquidity-Network/ILN-Smart-Contract/admin-signer-check.yml?branch=dev&label=dev) | `npx tsx scripts/verify-admin-signers.ts` |
+| Env config drift | mainnet/testnet env files have not diverged unintentionally | `.github/workflows/env-config-drift-check.yml` | ![env drift](https://img.shields.io/github/actions/workflow/status/Invoice-Liquidity-Network/ILN-Smart-Contract/env-config-drift-check.yml?branch=dev&label=dev) | `npx tsx scripts/check-env-config-drift.ts` |
+| E2E (Allure) | End-to-end protocol flows against a local network | `.github/workflows/e2e-allure.yml` | ![e2e](https://img.shields.io/github/actions/workflow/status/Invoice-Liquidity-Network/ILN-Smart-Contract/e2e-allure.yml?branch=dev&label=dev) | `make test-e2e` |
+| Storybook | Frontend component tests | `.github/workflows/storybook.yml` | ![storybook](https://img.shields.io/github/actions/workflow/status/Invoice-Liquidity-Network/ILN-Smart-Contract/storybook.yml?branch=dev&label=dev) | `pnpm --filter @iln/storybook test` |
+| Fuzz / property tests | Invariant testing across queue, reputation, TWAP paths | `contracts/fuzz`, Makefile | local gate | `make fuzz` |
+| Code coverage | tarpaulin HTML report for the workspace | Makefile | local gate | `make coverage` |
+| Bump/benchmark regression | Benchmark suite output vs recorded baseline | `scripts/check_benchmark_regression.sh` | local gate | `bash scripts/check_benchmark_regression.sh` |
+
+Issue-to-check traceability for this batch:
+
+- **#54 / #858** — event coverage row (`make event-coverage`).
+- **#55 / #859** — rate-limit matrix covered by the Rust suite rows
+  (`docs/rate-limiting.md`; tests `test_oracle_admin_functions_rate_limited`,
+  `test_update_config_rate_limited`).
+- **#56 / #860** — oracle health-gate regression tests in the Rust suite rows
+  (`test_get_verified_price_rejects_tripped_circuit`,
+  `test_get_verified_price_rejects_stale_health`,
+  `test_get_twap_price_none_when_health_degraded`,
+  `test_contract_stats_skips_stale_price_normalization`).
+- **#58 / #862** — this section.
+
+A point-in-time status snapshot (for offline audit packets) lives in
+[audit-readiness-dashboard.md](./audit-readiness-dashboard.md); this section
+stays authoritative because the badges update themselves.

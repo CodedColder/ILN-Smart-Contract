@@ -32,6 +32,7 @@
 | get_referral_stats | env: Env, code: BytesN<32> | u64 | Access: Anyone |
 | join_fund_queue | env: Env, lp: Address, invoice_id: u64 | Result<(), ContractError> | Access: LP only |
 | resolve_fund_queue | env: Env, invoice_id: u64 | Result<Address, ContractError> | Access: Anyone |
+| get_fund_queue_ttl_margins | env: Env, invoice_id: u64 | FundQueueTtlMargins | Access: Anyone |
 | fund_invoice | env: Env, funder: Address, invoice_id: u64, fund_amount: i128, require_oracle_verification: bool, | Result<(), ContractError> | consulted and the existing behaviour is preserved. |
 | transfer_invoice | env: Env, invoice_id: u64, new_freelancer: Address, | Result<(), ContractError> | Access: Submitter only |
 | transfer_lp_position | env: Env, invoice_id: u64, new_lp: Address, | Result<(), ContractError> | Access: Current LP only |

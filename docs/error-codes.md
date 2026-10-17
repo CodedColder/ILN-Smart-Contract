@@ -49,6 +49,8 @@ Source of truth: [`contracts/invoice_liquidity/src/errors.rs`](../contracts/invo
 | 36 | `InvoiceNftNotFound` | No NFT exists for the requested invoice. | Querying or transferring an NFT that was never minted (or was burned). | Verify the invoice was funded and the NFT was minted before querying. |
 | 37 | `InvoiceNftNotOwned` | The caller is not the current owner of this NFT. | A non-owner attempted to transfer or burn an NFT. | Verify ownership via `invoice_nft_owner` before attempting transfer or burn. |
 | 38 | `AmountTooSmall` | The invoice amount is below the configurable minimum threshold. | The submitted invoice amount is too low to be economically viable. | Increase the invoice amount to meet the minimum required by the contract configuration. |
+| 47 | `QueueFull` | The invoice's fund queue already holds `MAX_FUND_QUEUE_LEN` (50) LPs. | An additional LP tried to `join_fund_queue`. | Wait for the queue to be resolved/recovered, or fund directly if no resolution exists. |
+| 48 | `QueueNotStalled` | `recover_fund_queue` found nothing to recover. | No queue entries, winner not yet resolved, or the recovery grace period has not elapsed. | Retry after `QUEUE_RESOLUTION_TTL_LEDGERS` (or `QUEUE_DELAY_LEDGERS` when the invoice is within 24h of its due date). |
 
 ---
 
@@ -88,8 +90,8 @@ Source of truth: [`contracts/iln_governance/src/lib.rs`](../contracts/iln_govern
 | 5 | `NoVotingPower` | The voter has no governance token balance at the snapshot block. | Voter held no tokens when the proposal was created. | Acquire governance tokens before the proposal's snapshot block. |
 | 6 | `AlreadyVoted` | The address has already voted on this proposal. | Double-vote attempt on the same proposal. | Each address may vote once per proposal. |
 | 7 | `VotingOngoing` | The proposal's voting period is still in progress. | Attempted to finalize or execute a proposal before voting ended. | Wait for the voting period to end. |
-| 8 | `QuorumNotReached` | The proposal did not meet the minimum participation threshold. | Insufficient total votes relative to governance token supply. | Encourage more token holders to vote. |
-| 9 | `ProposalRejected` | The proposal was rejected (more votes against than for). | More weight voted against the proposal. | Revise the proposal and resubmit. |
+| 8 | `QuorumNotReached` | The proposal did not meet the minimum participation threshold. | Insufficient total votes relative to governance token supply. | Retained for ABI stability; no longer returned by `execute_proposal` (Issue #1007). A quorum miss now commits `Rejected` and emits `proposal_rejected` with reason `QuorumNotReached`. |
+| 9 | `ProposalRejected` | The proposal was rejected (more votes against than for). | More weight voted against the proposal. | Retained for ABI stability; no longer returned by `execute_proposal` (Issue #1007). A majority-against result now commits `Rejected` and emits `proposal_rejected` with reason `MajorityAgainst`. |
 | 10 | `AlreadyResolved` | The proposal has already been resolved (passed/rejected/executed/vetoed). | Action on a proposal that is already in a terminal state. | No further action is possible on a resolved proposal. |
 | 11 | `CannotDelegateToSelf` | Delegating to self is not allowed. | `delegate_votes` called with `to == caller`. | Delegate to a different address. |
 | 12 | `DelegationCyclePrevented` | Delegation would create a cycle. | Delegating A → B → A (directly or transitively). | Break the delegation chain before delegating. |

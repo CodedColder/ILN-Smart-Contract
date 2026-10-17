@@ -339,3 +339,22 @@ Implementing TWAP and manipulation-resistant mechanisms is **CRITICAL** for any 
 3. **Ongoing:** Implement monitoring and alerting for price manipulation
 
 By implementing these recommendations, ILN can maintain robust defenses against oracle manipulation attacks while enabling secure price oracle integrations for future protocol features.
+
+## 8. TWAP Migration Plan
+
+### 8.1 Contract Upgrades
+- The new `invoice_liquidity` contract introduces TWAP support built directly into the registry (`oracle_registry.rs`).
+- Upgrade the contract WASM. TWAP will be disabled by default for all feeds (`DataKey::TwapEnabled` defaults to false), ensuring the spot price fallback continues to operate seamlessly post-upgrade.
+
+### 8.2 Observation Accumulation
+- Before enabling TWAP for a feed, `get_twap_price` will not be invoked.
+- However, samples must be recorded *before* enabling TWAP so that `get_twap_price` has data to read.
+- Have a script periodically invoke `record_twap_sample` (or have the indexer/automation do so) for the feed and tokens of interest.
+
+### 8.3 Enabling TWAP
+- Once the buffer of observations is sufficiently populated (i.e. at least `MIN_TWAP_OBSERVATIONS` samples, default 2), an admin can call `set_twap_enabled(env, feed_type, true)`.
+- At that point, `get_twap_aware_price` will read the TWAP. If sufficient observations are not present, it will return an `InsufficientTwapObservations` error.
+- Therefore, DO NOT enable TWAP on a feed until the buffer has been properly warmed up.
+
+### 8.4 Backwards Compatibility
+- The `get_twap_aware_price` will automatically fall back to the spot price `get_verified_price` if `is_twap_enabled` is false. This guarantees backward compatibility during the transition period.

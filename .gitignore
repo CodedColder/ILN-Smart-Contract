@@ -22,5 +22,10 @@ cli/dist/
 # Test coverage
 sdk/coverage/
 cli/coverage/
+notifications/coverage/
+
+# macOS
+.DS_Store
 
 fix.md
+status-site/

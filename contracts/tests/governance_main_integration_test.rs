@@ -22,9 +22,9 @@ use iln_governance::{
     ProposalAction, ProposalStatus,
 };
 use invoice_liquidity::{
-    oracle_interface::ORACLE_INTERFACE_VERSION, oracle_registry::OracleFeedType as IlnOracleFeedType,
-    ContractError, InvoiceLiquidityContract, InvoiceLiquidityContractClient, InvoiceStatus,
-    OracleVerificationResponse, ReferralCode,
+    oracle_interface::ORACLE_INTERFACE_VERSION,
+    oracle_registry::OracleFeedType as IlnOracleFeedType, ContractError, InvoiceLiquidityContract,
+    InvoiceLiquidityContractClient, InvoiceStatus, OracleVerificationResponse, ReferralCode,
 };
 use soroban_sdk::{
     contract, contractimpl,
@@ -160,6 +160,15 @@ fn setup() -> GovIntegrationEnv {
         &admin,
         &GOV_TOTAL_SUPPLY,
     );
+
+    // Issue #805: checkpoint the voter and age it past the holding period
+    // (10 ledgers) so votes below exercise the eligible path. The constant
+    // lives in the governance contract (`MIN_VOTE_HOLD_LEDGERS`); the `+ 1`
+    // keeps the Aged rule (`cp.ledger + 10 <= created_ledger`) satisfied.
+    governance.checkpoint_balance(&voter);
+    let mut ledger = env.ledger().get();
+    ledger.sequence_number += 11;
+    env.ledger().set(ledger);
 
     // Fix ledger timestamp.
     let mut ledger = env.ledger().get();
@@ -383,9 +392,11 @@ fn test_veto_proposal_prevents_execution() {
     // Cast a FOR vote so the proposal would pass if not vetoed.
     t.governance.cast_vote(&t.voter, &proposal_id, &true);
 
-    // Admin vetoes the proposal.
+    // Veto multisig (1-of-1, the admin) vetoes the proposal.
     t.governance
-        .veto_proposal(&proposal_id, &dummy_hash(&t.env));
+        .configure_veto_multisig(&soroban_sdk::vec![&t.env, t.admin.clone()], &1);
+    t.governance
+        .veto_proposal(&t.admin, &proposal_id, &dummy_hash(&t.env));
 
     let p = t.governance.get_proposal(&proposal_id);
     assert_eq!(p.status, ProposalStatus::Vetoed);
@@ -461,9 +472,9 @@ fn test_register_token_oracle_via_governance_takes_effect_in_fund_invoice() {
         &t.payment_token_addr,
         &ReferralCode::None,
     );
-    let fund_before =
-        t.iln
-            .try_fund_invoice(&t.lp, &invoice_before, &INVOICE_AMOUNT, &true);
+    let fund_before = t
+        .iln
+        .try_fund_invoice(&t.lp, &invoice_before, &INVOICE_AMOUNT, &true);
     assert!(
         fund_before.is_ok(),
         "with no oracle registered yet, oracle verification must be a no-op"
@@ -517,9 +528,9 @@ fn test_register_token_oracle_via_governance_takes_effect_in_fund_invoice() {
         &t.payment_token_addr,
         &ReferralCode::None,
     );
-    let rejected =
-        t.iln
-            .try_fund_invoice(&t.lp, &invoice_after, &INVOICE_AMOUNT, &true);
+    let rejected = t
+        .iln
+        .try_fund_invoice(&t.lp, &invoice_after, &INVOICE_AMOUNT, &true);
     assert_eq!(
         rejected,
         Err(Ok(ContractError::PayerUnverified)),

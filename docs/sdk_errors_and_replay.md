@@ -133,3 +133,12 @@ During real-time streaming, network interruptions, indexer restarts, or connecti
 1.  **Gap Detection**: Whenever a new live event is received, the subscriber checks if its ledger sequence is greater than the next expected ledger sequence (`event.ledger > lastProcessedLedger + 1`).
 2.  **Recovery**: If a gap is detected, the subscriber triggers an asynchronous `replay` starting from the missing ledger sequence up to the current event.
 3.  **Deduplication**: A slide-capped cache of processed paging tokens is maintained. Replayed events that have already been processed (or duplicates received from the SSE stream) are automatically ignored.
+
+### New Batch Errors (Distribution, TWAP, Insurance)
+- `DistributionError`: **Terminal**. Indicates a fatal math or rounding error during yield/reward distribution. Do not retry; manual intervention required to balance pools.
+- `TwapStaleOracleError`: **Retryable**. The oracle hasn't been updated recently enough. Retry after the next oracle heartbeat (typically 5-10 minutes).
+- `TwapPriceDeviationError`: **Terminal**. The queried price deviates beyond the maximum allowed spread for the TWAP window.
+- `InsuranceInsufficientPremium`: **Terminal**. The provided premium does not meet the dynamically calculated rate.
+- `InsuranceClaimDenied`: **Terminal**. The automated condition for the claim was not met.
+
+*(Note: These replace several older paths that previously panicked. The SDK now safely decodes these into strongly-typed Error objects).*

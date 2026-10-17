@@ -118,7 +118,7 @@ help:
 	@echo ""
 	@grep -E '^## ' Makefile | sed 's/^## /  /'
 	@echo ""
-.PHONY: help install build build-rust build-sdk test test-rust test-e2e fuzz test-fuzz lint \
+.PHONY: help install build build-rust build-sdk test test-rust test-e2e fuzz test-fuzz test-formal lint \
         fmt fmt-check clippy deploy-testnet seed reset reset-testnet docs spec \
         changelog soroban-optimize health test-insurance test-invoice test-governance test-distribution
 
@@ -187,7 +187,10 @@ fuzz: ## Run the property/fuzz test suite
 test-fuzz: ## Run fuzz tests for the iln_fuzz crate
 	cargo test -p iln_fuzz
 
-lint: fmt-check clippy check-no-unwrap ## Lint everything (rustfmt check + clippy + panic-path gate)
+test-formal: ## Gate on formal counterexamples + proof obligations (#1100, #1101)
+	bash scripts/run-formal-verification.sh
+
+lint: fmt-check clippy check-no-unwrap event-coverage ## Lint everything (rustfmt check + clippy + panic-path gate + event coverage)
 
 fmt: ## Format all Rust code in place
 	cargo fmt --all
@@ -200,6 +203,10 @@ clippy: ## Run clippy with warnings denied
 
 check-no-unwrap: ## Gate: fail if unwrap()/expect() appears in non-test contract source (#845)
 	bash scripts/check-no-unwrap-in-contract-source.sh
+
+event-coverage: ## Gate: every state-mutating entrypoint emits an event or is an approved exemption (#858)
+	npx --no-install tsx --test scripts/check-event-coverage.test.ts
+	npx --no-install tsx scripts/check-event-coverage.ts --check
 
 deploy-testnet: ## Deploy all contracts to Stellar testnet
 	bash scripts/deploy-testnet.sh

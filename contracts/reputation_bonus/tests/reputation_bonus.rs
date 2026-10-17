@@ -144,10 +144,7 @@ fn test_governance_setters_and_access_control() {
 
     assert_eq!(events.events().len(), expected.len());
     for (idx, expected_event) in expected.iter().enumerate() {
-        let event = events
-            .events()
-            .get(idx)
-            .expect("expected event to exist");
+        let event = events.events().get(idx).expect("expected event to exist");
         assert!(format!("{event:?}").contains(&expected_event.param_name.to_string()));
     }
 
@@ -161,6 +158,43 @@ fn test_governance_setters_and_access_control() {
 
     let invalid_min_rate_res = client.try_update_config(&admin, &90, &300, &0);
     assert!(invalid_min_rate_res.is_err()); // Min rate > 0
+
+    let invalid_threshold_res = client.try_update_config(&admin, &101, &300, &150);
+    assert!(invalid_threshold_res.is_err()); // High rep threshold > 100
+}
+
+#[test]
+fn test_config_bounds_high_rep_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, ReputationBonusContract);
+    let client = ReputationBonusContractClient::new(&env, &contract_id);
+
+    client.init(&admin);
+
+    let valid_config = Config {
+        high_rep_threshold: 100,
+        bonus_bps: 200,
+        min_discount_rate_bps: 100,
+    };
+    assert!(client.try_set_config(&valid_config).is_ok());
+
+    let invalid_config_too_high = Config {
+        high_rep_threshold: 101,
+        bonus_bps: 200,
+        min_discount_rate_bps: 100,
+    };
+    assert!(client.try_set_config(&invalid_config_too_high).is_err());
+
+    let valid_config_zero = Config {
+        high_rep_threshold: 0,
+        bonus_bps: 200,
+        min_discount_rate_bps: 100,
+    };
+    assert!(client.try_set_config(&valid_config_zero).is_ok());
 }
 
 #[test]
