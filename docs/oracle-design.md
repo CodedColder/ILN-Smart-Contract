@@ -6,6 +6,12 @@ The Invoice Liquidity Network (ILN) supports an optional off-chain payer verific
 
 The oracle is entirely optional. When no oracle address is registered, all payer-verification checks pass (fail-open). This preserves backwards compatibility and lets the system operate without an oracle in development or permissive deployments.
 
+**Once an oracle *is* configured for a `(feed type, token)`, the gate is
+fail-closed** (Issue #1056): a payer funds only on a positive, fresh
+verification, and every way of failing to verify rejects funding rather than
+falling through to the fail-open default. The only exception is the
+truly-unconfigured case above. See [Fail-Closed Semantics](#fail-closed-semantics-issue-1056) below for the exact disposition.
+
 ---
 
 ## Oracle Data Format
@@ -44,17 +50,68 @@ This design keeps the oracle stateless from ILN's perspective and avoids the com
 
 ## Failure Modes
 
-| Scenario | ILN Behaviour |
+| Scenario | ILN Behaviour (fail-closed) |
 |---|---|
-| No oracle registered | Permissive — verification always passes |
-| Oracle reports `verified = false` | Check fails; payer cannot proceed |
-| Oracle data is stale (age > 7 days) | Treated as unverified; check fails |
-| Oracle re-serves an older timestamp than it last reported (Issue #1052) | Rejected with `OracleTimestampRegression`; funding fails |
-| Oracle served 3 consecutive stale responses (circuit breaker) | The feed + token's circuit breaker trips; `fund_invoice` stops resolving that oracle until it is cleared — by the admin `reset_oracle_circuit` fast path, or automatically (Issue #1048) once the *tripping* oracle serves 3 fresh, advancing observations over ≥120 ledgers |
-| Identity feeders disagree — fewer than the quorum agree (Issue #1047) | Treated as unverified (`PayerUnverified`); an `oracle_feeder_disagreement` event is emitted |
+| No oracle configured for the `(feed type, token)` | Permissive — verification always passes. **The only fail-open path** (Issue #1056) |
+| Oracle reports `is_verified = false` | Funding fails with `PayerUnverified` |
+| Oracle data is stale — age `>= max_oracle_age_ledgers` (default 17 280 ledgers ≈ 24h); a **future-dated** timestamp also counts as stale | Funding fails with `OracleDataStale` (Issue #93 / #1050) |
+| Oracle re-serves an older timestamp than it last reported (Issue #1052) | Funding fails with `OracleTimestampRegression` |
+| Oracle re-serves an identical timestamp more than `MAX_CONSECUTIVE_DUPLICATE_UPDATES` (3) times in a row (Issue #1053) | Funding fails with `OracleDuplicateUpdate` |
+| Oracle served 3 consecutive stale responses (circuit breaker) | The feed + token's circuit breaker trips; `fund_invoice` stops resolving that oracle (`OracleCircuitOpen`) until it is cleared — by the admin `reset_oracle_circuit` fast path, or automatically (Issue #1048) once the *tripping* oracle serves 3 fresh, advancing observations over ≥120 ledgers |
+| Identity feeders disagree — fewer than the quorum agree (Issue #1047) | Funding fails with `PayerUnverified`; an `oracle_feeder_disagreement` event is emitted |
 | One Identity feeder reverts / is stale out of several (Issue #1047) | That feeder contributes no agreement; the other feeders can still meet the quorum |
-| Oracle contract panics / traps | Treated as unverified (caller catches trap) |
-| Oracle contract address is wrong / undeployed | Cross-contract call panics; ILN treats as unverified |
+| Oracle contract panics / traps (single-oracle path) | The cross-contract call traps and the whole funding invocation reverts — it is never treated as "verified" |
+| Oracle contract address is wrong / undeployed | Cross-contract call panics; funding reverts |
+
+When several conditions hold at once the gate reports the **first** match, in a
+fixed order: `OracleCircuitOpen` → `OracleTimestampRegression` →
+`OracleDuplicateUpdate` → `OracleDataStale` → `PayerUnverified`.
+
+---
+
+## Fail-Closed Semantics (Issue #1056)
+
+The individual defences above share one disposition, made explicit here: **on
+any configured `(feed type, token)`, funding is fail-closed.** A payer funds
+only when the gate positively verifies them with fresh data; every other outcome
+rejects the funding call. The sole fail-open path is the genuinely unconfigured
+case (no per-token override, no feed-type default, no legacy `price_oracle`),
+which is preserved for backwards compatibility.
+
+The whole decision is one shared helper,
+`oracle_registry::evaluate_identity_verification`, called by both `fund_invoice`
+(which maps each outcome to a `ContractError`) and the permissionless
+`check_oracle_verification` diagnostic (which returns the outcome). The mapping
+is exact and its precedence is fixed by the helper:
+
+| `IdentityVerificationOutcome` | `fund_invoice` result | Meaning |
+|---|---|---|
+| `Verified` | funds (`Ok`) | verified with fresh data — or nothing is configured (fail-open) |
+| `Stale` | `Err(OracleDataStale)` | data aged out (or is future-dated) |
+| `QuorumDisagreement` | `Err(PayerUnverified)` | fewer than the quorum of feeders agreed |
+| `TimestampRegression` | `Err(OracleTimestampRegression)` | same oracle re-served an older timestamp |
+| `DuplicateUpdate` | `Err(OracleDuplicateUpdate)` | identical timestamp past the duplicate cap |
+| `CircuitOpen` | `Err(OracleCircuitOpen)` | every candidate oracle is breaker-tripped |
+| `Unverified` | `Err(PayerUnverified)` | the oracle reports the payer is not verified |
+
+Two properties follow and are pinned by the `test_1056_*` suite in
+`tests_oracle_registry.rs`:
+
+- **Rejection is atomic.** A rejected `fund_invoice` returns `Err`, so Soroban
+  rolls back everything it wrote — the invoice stays `Pending` and the health
+  snapshot the gate recorded is discarded. This is exactly why observing a
+  *rejection* requires the never-erroring `check_oracle_verification` diagnostic
+  ([Failure Observability](#failure-observability-stale-and-quorum-failure-events-issue-1049)).
+- **Verification is a precondition, not an authorization.** Oracle state never
+  substitutes for the funder's `require_auth`: with authorizations stripped,
+  `fund_invoice` still fails regardless of oracle configuration.
+
+No code path changed for this issue — the semantics above were already enforced
+by the #1046–#1055 work; #1056 states them, corrects the audit evidence pointer
+(the cited `lib.rs:3832-3847` is the dispute-resolution refund block, not oracle
+logic — the real path is `fund_invoice`'s `require_oracle_verification` block,
+`lib.rs:2656-2711`), and adds the regression suite. See
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#19-document-fail-closed-oracle-behavior-issue-1056).
 
 ---
 
@@ -77,6 +134,8 @@ Oracle operators **must** refresh verification records at least every 7 days to 
 > **Note (monotonicity, Issue #1052).** The freshness gate bounds *how old* a response may be but not its *direction*, so — before #1052 — an oracle could re-serve a response it had already served (replayed data, or a rolled-back clock) and still pass while inside the window. `fund_invoice` now also rejects a `data_timestamp` **strictly older** than the last timestamp recorded for the **same** oracle on that `(feed type, token)` with `ContractError::OracleTimestampRegression`. The baseline is the per-`(feed type, token)` `OracleHealthStatus.last_data_timestamp` maintained by `record_oracle_health`, read *before* the snapshot is overwritten. Equal timestamps are allowed (the rule is non-decreasing), a first read with no snapshot is allowed, and a *different* oracle's timeline is never compared (so a failover oracle isn't a false positive). Combined with the #1050 rule, an accepted response must lie in `[last_recorded, current_ledger]`.
 >
 > **Note (duplicate update frequency, Issue #1053).** #1052's non-decreasing rule allows an *equal* timestamp, which left the opposite hole: an oracle that simply **stands still** re-serves an identical `timestamp` on every read, stays inside the freshness window, and keeps resetting the consecutive-stale streak — so a stalled/compromised oracle could keep funding open indefinitely at no cost. `fund_invoice` now also rejects a same-oracle response repeating an identical `data_timestamp` more than `MAX_CONSECUTIVE_DUPLICATE_UPDATES` (3) times in a row with `ContractError::OracleDuplicateUpdate`. The streak is `OracleHealthStatus.consecutive_duplicate_count`, maintained by `record_oracle_health` (read *before* it is overwritten), reset to `0` by any advance or oracle failover, and mirrored on the `oracle_health_recorded` event. Duplicates up to the cap are still accepted, and a rejected funding call rolls its write back so the gate does not advance by retrying — it re-opens only when the oracle actually advances (or governance changes the resolved oracle).
+>
+> **Note (compromised-feeder coverage, Issue #1054).** The notes above describe the individual rules; Issue #1054 adds the adversarial suite that frames their shared adversary — a feeder that is still an *authorized* registry entry but whose `get_payer_data` payload is attacker-controlled. `tests_oracle_registry.rs`'s `test_1054_*` set proves, end to end, that a lone rogue cannot reach the quorum (`PayerUnverified` / `QuorumDisagreement`), a silent or reverting feeder cannot jam an honest quorum, and a stale-replay / future-dated / regressed / frozen payload is rejected by the freshness, monotonicity and duplicate rules respectively. Two operational properties are pinned there explicitly: a rejected `fund_invoice` cannot advance the circuit breaker (its writes roll back), so containment is only *committed* via the permissionless `check_oracle_verification` keeper path; and a compromised **majority** of feeders genuinely satisfies the quorum, so it is not distinguishable on chain from honest agreement — that case is a governance `remove_identity_oracle` action, not something any on-chain rule can catch. The cost of each rejection branch is recorded by `benchmark_compromised_feeder_rejection_paths`.
 
 ---
 
@@ -227,11 +286,53 @@ for the operator view and
 [`benchmarks.md`](benchmarks.md#verification-diagnostic-events-cost-issue-1049)
 for the measured per-call cost.
 
+## Health and Quorum Exposure (Issue #1055)
+
+The registry's *configuration* and *health* state was readable only by fanning
+out across five entry points — `get_oracle_health`,
+`is_oracle_circuit_tripped`, `get_circuit_recovery_state`,
+`get_identity_oracles`, `get_identity_quorum` — and the **live health of the
+multi-oracle Identity quorum (#1047) had no reader at all**. The quorum path
+deliberately does not write the single-oracle `OracleHealth` key (it models *N*
+oracles per feed + token, not one), so `get_oracle_health` returns `None` forever
+once a feeder list is registered. A `/health` page therefore could not see
+whether gating was healthy — the exact action item recorded in
+[`game-day-exercise-execution.md`](game-day-exercise-execution.md).
+
+#1055 adds two additive, **permissionless**, read-only views:
+
+- `get_oracle_status(feed_type, token)` (Anyone) → `OracleStatusView`: the
+  resolved oracle, the last recorded `OracleHealthStatus`, the breaker flag, the
+  half-open `CircuitRecoveryState` (#1048), the Identity feeder list + threshold,
+  and the price sources — composed from **local storage reads only** (no
+  cross-contract calls, no writes), so it is cheap and safe to poll at high
+  frequency, including while the contract is paused.
+- `check_identity_quorum_health(feed_type, token, payer)` (Anyone) →
+  `IdentityQuorumHealth`: one `FeederHealth` observation per registered feeder
+  (`Verified` / `Unverified` / `Stale` / `Unreachable`), the `verified_count`, the
+  `required_quorum`, and the resulting `quorum_met` verdict. This necessarily
+  queries the feeders, and its fan-out is bounded by
+  `MAX_IDENTITY_ORACLES_PER_FEED` (20).
+
+Both views classify a feeder through the **single** shared predicate
+`oracle_registry::classify_identity_feeder`, which the funding gate's
+`check_identity_quorum` also calls, so the diagnostic can never disagree with the
+gate about *why* a feeder did or didn't count. A feeder that reverts/traps/
+returns an undecodable payload degrades to `FeederHealth::Unreachable` ("no
+opinion") via the non-panicking `try_invoke_contract` rather than aborting the
+probe. The change is purely additive: two new entry points and two new
+`#[contracttype]` views, no new storage key, no change to any existing key/value
+encoding, error code, or TTL constant. See
+[`oracle-integration.md`](oracle-integration.md#exposing-health-and-quorum-issue-1055)
+for the operator view and
+[`benchmarks.md`](benchmarks.md#oracle-health--quorum-exposure-cost-issue-1055)
+for the measured cost.
+
 ## Security Considerations
 
 - The oracle is a **read-only dependency** — it cannot initiate token transfers or modify ILN state.
 - The admin key that controls `set_price_oracle` is a single point of control. A compromised admin can register a malicious oracle. Governance timelock on oracle registration changes is recommended.
-- Fail-open behaviour (no oracle → all pass) is appropriate for the MVP. High-security deployments should consider fail-closed defaults.
+- Fail-open behaviour applies **only** when nothing is configured (no oracle → all pass), which preserves backwards compatibility for deployments that run without an oracle. Once **any** oracle is registered for a feed + token the gate is fail-closed (Issue #1056) — every failure to positively verify rejects funding — so the "fail-open" default is not a live risk for a configured feed, only for a deliberately oracle-free deployment.
 - Oracle address changes take effect immediately. There is no delay between registering a new oracle and it being used for checks. Consider adding a timelock.
 - The per-feed price-source list is **capped** (`MAX_PRICE_SOURCES_PER_FEED`, Issue #1064) so that neither a single `get_verified_price` read's CPU/storage cost nor its `PriceOutlierRejected` event fan-out (one per deviating source) can be grown without bound — a feed that grew large enough to exceed Soroban's per-invocation resource limit would otherwise fail the price path for every token on that feed. The cap is a defensive bound on unbounded series, not a limit on any realistic quorum.
 - The per-feed Identity-feeder list is likewise **capped** (`MAX_IDENTITY_ORACLES_PER_FEED`, Issue #1047) for the same reason — the funding path makes one cross-contract call per feeder, so the cap bounds the worst-case `fund_invoice` cost, and it also bounds the `oracle_feeder_disagreement` payload's `total_oracles` field. As with price sources, this is a defensive bound, not a limit on a realistic quorum.

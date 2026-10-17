@@ -185,7 +185,7 @@ First 15 min: Snapshot state, contain, assign workstreams.
 | # | Action | Owner | Priority | Due Date | Issue # |
 |---|--------|-------|----------|----------|---------|
 | 1 | Investigate indexer lag recovery variance (12 min vs. baseline 8 min) | Infrastructure lead | P1 | 2026-10-03 | TBD |
-| 2 | Add oracle state visibility to `/health` endpoint | Infrastructure lead | P2 | 2026-10-10 | TBD |
+| 2 | Add oracle state visibility to `/health` endpoint | Infrastructure lead | P2 | 2026-10-10 | #1055 — on-chain support landed: `get_oracle_status` (one-call config + health aggregate) and `check_identity_quorum_health` (live per-feeder health + `quorum_met`); the `/health` handler still needs to consume them |
 | 3 | Add pre-unpause verification checklist to incident response runbook | Release lead | P2 | 2026-10-10 | TBD |
 | 4 | Update vulnerability report template to require JSON structure (version, path, reproduction steps) | Security lead | P2 | 2026-10-10 | TBD |
 

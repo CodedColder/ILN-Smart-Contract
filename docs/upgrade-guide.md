@@ -1053,6 +1053,128 @@ Operator rollout steps:
 the `oracle_stale_data_rejected` event; no data migration is needed (nothing new
 is persisted). Funding behavior is identical on both builds.
 
+## Compromised-Feeder Adversarial Coverage (Issue #1054)
+
+This change is **test- and documentation-only** — it does **not** modify
+`invoice_liquidity` (or any contract) at all, so there is nothing to upgrade and
+nothing to migrate:
+
+- **No contract, ABI, storage, or error-code change.** The issue adds a focused
+  adversarial suite (`test_1054_*` in `tests_oracle_registry.rs`) and a cost
+  benchmark (`benchmark_compromised_feeder_rejection_paths` in
+  `tests_benchmarks.rs`), both exercising existing entry points. A plain
+  `upgrade()` of an already-deployed contract is unaffected; no storage version
+  bump, no new key, no redeploy of oracles.
+- **Why it still matters operationally.** The suite pins, as executable
+  assertions, two properties operators must rely on: (a) a compromised feeder is
+  only *contained* (breaker tripped) when a keeper is calling the permissionless
+  `check_oracle_verification` — a rejected `fund_invoice` rolls its writes back
+  and cannot advance the breaker; and (b) a compromised **majority** of Identity
+  feeders genuinely satisfies the quorum and cannot be stopped on chain, so it
+  remains a governance `remove_identity_oracle` action. Neither is a migration
+  item, but both belong in the operator runbook.
+
+**No rollout steps and no rollback caveat** — nothing is deployed or persisted.
+See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#17-test-compromised-feeder-data-issue-1054)
+and [`oracle-design.md`](oracle-design.md) for the before/after detail.
+
+## Oracle Health & Quorum Views (Issue #1055)
+
+This change adds two **additive, permissionless, read-only** oracle views — it
+does **not** change any existing behaviour, so there is nothing to migrate:
+
+- **No behaviour, storage, or error-code change.** `get_oracle_status(feed_type,
+  token)` (aggregate of recorded configuration + health) and
+  `check_identity_quorum_health(feed_type, token, payer)` (live per-feeder health
+  + quorum verdict) are new entry points returning new `#[contracttype]` views
+  (`OracleStatusView`, `IdentityQuorumHealth`). No existing key, value encoding,
+  error code, or TTL constant changes, so **no storage migration is required** and
+  a plain `upgrade()` of an already-deployed contract is unaffected. The only
+  touch to a live path is extracting the quorum loop's per-feeder check into the
+  shared `oracle_registry::classify_identity_feeder`, which yields the identical
+  count.
+- **Why it matters operationally.** Operators gain a one-call `/health` probe
+  (`get_oracle_status`) that previously required fanning out across five entry
+  points, and — the part with no prior reader at all — a live view of the
+  multi-oracle Identity quorum (`check_identity_quorum_health`). Add both to the
+  post-upgrade monitoring pass: alert on `circuit_tripped`, a stale `health`, or a
+  non-empty feeder list with `quorum_met = false`. Both views are read-only and
+  need no authorization, and `get_oracle_status` makes no cross-contract calls, so
+  neither is affected by pausing.
+
+**No rollout steps and no rollback caveat** — nothing is deployed or persisted.
+See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#18-expose-oracle-health-and-quorum-issue-1055),
+[`oracle-integration.md`](oracle-integration.md#exposing-health-and-quorum-issue-1055)
+and [`benchmarks.md`](benchmarks.md#oracle-health--quorum-exposure-cost-issue-1055)
+for the before/after detail.
+
+---
+
+## Documented Fail-Closed Oracle Behavior (Issue #1056)
+
+This change **documents** the oracle gate's disposition and adds regression
+tests — it does **not** change any code path, so there is nothing to migrate:
+
+- **No behaviour, storage, or error-code change.** The gate's fail-closed
+  semantics (a payer funds only on a positive, fresh verification once any
+  oracle is configured; the sole fail-open path is the unconfigured feed) and
+  the exact outcome-to-error mapping (`Stale → OracleDataStale`,
+  `QuorumDisagreement`/`Unverified → PayerUnverified`,
+  `TimestampRegression`, `DuplicateUpdate`, `CircuitOpen`, in the fixed
+  precedence documented in [`oracle-design.md`](oracle-design.md#fail-closed-semantics-issue-1056))
+  were already enforced by the #1046–#1055 work. No storage key, value encoding,
+  error code, event, entry-point signature, or TTL constant is touched, so
+  **no storage migration is required** and a plain `upgrade()` of an
+  already-deployed contract is unaffected.
+- **Corrected evidence pointer for reviewers.** The issue's audit evidence cites
+  `lib.rs:3832-3847`; those lines are the dispute-resolution ("Upheld") refund
+  block, not oracle logic. The real fail-closed path is `fund_invoice`'s
+  `require_oracle_verification` block (`lib.rs:2656-2711`), delegating to
+  `oracle_registry::evaluate_identity_verification`. No action follows from the
+  citation beyond the corrected reference.
+- **New regression suite.** `tests_oracle_registry.rs`'s `test_1056_*` (9 cases)
+  pins the documented contract: success, the fail-open exception, unverified,
+  quorum disagreement, the exact staleness ledger boundary, frozen/duplicate
+  rejection, rejection atomicity, gate/diagnostic agreement, and the fact that
+  oracle verification never bypasses the funder's authorization.
+
+**No rollout steps and no rollback caveat** — nothing is deployed or persisted.
+See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#19-document-fail-closed-oracle-behavior-issue-1056)
+and [`threat-model.md`](threat-model.md) for the before/after detail.
+
+## Worst-Case Queue Insertion Benchmark (Issue #1057)
+
+This change **benchmarks and regression-tests** `join_fund_queue` at the queue
+bound (`MAX_FUND_QUEUE_LEN` = 50) — it does **not** change any code path, so
+there is nothing to migrate:
+
+- **No behaviour, storage, or error-code change.** Admission still follows the
+  #1095/#1091 rule: at the bound, a joiner that strictly outscores the tail is
+  admitted (displacing the tail and emitting `fund_queue_displaced`), and a
+  joiner at or below the tail score is rejected with `QueueFull`. The
+  `FundQueueOpenedAt` MEV marker (#MEV-1) is still written on the first join
+  only (`try_set_fund_queue_opened_at`), so a displacing re-join never resets
+  the resolution maturity gate. No storage key, value encoding, error code,
+  event, entry-point signature, or TTL constant is touched, so **no storage
+  migration is required** and a plain `upgrade()` of an already-deployed
+  contract is unaffected.
+- **New benchmark.** `tests_benchmarks.rs`'s `benchmark_worst_case_queue_insertion`
+  sweeps admission positions (head index 0, middle index 25, tail index 49) plus
+  the `QueueFull` rejection branch at the bound, replacing #1062's single
+  equal-score point (which always forced index 0 and could not show where the
+  worst case is). Finding: rows are near-flat — cost is dominated by the
+  serialized entry size at the bound, not the insertion index; the head insert
+  is marginally the worst *admitted* case.
+- **New regression suite.** `tests_storage.rs`'s `test_1057_*` (6 cases) pins
+  head displacement, middle placement, the tail+1 admission boundary, exact-tail
+  rejection (queue unchanged), stripped-authorization rejection, and
+  `FundQueueOpenedAt` non-reset on a displacing re-join.
+
+**No rollout steps and no rollback caveat** — nothing is deployed or persisted.
+See [`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#20-benchmark-worst-case-queue-insertion-issue-1057)
+and [`benchmarks.md`](benchmarks.md) (§ Worst-case queue insertion) for the
+before/after detail and the run command.
+
 ---
 
 **Document Prepared By:** DevOps & Security Team  

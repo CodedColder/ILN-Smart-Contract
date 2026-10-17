@@ -663,6 +663,28 @@ pub fn set_max_oracle_age(env: Env, max_age_ledgers: u64) -> Result<(), Contract
         oracle_registry::check_oracle_verification(env, feed_type, token, payer)
     }
 
+    /// Issue #1055: the whole recorded oracle configuration + health state for
+    /// `feed_type` + `token` in a single call — the resolved oracle, the last
+    /// health snapshot, the circuit-breaker flag, in-progress recovery, the
+    /// registered Identity quorum + threshold, and the registered price
+    /// sources. This is the one call an off-chain `/health` probe should use to
+    /// answer "is this feed's oracle gating healthy?".
+    ///
+    /// Cheap by construction: it makes **no** cross-contract calls and writes
+    /// nothing — every field is a local read of already-recorded state — so it
+    /// is safe to poll frequently and while the contract is paused. For the
+    /// *live* per-feeder health of a multi-oracle Identity quorum (which the
+    /// single-oracle health snapshot never records), use
+    /// `check_identity_quorum_health`.
+    /// Access: Anyone
+    pub fn get_oracle_status(
+        env: Env,
+        feed_type: OracleFeedType,
+        token: Address,
+    ) -> oracle_registry::OracleStatusView {
+        oracle_registry::get_oracle_status(env, feed_type, token)
+    }
+
     /// Whether the oracle circuit breaker for `feed_type` + `token` is
     /// currently tripped (from `MAX_CONSECUTIVE_STALE_QUERIES` consecutive
     /// stale responses) and therefore excluded from `fund_invoice`'s
@@ -800,6 +822,33 @@ pub fn set_max_oracle_age(env: Env, max_age_ledgers: u64) -> Result<(), Contract
     /// Access: Anyone
     pub fn get_identity_quorum(env: Env) -> u32 {
         oracle_registry::get_identity_quorum(env)
+    }
+
+    /// Issue #1055: the *live* health of the registered Identity quorum for
+    /// `feed_type` + `token` — one `FeederHealth` observation per registered
+    /// feeder (index-aligned with `feeders`), the count that agreed, the
+    /// configured threshold, and whether the quorum is currently met.
+    ///
+    /// This fills the observability gap the single-oracle health snapshot
+    /// leaves: the quorum path never writes `OracleHealth`, so `get_oracle_health`
+    /// (and `get_oracle_status`) report `None` in quorum mode no matter how
+    /// often verification runs. Here each feeder is probed and reported as
+    /// `Verified` / `Unverified` / `Stale` / `Unreachable`, using the **same**
+    /// predicate the funding gate applies, so a silently degraded feeder is
+    /// visible before it makes funding fail closed.
+    ///
+    /// Permissionless and never-erroring — an unreachable feeder is reported,
+    /// not propagated. Writes and emits nothing; the fan-out is bounded by
+    /// `MAX_IDENTITY_ORACLES_PER_FEED`. When no feeder is registered the list
+    /// is empty and `quorum_met` is `false` (the single-oracle chain governs).
+    /// Access: Anyone
+    pub fn check_identity_quorum_health(
+        env: Env,
+        feed_type: OracleFeedType,
+        token: Address,
+        payer: Address,
+    ) -> oracle_registry::IdentityQuorumHealth {
+        oracle_registry::check_identity_quorum_health(env, feed_type, token, payer)
     }
 
     /// Query every registered price source for `feed_type` + `token` and

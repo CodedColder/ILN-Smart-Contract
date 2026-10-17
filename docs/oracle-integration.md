@@ -280,6 +280,76 @@ and on `oracle_stale_data_rejected` / `oracle_feeder_disagreement` events.
 
 ---
 
+## Exposing Health and Quorum (Issue #1055)
+
+Answering "is oracle gating for this feed + token healthy?" used to require an
+off-chain probe to know and fan out across five separate read entry points —
+`get_oracle_health`, `is_oracle_circuit_tripped`, `get_circuit_recovery_state`,
+`get_identity_oracles`, `get_identity_quorum`. Worse, under the #1047 multi-oracle
+Identity quorum the *live* health had no reader at all: `check_identity_quorum`
+never writes the single-oracle `OracleHealth` key, so `get_oracle_health` returns
+`None` forever once a quorum list is registered.
+
+Since #1055 that state is exposed through two **permissionless** views:
+
+```typescript
+// One-call aggregate of *recorded* state. No cross-contract calls, no writes —
+// cheap enough for a high-frequency /health probe and safe while paused.
+const status = await ilnClient.get_oracle_status({ feed_type: "Identity", token });
+// status.resolved_oracle  — the oracle the priority chain resolves to (or null)
+// status.health           — last recorded OracleHealthStatus (or null; see caveat)
+// status.circuit_tripped  — is the breaker open for this feed + token?
+// status.recovery         — in-progress half-open recovery, or null (Issue #1048)
+// status.identity_oracles — registered Identity quorum feeders, in order
+// status.identity_quorum  — the N of the N-of-M threshold (protocol-wide)
+// status.price_sources    — registered price sources for Price feeds
+
+// Live per-feeder health + the resulting quorum verdict, for one payer. This
+// *does* query the feeders (bounded by MAX_IDENTITY_ORACLES_PER_FEED = 20).
+const q = await ilnClient.check_identity_quorum_health({
+  feed_type: "Identity",
+  token,
+  payer,
+});
+// q.feeders            — registered feeders, in order (empty ⇒ single-oracle chain governs)
+// q.observations       — one FeederHealth per feeder, index-aligned:
+//                          "Verified"    — fresh AND is_verified (counts toward quorum)
+//                          "Unverified"  — fresh, but is_verified = false (disagrees)
+//                          "Stale"       — responded but stale/future-dated
+//                          "Unreachable" — reverted/trapped/undecodable ("no opinion")
+// q.verified_count     — feeders that agreed
+// q.required_quorum    — the N of N-of-M
+// q.quorum_met         — verified_count >= required_quorum (false when no quorum is in use)
+```
+
+`check_identity_quorum_health` classifies each feeder through the **same**
+predicate the funding gate uses (`oracle_registry::classify_identity_feeder`), so
+it can never disagree with `fund_invoice` about *why* a feeder did or didn't
+count; a reverting feeder degrades to `Unreachable` rather than aborting the
+probe. Use `get_oracle_status` as the cheap periodic `/health` probe and
+`check_identity_quorum_health` when you need to know *which* feeder is holding a
+quorum back — both are read-only (no `require_auth`, no write side effects) and
+therefore safe to call from any monitoring role.
+
+### Before / after
+
+| | Before #1055 | After #1055 |
+|---|---|---|
+| Configuration + health read | five separate entry points to know and call | one aggregate `get_oracle_status(feed_type, token)` → `OracleStatusView` |
+| Live quorum health | **no reader** — `OracleHealth` is never written in quorum mode, so `get_oracle_health` is permanently `None` | `check_identity_quorum_health(feed_type, token, payer)` → `IdentityQuorumHealth` with a per-feeder `FeederHealth` + `quorum_met` |
+| Gate / diagnostic agreement | n/a | both share `classify_identity_feeder`, so they cannot disagree |
+| Cross-contract calls / writes | n/a | `get_oracle_status`: none (local reads only); `check_identity_quorum_health`: live fan-out, bounded by `MAX_IDENTITY_ORACLES_PER_FEED` |
+| Authorization | n/a | both permissionless, mirroring `check_oracle_health`; no write side effect |
+
+For a `/health` endpoint, poll `get_oracle_status` per (feed, token) and alert on
+`circuit_tripped` or a stale `health`; where an Identity quorum is configured,
+additionally poll `check_identity_quorum_health` and alert whenever `quorum_met`
+is `false` while the feeder list is non-empty. See
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#18-expose-oracle-health-and-quorum-issue-1055)
+and [`benchmarks.md`](benchmarks.md) for the before/after and cost.
+
+---
+
 ## Staleness Policy
 
 `fund_invoice`'s `require_oracle_verification` path (the live enforcement point) checks freshness against `max_oracle_age_ledgers`, a per-protocol setting in **ledgers**, not seconds — default `DEFAULT_MAX_ORACLE_AGE_LEDGERS` = 17 280 ledgers, ≈ **24 hours** at 5 seconds/ledger. It's read/set via `get_max_oracle_age()` / `set_max_oracle_age()` (admin-gated, rate-limited to one call per ~10 minutes). Oracle operators must refresh records more often than this window to keep payers passing verification.
@@ -339,14 +409,35 @@ stay within the enforced staleness window — see [Staleness Policy](#staleness-
 
 ## Failure Handling
 
+**Once any oracle is configured for a feed + token, funding is fail-closed**
+(Issue #1056): a payer funds only on a positive, fresh verification, and every
+other outcome rejects the call. The only fail-open path is the unconfigured case.
+The gate reports the first matching condition in the order
+`OracleCircuitOpen` → `OracleTimestampRegression` → `OracleDuplicateUpdate` →
+`OracleDataStale` → `PayerUnverified`.
+
 | Situation | ILN Response |
 |---|---|
-| No oracle registered | All payers pass (fail-open) |
-| Oracle returns `verified = false` | Payer check fails |
-| Oracle timestamp > 7 days old | Treated as unverified |
-| Oracle contract panics | Treated as unverified |
-| Identity feeders disagree (fewer than the quorum agree) | Treated as unverified (`PayerUnverified`); an `oracle_feeder_disagreement` event is emitted (Issue #1047) |
-| A single Identity feeder reverts / is stale | It contributes no agreement; the remaining feeders still satisfy the quorum (Issue #1047) |
+| No oracle configured for the feed + token | All payers pass (fail-open). The **only** fail-open path |
+| Oracle returns `is_verified = false` | Funding fails with `PayerUnverified` |
+| Oracle data is stale — age `>= max_oracle_age_ledgers` (default 17 280 ledgers ≈ 24h, **not** 7 days), or the timestamp is future-dated | Funding fails with `OracleDataStale` (Issue #1050) |
+| Oracle re-serves an older timestamp than it last reported | Funding fails with `OracleTimestampRegression` (Issue #1052) |
+| Oracle re-serves an identical timestamp past the duplicate cap (3) | Funding fails with `OracleDuplicateUpdate` (Issue #1053) |
+| Oracle served 3 consecutive stale responses | The circuit breaker trips; funding fails with `OracleCircuitOpen` until recovery (Issue #1048) |
+| Oracle contract panics / traps | The cross-contract call traps and the funding invocation reverts (fail-closed) |
+| Identity feeders disagree (fewer than the quorum agree) | Funding fails with `PayerUnverified`; an `oracle_feeder_disagreement` event is emitted (Issue #1047) |
+| A single Identity feeder reverts / is stale | It contributes no agreement ("no opinion"); the remaining feeders can still satisfy the quorum (Issue #1047) |
+
+A rejected `fund_invoice` returns `Err`, so everything it wrote is rolled back —
+the invoice stays `Pending` and no health snapshot is persisted. To *observe* a
+rejection (and its reason) you must use the permissionless
+`check_oracle_verification` diagnostic, which runs the identical gate but
+returns the outcome so its events commit — see
+[Observing Gate Failures](#observing-gate-failures-issue-1049). Oracle state is
+also never a substitute for the funder's authorization: `fund_invoice` still
+requires the funder's `require_auth` regardless of oracle configuration. See
+[`oracle-design.md` § Fail-Closed Semantics](oracle-design.md#fail-closed-semantics-issue-1056)
+for the full outcome-to-error mapping.
 
 ---
 
