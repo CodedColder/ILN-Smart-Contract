@@ -44,6 +44,11 @@ const MIN_VOTE_HOLD_LEDGERS: u32 = 10;
 /// Default maximum transitive delegation chain depth.
 const DEFAULT_MAX_DELEGATION_DEPTH: u32 = 10;
 
+/// Issue #985: Minimum production execution delay (24 hours at ~5 s/ledger = 17,280 ledgers).
+pub const MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS: u32 = 17_280;
+/// Issue #985: Maximum execution delay allowed to prevent governance deadlocks (30 days at ~5 s/ledger = 518,400 ledgers).
+pub const MAX_EXECUTION_DELAY_LEDGERS: u32 = 518_400;
+
 // ================================================================
 // Governance error enum
 // ================================================================
@@ -103,6 +108,14 @@ pub enum GovernanceError {
     /// `checkpoint_balance` and wait out the holding period (or vote on a
     /// later proposal) before voting.
     InsufficientHoldingPeriod = 29,
+    /// Issue #985: Execution delay violates production minimum or maximum bounds.
+    ExecutionDelayOutOfBounds = 35,
+    /// Issue #989: Invalid transition in veto state machine.
+    InvalidVetoTransition = 36,
+    /// Issue #990: Admin veto power has already been permanently disabled.
+    VetoPowerAlreadyDisabled = 37,
+    /// Issue #990: Consent reason hash is required and cannot be empty.
+    ConsentRequired = 38,
 }
 
 // ================================================================
@@ -334,6 +347,54 @@ pub struct VetoPowerDisabled {
     pub disabled_by: Address,
 }
 
+/// Issue #990: Permanent on-chain audit record of veto-power disablement.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VetoDisableRecord {
+    pub authorized_by: Address,
+    pub disabled_at_ledger: u32,
+    pub reason_hash: BytesN<32>,
+}
+
+/// Issue #990: Emitted when veto power is disabled, recording caller authorization and reason hash.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VetoDisableRecorded {
+    pub authorized_by: Address,
+    pub disabled_at_ledger: u32,
+    pub reason_hash: BytesN<32>,
+}
+
+/// Issue #989: Veto lifecycle states in the veto state machine.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VetoStatus {
+    Uninitiated = 0,
+    Pending = 1,
+    Executed = 2,
+}
+
+/// Issue #989: State record for the veto state machine.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VetoState {
+    pub status: VetoStatus,
+    pub approvals_count: u32,
+    pub threshold: u32,
+    pub reason_hash: BytesN<32>,
+}
+
+/// Issue #989: Emitted when a veto state transition occurs.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VetoStateTransition {
+    pub proposal_id: u64,
+    pub previous_status: VetoStatus,
+    pub new_status: VetoStatus,
+    pub approvals_count: u32,
+    pub threshold: u32,
+}
+
 /// Issue #642: emitted when the veto multisig signer set / threshold is
 /// (re)configured.
 #[contracttype]
@@ -480,6 +541,10 @@ pub enum StorageKey {
     /// derived from these durable per-signer flags so an archived approval list
     /// cannot reset a partially-collected veto multisig.
     VetoApprovalReceipt(u64, Address),
+    /// Issue #989: Veto state machine record for a proposal.
+    VetoState(u64),
+    /// Issue #990: Record of veto power disable authorization and reason.
+    VetoDisableRecord,
 }
 
 // ================================================================
@@ -1622,6 +1687,18 @@ pub fn set_execution_delay(
             .instance()
             .get(&StorageKey::ExecutionDelay)
             .unwrap_or(0_u32);
+
+        // Issue #985: Validate maximum delay bound to prevent governance deadlocks
+        if delay > MAX_EXECUTION_DELAY_LEDGERS {
+            return Err(GovernanceError::ExecutionDelayOutOfBounds);
+        }
+
+        // Issue #985: Once veto power is disabled (full decentralization), enforce
+        // the minimum production delay bound (at least 24 hours).
+        if !Self::is_veto_power_enabled(env.clone()) && delay < MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS {
+            return Err(GovernanceError::ExecutionDelayOutOfBounds);
+        }
+
         env.storage()
             .instance()
             .set(&StorageKey::ExecutionDelay, &delay);
@@ -1646,6 +1723,38 @@ pub fn get_execution_delay(env: Env) -> u32 {
             .instance()
             .get(&StorageKey::ExecutionDelay)
             .unwrap_or(0)
+    }
+
+    /// Issue #985: Returns the minimum and maximum execution delay bounds (in ledgers).
+    /// Access: Anyone
+    pub fn get_production_delay_bounds(_env: Env) -> (u32, u32) {
+        (
+            MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS,
+            MAX_EXECUTION_DELAY_LEDGERS,
+        )
+    }
+
+    /// Issue #985: Validates whether a delay meets production requirements.
+    /// Access: Anyone
+    pub fn is_valid_production_delay(_env: Env, delay: u32) -> bool {
+        delay >= MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS && delay <= MAX_EXECUTION_DELAY_LEDGERS
+    }
+
+    /// Issue #987: Verify eta comparisons across ledger rollover using
+    /// RFC 1982 serial number arithmetic.
+    /// Returns `true` if `current_ledger` has reached or passed `eta_ledger`.
+    /// Access: Anyone
+    pub fn is_eta_reached(_env: Env, current_ledger: u32, eta_ledger: u32) -> bool {
+        Self::check_eta_reached(current_ledger, eta_ledger)
+    }
+
+    /// Internal helper for RFC 1982 serial number comparison across ledger rollover.
+    pub fn check_eta_reached(current_ledger: u32, eta_ledger: u32) -> bool {
+        if eta_ledger == 0 {
+            return true;
+        }
+        let diff = current_ledger.wrapping_sub(eta_ledger);
+        (diff as i32) >= 0
     }
 
     // ── execute_proposal ─────────────────────────────────────────
@@ -1718,7 +1827,8 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
                 .instance()
                 .get(&StorageKey::ExecutionDelay)
                 .unwrap_or(0_u32);
-            proposal.eta_ledger = env.ledger().sequence().saturating_add(delay);
+            // Issue #987: Calculate eta using wrapping_add to cleanly support ledger rollover.
+            proposal.eta_ledger = env.ledger().sequence().wrapping_add(delay);
 
             env.storage()
                 .persistent()
@@ -1731,7 +1841,8 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
 
         if proposal.status == ProposalStatus::Passed {
             let current_ledger = env.ledger().sequence();
-            if current_ledger < proposal.eta_ledger {
+            // Issue #987: Verify eta comparison across ledger rollover.
+            if !Self::check_eta_reached(current_ledger, proposal.eta_ledger) {
                 return Err(GovernanceError::TimelockNotExpired);
             }
 
@@ -2084,6 +2195,25 @@ pub fn veto_proposal(
             _ => return Err(GovernanceError::NotVetoable),
         }
 
+        // Issue #989: Veto transition state machine check
+        let veto_state_key = StorageKey::VetoState(proposal_id);
+        let current_veto_state = env
+            .storage()
+            .instance()
+            .get::<_, VetoState>(&veto_state_key)
+            .unwrap_or(VetoState {
+                status: VetoStatus::Uninitiated,
+                approvals_count: 0,
+                threshold,
+                reason_hash: reason_hash.clone(),
+            });
+
+        if current_veto_state.status == VetoStatus::Executed || proposal.status == ProposalStatus::Vetoed {
+            return Err(GovernanceError::InvalidVetoTransition);
+        }
+
+        let prev_status = current_veto_state.status;
+
         // ── Record this signer's approval (Issue #1099: durable) ──
         let receipt_key = StorageKey::VetoApprovalReceipt(proposal_id, signer.clone());
         if env.storage().persistent().has(&receipt_key) {
@@ -2109,6 +2239,25 @@ pub fn veto_proposal(
         );
 
         if approvals.len() < threshold {
+            let next_state = VetoState {
+                status: VetoStatus::Pending,
+                approvals_count: approvals.len(),
+                threshold,
+                reason_hash: reason_hash.clone(),
+            };
+            env.storage().instance().set(&veto_state_key, &next_state);
+
+            env.events().publish(
+                (Symbol::new(&env, "veto_state_transition"), proposal_id),
+                VetoStateTransition {
+                    proposal_id,
+                    previous_status: prev_status,
+                    new_status: VetoStatus::Pending,
+                    approvals_count: approvals.len(),
+                    threshold,
+                },
+            );
+
             env.events().publish(
                 (
                     Symbol::new(&env, "veto_approved"),
@@ -2138,6 +2287,25 @@ pub fn veto_proposal(
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
 
+        let next_state = VetoState {
+            status: VetoStatus::Executed,
+            approvals_count: approvals.len(),
+            threshold,
+            reason_hash: reason_hash.clone(),
+        };
+        env.storage().instance().set(&veto_state_key, &next_state);
+
+        env.events().publish(
+            (Symbol::new(&env, "veto_state_transition"), proposal_id),
+            VetoStateTransition {
+                proposal_id,
+                previous_status: prev_status,
+                new_status: VetoStatus::Executed,
+                approvals_count: approvals.len(),
+                threshold,
+            },
+        );
+
         // Issue #814: vetoed spam is forfeited like a rejection (documented
         // in governance-security-summary.md).
         Self::forfeit_proposal_deposit(&env, proposal_id, &proposal.proposer);
@@ -2158,36 +2326,130 @@ pub fn veto_proposal(
         Ok(())
     }
 
-    // ── Issue #68: disable_veto_power ─────────────────────────────
+    /// Issue #989: Returns the current state of the veto transition state machine for a proposal.
+    /// Access: Anyone
+    pub fn get_veto_state(env: Env, proposal_id: u64) -> VetoState {
+        if let Some(state) = env
+            .storage()
+            .instance()
+            .get::<_, VetoState>(&StorageKey::VetoState(proposal_id))
+        {
+            return state;
+        }
 
-/// Permanently disable the admin veto power.
-///
-/// # Arguments
-/// * `env` — host environment
-///
-/// # Returns
-/// * `Ok(...)` on success; see Errors
-///
-/// # Errors
-/// * Authorization / validation errors as defined by this contract
-///
-/// Access: Caller (require_auth)
-pub fn disable_veto_power(env: Env) -> Result<(), GovernanceError> {
-        let iln_contract = Self::get_iln_contract(&env)?;
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::VetoThreshold)
+            .unwrap_or(0);
+
+        let empty_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        if let Some(proposal) = env
+            .storage()
+            .persistent()
+            .get::<_, GovernanceProposal>(&StorageKey::Proposal(proposal_id))
+        {
+            if proposal.status == ProposalStatus::Vetoed {
+                return VetoState {
+                    status: VetoStatus::Executed,
+                    approvals_count: threshold,
+                    threshold,
+                    reason_hash: empty_hash,
+                };
+            }
+        }
+
+        VetoState {
+            status: VetoStatus::Uninitiated,
+            approvals_count: 0,
+            threshold,
+            reason_hash: empty_hash,
+        }
+    }
+
+    // ── Issue #68 / #990: disable_veto_power ──────────────────────
+
+    /// Permanently disable the admin veto power.
+    ///
+    /// # Arguments
+    /// * `env` — host environment
+    ///
+    /// # Returns
+    /// * `Ok(...)` on success; see Errors
+    ///
+    /// # Errors
+    /// * Authorization / validation errors as defined by this contract
+    ///
+    /// Access: Caller (require_auth)
+    pub fn disable_veto_power(env: Env) -> Result<(), GovernanceError> {
+        let empty_hash = BytesN::from_array(&env, &[0u8; 32]);
+        Self::internal_disable_veto_power(&env, empty_hash)
+    }
+
+    /// Issue #990: Permanently disable the admin veto power with an explicit reason hash.
+    ///
+    /// Access: Caller (require_auth)
+    pub fn disable_veto_power_with_reason(
+        env: Env,
+        reason_hash: BytesN<32>,
+    ) -> Result<(), GovernanceError> {
+        let empty_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if reason_hash == empty_hash {
+            return Err(GovernanceError::ConsentRequired);
+        }
+        Self::internal_disable_veto_power(&env, reason_hash)
+    }
+
+    fn internal_disable_veto_power(
+        env: &Env,
+        reason_hash: BytesN<32>,
+    ) -> Result<(), GovernanceError> {
+        let iln_contract = Self::get_iln_contract(env)?;
         iln_contract.require_auth();
+
+        if !Self::is_veto_power_enabled(env.clone()) {
+            return Err(GovernanceError::VetoPowerAlreadyDisabled);
+        }
 
         env.storage()
             .instance()
             .set(&StorageKey::VetoPowerEnabled, &false);
 
+        let record = VetoDisableRecord {
+            authorized_by: iln_contract.clone(),
+            disabled_at_ledger: env.ledger().sequence(),
+            reason_hash: reason_hash.clone(),
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::VetoDisableRecord, &record);
+
         env.events().publish(
-            (Symbol::new(&env, "veto_power_disabled"),),
+            (Symbol::new(env, "veto_power_disabled"),),
             VetoPowerDisabled {
-                disabled_by: iln_contract,
+                disabled_by: iln_contract.clone(),
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(env, "veto_disable_recorded"), iln_contract),
+            VetoDisableRecorded {
+                authorized_by: record.authorized_by,
+                disabled_at_ledger: record.disabled_at_ledger,
+                reason_hash,
             },
         );
 
         Ok(())
+    }
+
+    /// Issue #990: Returns the recorded veto-disable authorization details if disabled.
+    /// Access: Anyone
+    pub fn get_veto_disable_record(env: Env) -> Option<VetoDisableRecord> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::VetoDisableRecord)
     }
 
 /// Returns `true` when admin veto power is still active.

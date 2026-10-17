@@ -109,6 +109,10 @@ Source of truth: [`contracts/iln_governance/src/lib.rs`](../contracts/iln_govern
 | 19 | `InsufficientProposerBalance` | Proposer does not hold the minimum required token balance. | Proposer's token balance is below `MinProposalBalance`. | Acquire enough governance tokens to meet the proposal threshold. |
 | 28 | `NotInitialized` | Contract called before `initialize()`. | Calling an admin-gated function on a contract instance that was never initialized. | Call `initialize()` first. |
 | 29 | `InsufficientHoldingPeriod` | Voter has no balance checkpoint predating the proposal by `MIN_VOTE_HOLD_LEDGERS` (10 ledgers). | First vote (or delegation) from a newly funded address; possible flash-loan attempt. | Call `checkpoint_balance` and wait ~10 ledgers (or vote on a later proposal). |
+| 35 | `ExecutionDelayOutOfBounds` | Execution delay violates production minimum or maximum bounds. | Setting execution delay greater than 30 days or less than 24 hours when veto power is disabled. | Configure an execution delay within defined bounds (`MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS..=MAX_EXECUTION_DELAY_LEDGERS`). |
+| 36 | `InvalidVetoTransition` | Invalid transition in veto transition state machine. | Attempting to approve or execute a veto on a proposal that is already vetoed or in an invalid state. | Verify current veto state with `get_veto_state` before submitting veto approvals. |
+| 37 | `VetoPowerAlreadyDisabled` | Admin veto power has already been permanently disabled. | Attempted to disable veto power when it was already disabled. | Check `is_veto_power_enabled()` or `get_veto_disable_record()` before attempting disablement. |
+| 38 | `ConsentRequired` | Action requires an explicit non-empty consent reason hash. | Provided an empty (all zeros) reason hash when disabling veto power with reason. | Provide a valid non-empty 32-byte hash representing the documented justification. |
 
 ---
 

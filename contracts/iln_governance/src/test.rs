@@ -2968,6 +2968,228 @@ fn test_pre_init_calls_return_not_initialized() {
     );
 }
 
+// ── Issue #985: Minimum production delay bounds ─────────────────────────────
+
+#[test]
+fn test_production_delay_bounds_query_and_validation() {
+    let t = setup();
+    let (min_bound, max_bound) = t.contract.get_production_delay_bounds();
+    assert_eq!(min_bound, MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS);
+    assert_eq!(max_bound, MAX_EXECUTION_DELAY_LEDGERS);
+
+    assert!(t.contract.is_valid_production_delay(&min_bound));
+    assert!(t.contract.is_valid_production_delay(&max_bound));
+    assert!(!t.contract.is_valid_production_delay(&(min_bound - 1)));
+    assert!(!t.contract.is_valid_production_delay(&(max_bound + 1)));
+}
+
+#[test]
+fn test_set_execution_delay_exceeding_max_bound_fails() {
+    let t = setup();
+    let res = t
+        .contract
+        .try_set_execution_delay(&t.admin, &(MAX_EXECUTION_DELAY_LEDGERS + 1));
+    assert_eq!(res, Err(Ok(GovernanceError::ExecutionDelayOutOfBounds)));
+}
+
+#[test]
+fn test_set_execution_delay_below_minimum_when_veto_disabled_fails() {
+    let t = setup();
+    t.contract.disable_veto_power();
+    assert!(!t.contract.is_veto_power_enabled());
+
+    // Once veto power is disabled, setting delay below minimum production delay bound fails.
+    let res = t
+        .contract
+        .try_set_execution_delay(&t.admin, &(MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS - 1));
+    assert_eq!(res, Err(Ok(GovernanceError::ExecutionDelayOutOfBounds)));
+
+    // Setting delay within production bounds succeeds.
+    let res_ok = t
+        .contract
+        .try_set_execution_delay(&t.admin, &MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS);
+    assert!(res_ok.is_ok());
+    assert_eq!(
+        t.contract.get_execution_delay(),
+        MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS
+    );
+}
+
+// ── Issue #987: Verify eta comparisons across ledger rollover ──────────────
+
+#[test]
+fn test_is_eta_reached_exact_and_normal_cases() {
+    let t = setup();
+    // eta = 0 always expired
+    assert!(t.contract.is_eta_reached(&100, &0));
+    // current == eta
+    assert!(t.contract.is_eta_reached(&100, &100));
+    // current > eta
+    assert!(t.contract.is_eta_reached(&105, &100));
+    // current < eta
+    assert!(!t.contract.is_eta_reached(&95, &100));
+}
+
+#[test]
+fn test_is_eta_reached_across_rollover_boundaries() {
+    let t = setup();
+    // Suppose scheduled at u32::MAX - 5 with delay 15 ledgers -> eta = 9 (wrapping)
+    let eta: u32 = 9;
+
+    // Before rollover (current = u32::MAX - 5) -> not reached
+    assert!(!t.contract.is_eta_reached(&(u32::MAX - 5), &eta));
+    // At rollover boundary (current = u32::MAX) -> not reached
+    assert!(!t.contract.is_eta_reached(&u32::MAX, &eta));
+    // Immediately after rollover (current = 0) -> not reached
+    assert!(!t.contract.is_eta_reached(&0, &eta));
+    // Right before eta (current = 8) -> not reached
+    assert!(!t.contract.is_eta_reached(&8, &eta));
+    // At exact eta (current = 9) -> reached
+    assert!(t.contract.is_eta_reached(&9, &eta));
+    // After eta (current = 10) -> reached
+    assert!(t.contract.is_eta_reached(&10, &eta));
+}
+
+#[test]
+fn test_proposal_execution_across_ledger_rollover() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &10);
+
+    // Set ledger near u32::MAX
+    let mut ledger = t.env.ledger().get();
+    ledger.sequence_number = u32::MAX - 5;
+    t.env.ledger().set(ledger.clone());
+
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    t.contract.cast_vote(&t.voter_b, &id, &true);
+
+    // End voting
+    ledger.timestamp += VOTING_PERIOD_SECS + 1;
+    t.env.ledger().set(ledger.clone());
+
+    // First execute passes the proposal and schedules eta with wrapping add
+    t.contract.execute_proposal(&id);
+    let p = t.contract.get_proposal(&id);
+    assert_eq!(p.status, ProposalStatus::Passed);
+    let expected_eta = (u32::MAX - 5).wrapping_add(10);
+    assert_eq!(p.eta_ledger, expected_eta);
+
+    // Trying to execute before rollover fails with TimelockNotExpired
+    let res = t.contract.try_execute_proposal(&id);
+    assert_eq!(res, Err(Ok(GovernanceError::TimelockNotExpired)));
+
+    // Rollover occurs: sequence wraps past u32::MAX to expected_eta
+    ledger.sequence_number = expected_eta;
+    t.env.ledger().set(ledger);
+
+    // At expected_eta, execution succeeds
+    t.contract.execute_proposal(&id);
+    assert_eq!(
+        t.contract.get_proposal(&id).status,
+        ProposalStatus::Executed
+    );
+}
+
+// ── Issue #989: Veto transition state machine ──────────────────────────────
+
+#[test]
+fn test_veto_state_machine_lifecycle_uninitiated_to_pending_to_executed() {
+    let t = setup();
+    let signer_a = Address::generate(&t.env);
+    let signer_b = Address::generate(&t.env);
+    let mut signers = soroban_sdk::Vec::new(&t.env);
+    signers.push_back(signer_a.clone());
+    signers.push_back(signer_b.clone());
+    t.contract.configure_veto_multisig(&signers, &2);
+
+    let id = create_fee_proposal(&t);
+
+    // Initial state: Uninitiated
+    let state_0 = t.contract.get_veto_state(&id);
+    assert_eq!(state_0.status, VetoStatus::Uninitiated);
+    assert_eq!(state_0.approvals_count, 0);
+    assert_eq!(state_0.threshold, 2);
+
+    // First signer approves -> transitions to Pending
+    t.contract
+        .veto_proposal(&signer_a, &id, &reason_hash(&t.env));
+    let state_1 = t.contract.get_veto_state(&id);
+    assert_eq!(state_1.status, VetoStatus::Pending);
+    assert_eq!(state_1.approvals_count, 1);
+    assert_eq!(state_1.threshold, 2);
+    assert_eq!(state_1.reason_hash, reason_hash(&t.env));
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
+
+    // Second signer approves -> transitions to Executed
+    t.contract
+        .veto_proposal(&signer_b, &id, &reason_hash(&t.env));
+    let state_2 = t.contract.get_veto_state(&id);
+    assert_eq!(state_2.status, VetoStatus::Executed);
+    assert_eq!(state_2.approvals_count, 2);
+    assert_eq!(state_2.threshold, 2);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Vetoed);
+
+    // Further veto attempts fail with InvalidVetoTransition
+    let res = t.env.as_contract(&t.contract.address, || {
+        GovContract::veto_proposal(
+            t.env.clone(),
+            signer_a.clone(),
+            id,
+            reason_hash(&t.env),
+        )
+    });
+    assert_eq!(res, Err(GovernanceError::InvalidVetoTransition));
+}
+
+// ── Issue #990: Record veto-disable authorization and reason ────────────────
+
+#[test]
+fn test_disable_veto_power_records_authorization_and_reason() {
+    let t = setup();
+    assert!(t.contract.get_veto_disable_record().is_none());
+
+    let r_hash = reason_hash(&t.env);
+    let mut ledger = t.env.ledger().get();
+    ledger.sequence_number = 1234;
+    t.env.ledger().set(ledger);
+
+    t.contract.disable_veto_power_with_reason(&r_hash);
+    assert!(!t.contract.is_veto_power_enabled());
+
+    let record = t.contract.get_veto_disable_record().expect("must be recorded");
+    assert_eq!(record.disabled_at_ledger, 1234);
+    assert_eq!(record.reason_hash, r_hash);
+}
+
+#[test]
+fn test_disable_veto_power_already_disabled_fails() {
+    let t = setup();
+    t.contract.disable_veto_power();
+    assert!(!t.contract.is_veto_power_enabled());
+
+    // Calling disable_veto_power again returns VetoPowerAlreadyDisabled
+    let res = t.contract.try_disable_veto_power();
+    assert_eq!(res, Err(Ok(GovernanceError::VetoPowerAlreadyDisabled)));
+
+    // Calling disable_veto_power_with_reason again also returns VetoPowerAlreadyDisabled
+    let res_with_reason = t
+        .contract
+        .try_disable_veto_power_with_reason(&reason_hash(&t.env));
+    assert_eq!(
+        res_with_reason,
+        Err(Ok(GovernanceError::VetoPowerAlreadyDisabled))
+    );
+}
+
+#[test]
+fn test_disable_veto_power_with_empty_reason_fails() {
+    let t = setup();
+    let empty_hash = BytesN::from_array(&t.env, &[0u8; 32]);
+    let res = t.contract.try_disable_veto_power_with_reason(&empty_hash);
+    assert_eq!(res, Err(Ok(GovernanceError::ConsentRequired)));
+}
+
 // ── Issue #1101: property-based counterexample hunt ──────────────────────────
 //
 // These randomized tests attempt to *falsify* the governance invariants by
