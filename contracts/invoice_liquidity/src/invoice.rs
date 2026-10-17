@@ -842,54 +842,43 @@ pub fn set_lp_score(env: &Env, lp: &Address, score: u32) {
     }
 }
 
-/// Return all queued LP requests for an invoice
+/// Return all queued LP requests for an invoice.
+///
+/// Issues #1009 / #1010: the queue helpers live in `storage.rs`, where reads
+/// and writes extend the TTL of the queue, its opened-at marker and the
+/// resolution record together. These wrappers delegate so there is a single
+/// implementation.
 pub fn get_fund_queue(env: &Env, invoice_id: u64) -> soroban_sdk::Vec<LpFundRequest> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::FundQueue(invoice_id))
-        .unwrap_or(soroban_sdk::Vec::new(env))
+    crate::storage::get_fund_queue(env, invoice_id)
 }
 
 /// Persist the queue
 pub fn save_fund_queue(env: &Env, invoice_id: u64, queue: &soroban_sdk::Vec<LpFundRequest>) {
-    env.storage()
-        .persistent()
-        .set(&StorageKey::FundQueue(invoice_id), queue);
+    crate::storage::save_fund_queue(env, invoice_id, queue)
 }
 
 /// Return the resolved (approved) funder for an invoice, if any
 pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::QueueResolution(invoice_id))
+    crate::storage::get_queue_resolution(env, invoice_id)
 }
 
 /// Store the approved funder chosen by the priority queue
 pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
-    env.storage()
-        .persistent()
-        .set(&StorageKey::QueueResolution(invoice_id), approved_lp);
+    crate::storage::save_queue_resolution(env, invoice_id, approved_lp)
 }
 
 /// Record the ledger sequence when the first LP joined the fund queue.
 /// Called once when the queue transitions from empty to non-empty.
 /// Subsequent joins do not overwrite this value.
 pub fn try_set_fund_queue_opened_at(env: &Env, invoice_id: u64) {
-    let key = StorageKey::FundQueueOpenedAt(invoice_id);
-    if !env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .set(&key, &env.ledger().sequence());
-    }
+    crate::storage::try_set_fund_queue_opened_at(env, invoice_id)
 }
 
 /// Return the ledger sequence when the fund queue for `invoice_id` was first
 /// opened (i.e. when the first LP joined), or `None` if the queue is still
 /// empty.
 pub fn get_fund_queue_opened_at(env: &Env, invoice_id: u64) -> Option<u32> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::FundQueueOpenedAt(invoice_id))
+    crate::storage::get_fund_queue_opened_at(env, invoice_id)
 }
 // Contract stats helpers
 // ----------------------------------------------------------------

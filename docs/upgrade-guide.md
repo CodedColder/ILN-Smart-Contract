@@ -782,3 +782,20 @@ fails the build before any on-chain run.
 **Document Prepared By:** DevOps & Security Team  
 **Last Updated:** May 2024 (migration script added — Issue #114)  
 **Next Review:** Upon next upgrade
+
+## Appendix: fund-queue TTL (Issues #1009 / #1010) and multisig error codes
+
+* **Fund-queue TTL.** `FundQueue`, `FundQueueOpenedAt` and `QueueResolution` are
+  now extended together (threshold 1,000,000 / extend-to 2,000,000 ledgers) on
+  every read and write. No migration is required and no keys are added.
+  Queue entries written by a *previous* wasm keep their old (short) TTL until
+  they are next read or written by the new wasm, so after upgrading, have an
+  operator call `resolve_fund_queue(invoice_id)` (idempotent; returns the
+  approved LP and bumps all three records) for any invoice with a resolved
+  queue that is still awaiting funding. Rollback to the old wasm is safe: the
+  extended TTLs simply stop being refreshed.
+* **Multisig error codes.** The multisig admin `ContractError` variants lost in
+  a merge were restored as codes **47–59** (`InvalidMultisigConfig` = 47 …
+  `RotationAlreadyPending` = 59). Codes 44–46 are unchanged
+  (`MaxInvoiceAmountExceeded`, `GlobalVolumeCapExceeded`, `InvalidTwapWindow`).
+  SDK error maps must be regenerated from the contract spec.

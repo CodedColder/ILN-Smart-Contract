@@ -383,9 +383,11 @@ fn test_veto_proposal_prevents_execution() {
     // Cast a FOR vote so the proposal would pass if not vetoed.
     t.governance.cast_vote(&t.voter, &proposal_id, &true);
 
-    // Admin vetoes the proposal.
+    // Veto multisig (1-of-1, the admin) vetoes the proposal.
     t.governance
-        .veto_proposal(&proposal_id, &dummy_hash(&t.env));
+        .configure_veto_multisig(&soroban_sdk::vec![&t.env, t.admin.clone()], &1);
+    t.governance
+        .veto_proposal(&t.admin, &proposal_id, &dummy_hash(&t.env));
 
     let p = t.governance.get_proposal(&proposal_id);
     assert_eq!(p.status, ProposalStatus::Vetoed);

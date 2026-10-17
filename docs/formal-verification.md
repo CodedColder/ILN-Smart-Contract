@@ -320,7 +320,7 @@ Unlike the invoice lifecycle (one enum field on a mutable record), a `Governance
 
 **Rationale:** Guarantees `execute_proposal` is safely retriable and that `Executed` status is a reliable signal that the action actually took effect (Issue #531).
 
-**Enforcement:** `invoke_and_check()` (`src/lib.rs:1396-1408`) uses `try_invoke_contract`; the `!succeeded` branch (`src/lib.rs:1186-1198`) returns `ExecutionFailed` without touching persistent proposal storage.
+**Enforcement:** `invoke_and_check()` (`src/lib.rs:1396-1408`) uses `try_invoke_contract`; the `!succeeded` branch emits `proposal_execution_failed` and returns `Ok` (Issue #1007: an `Err` would roll the event back) without touching persistent proposal storage.
 
 ---
 

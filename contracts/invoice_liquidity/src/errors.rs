@@ -88,4 +88,39 @@ pub enum ContractError {
     /// Issue #817: requested TWAP window is outside the governance-bounded
     /// `[MIN_TWAP_WINDOW_LEDGERS, MAX_TWAP_WINDOW_LEDGERS]` range.
     InvalidTwapWindow = 46,
+    // ── Issue #124 / #641 / #640 / #639: multisig admin ────────────
+    // These variants were lost in a merge; they are re-added after the
+    // current highest code (46) because 44-46 now belong to other errors.
+    /// Signer list/threshold combination is invalid (empty signer set,
+    /// duplicate signer, or threshold outside `1..=signers.len()`).
+    InvalidMultisigConfig = 47,
+    /// Caller is not a configured multisig signer.
+    NotAuthorizedSigner = 48,
+    /// This signer has already approved the given proposal.
+    AlreadySigned = 49,
+    /// No multisig proposal exists with the given id.
+    ProposalNotFound = 50,
+    /// The proposal has already been executed and cannot be executed again.
+    ProposalAlreadyExecuted = 51,
+    /// The proposal's approval window (`MULTISIG_WINDOW_LEDGERS`) has
+    /// elapsed; it can no longer be signed or executed.
+    ProposalExpired = 52,
+    /// The proposal has not yet collected enough signer approvals to be executed.
+    ThresholdNotReached = 53,
+    /// No multisig admin scheme has been bootstrapped yet.
+    MultisigNotConfigured = 54,
+    /// `initialize_multisig_admin` was called again after the multisig
+    /// admin scheme was already bootstrapped; reconfiguration must go
+    /// through the `UpdateMultisig` proposal flow instead.
+    MultisigAlreadyConfigured = 55,
+    /// Issue #641: a Pending, non-expired proposal already exists for this
+    /// exact admin action — reject the duplicate.
+    DuplicateProposal = 56,
+    /// Issue #640: no pending signer rotation exists to finalize or cancel.
+    RotationNotFound = 57,
+    /// Issue #640: the rotation's timelock has not yet elapsed.
+    RotationTimelockNotExpired = 58,
+    /// Issue #640: a signer rotation is already pending; only one may be
+    /// in flight at a time.
+    RotationAlreadyPending = 59,
 }

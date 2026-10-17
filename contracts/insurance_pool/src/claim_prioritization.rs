@@ -22,6 +22,9 @@
 //! **Invariant P3: Deterministic Order**
 //! Given a fixed set of claims and a prioritization strategy, payout order is deterministic.
 
+extern crate alloc;
+
+use alloc::{vec, vec::Vec};
 use soroban_sdk::{contracttype, Address, Env};
 
 /// Payout prioritization strategy for claims exceeding pool balance.

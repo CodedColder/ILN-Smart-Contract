@@ -1253,7 +1253,7 @@ impl InsurancePoolInterface for InsurancePool {
 
         // Transfer tokens from LP to pool (checks-effects-interactions pattern).
         // State changes above must complete before this external call.
-        let token = Self::get_token_client(&env)?;
+        let token = Self::get_token_client(&env).unwrap_or_else(|e| panic_with_error!(&env, e));
         token.transfer(
             &lp,                             // from (caller)
             &env.current_contract_address(), // to (this contract)
@@ -1314,7 +1314,7 @@ impl InsurancePoolInterface for InsurancePool {
                 .set(&DataKey::Claimed(invoice_id), &true);
 
             // Transfer tokens from pool to LP (Issue #527).
-            let token = Self::get_token_client(&env)?;
+            let token = Self::get_token_client(&env).unwrap_or_else(|e| panic_with_error!(&env, e));
             token.transfer(
                 &env.current_contract_address(), // from (this contract)
                 &lp,                             // to

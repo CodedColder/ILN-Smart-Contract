@@ -41,3 +41,17 @@ pub const MAX_REPUTATION_DECAY_PERIODS: u64 = 1000;
 /// joining the queue can no longer immediately resolve the queue in the same
 /// block to lock-out competing LPs (Issue #MEV-1).
 pub const QUEUE_DELAY_LEDGERS: u32 = 120;
+
+// ----------------------------------------------------------------
+// Fund-queue storage TTL (Issues #1009 / #1010)
+// ----------------------------------------------------------------
+
+/// Persistent-entry TTL threshold (ledgers) for the fund queue, its
+/// `FundQueueOpenedAt` marker and the `QueueResolution` record: whenever one
+/// is written or read and its remaining TTL is at or below this value, it is bumped.
+/// Matches the invoice entries (`save_invoice`) so a queue entry can never
+/// expire before the invoice it belongs to.
+pub const QUEUE_TTL_THRESHOLD_LEDGERS: u32 = 1_000_000;
+
+/// Persistent-entry TTL (ledgers) the queue entries are extended to.
+pub const QUEUE_TTL_EXTEND_TO_LEDGERS: u32 = 2_000_000;

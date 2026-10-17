@@ -33,20 +33,19 @@ pub enum AdminAction {
     /// Set maximum discount rate
     SetMaxDiscount(u32),
     /// Update multisig configuration itself (change signers or threshold)
-    UpdateMultisig {
-        new_signers: Vec<Address>,
-        new_threshold: u32,
-    },
+    ///
+    /// Tuple variant `(new_signers, new_threshold)` — `#[contracttype]` does
+    /// not support named-field enum variants.
+    UpdateMultisig(Vec<Address>, u32),
     /// Issue #640: replace `old_signer` with `new_signer` in the signer
     /// set. Executing this proposal does not swap the signer immediately —
     /// it schedules the swap behind a timelock (see `schedule_rotation`),
     /// so a compromised or departing signer's key can be rotated without a
     /// contract upgrade while still giving the team a window to detect and
     /// cancel a malicious or mistaken rotation.
-    RotateSigner {
-        old_signer: Address,
-        new_signer: Address,
-    },
+    ///
+    /// Tuple variant `(old_signer, new_signer)`.
+    RotateSigner(Address, Address),
 }
 
 /// Multi-signature admin configuration
@@ -126,7 +125,7 @@ pub fn threshold_reached(proposal: &MultisigProposal, threshold: u32) -> bool {
 
 /// Check if proposal has expired
 pub fn is_expired(env: &Env, proposal: &MultisigProposal) -> bool {
-    env.ledger().sequence() >= proposal.expires_at
+    u64::from(env.ledger().sequence()) >= proposal.expires_at
 }
 
 // ================================================================
