@@ -60,6 +60,10 @@ pub struct OracleHealthRecorded {
     pub is_stale: bool,
     pub last_data_age_ledgers: u64,
     pub consecutive_stale_count: u32,
+    /// Issue #1053: consecutive duplicate (identical-timestamp) updates from
+    /// the same oracle, so monitors can see a "frozen" oracle building up
+    /// before oracle-gated funding is rejected with `OracleDuplicateUpdate`.
+    pub consecutive_duplicate_count: u32,
 }
 
 /// Emitted once when a feed type + token's oracle resolution channel is

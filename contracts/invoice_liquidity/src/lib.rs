@@ -1820,15 +1820,18 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             return Err(ContractError::MaxInvoiceAmountExceeded);
         }
 
-        validate_invoice_terms(&env, amount, due_date, discount_rate)?;
-
         // token validation
         if !is_approved_token(&env, &token) {
             return Err(ContractError::Unauthorized);
         }
 
-        // Re-validate amount using token-aware decimal precision now that we
-        // know the token is on the allowlist (and therefore has decimals stored).
+        // Issue #1051: the amount floor is enforced solely through the token's
+        // *registered* decimal precision, which fails closed with
+        // `TokenDecimalsNotConfigured` when absent. The former decimals-blind
+        // pre-check (`validate_invoice_terms`, hardcoded 6-decimal floor) has
+        // been removed: it compared the amount against an assumed scale and so
+        // weakened precision — for a 7-decimal asset it under-enforced the
+        // floor by 10x — had it ever run without this token-aware check after it.
         validate_invoice_terms_with_token(&env, amount, due_date, discount_rate, &token)?;
 
         let id = next_invoice_id(&env)?;
@@ -1939,10 +1942,12 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             InvoiceStatus::Cancelled => return Err(ContractError::AlreadyCancelled),
         }
 
-        validate_invoice_terms(&env, amount, due_date, discount_rate)?;
-
-        // Issue #489: re-validate with token-aware minimum so updating
+        // Issue #489 / #1051: validate with token-aware minimum so updating
         // cannot push the amount below the token-specific floor (e.g. XLM).
+        // The former decimals-blind pre-check (`validate_invoice_terms`, a
+        // hardcoded 6-decimal floor) has been removed: it weakened precision
+        // by comparing the amount against an assumed scale instead of the
+        // token's registered decimals, which fail closed.
         validate_invoice_terms_with_token(&env, amount, due_date, discount_rate, &invoice.token)?;
 
         invoice.amount = amount;
@@ -2060,13 +2065,14 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
                 authenticated_freelancers.push_back(params.freelancer.clone());
             }
 
-            validate_invoice_terms(&env, params.amount, params.due_date, params.discount_rate)?;
-
             if !is_approved_token(&env, &params.token) {
                 return Err(ContractError::Unauthorized);
             }
 
-            // Re-validate with token-aware decimal precision.
+            // Issue #1051: enforce the amount floor solely through the token's
+            // registered decimal precision (fails closed). The former
+            // decimals-blind pre-check (`validate_invoice_terms`, hardcoded
+            // 6-decimal floor) weakened precision for non-6-decimal assets.
             validate_invoice_terms_with_token(
                 &env,
                 params.amount,
@@ -2517,6 +2523,43 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
                     .map(|c| c.max_oracle_age_ledgers)
                     .unwrap_or(DEFAULT_MAX_ORACLE_AGE_LEDGERS);
 
+                // Issue #1052: monotonicity — a data timestamp must never go
+                // *backwards* for the same oracle on this feed + token
+                // (replayed / rolled-back data). Read the previous health
+                // snapshot *before* `record_oracle_health` overwrites it below.
+                // Combined with the #1050 rule (future-dated data is stale), an
+                // accepted response must lie in [last_recorded, current_ledger].
+                if oracle_registry::is_oracle_data_timestamp_regression(
+                    &env,
+                    OracleFeedType::Identity,
+                    &invoice.token,
+                    &oracle_addr,
+                    response.timestamp,
+                ) {
+                    return Err(ContractError::OracleTimestampRegression);
+                }
+
+                // Issue #1053: bound duplicate update frequency. The
+                // monotonicity rule above allows an *equal* timestamp (that's
+                // what makes it non-*decreasing*), but nothing there stops an
+                // oracle from standing still: an oracle that has stopped
+                // advancing and just re-serves the same value keeps producing
+                // non-stale responses and keeps resetting the stale streak, so
+                // it could stand in for live verification indefinitely. Once
+                // the same oracle has served an identical data timestamp more
+                // than `MAX_CONSECUTIVE_DUPLICATE_UPDATES` times in a row,
+                // reject the next duplicate. Read the prior health snapshot
+                // *before* `record_oracle_health` overwrites it below.
+                if oracle_registry::is_oracle_data_duplicate_update(
+                    &env,
+                    OracleFeedType::Identity,
+                    &invoice.token,
+                    &oracle_addr,
+                    response.timestamp,
+                ) {
+                    return Err(ContractError::OracleDuplicateUpdate);
+                }
+
                 // Issue #532: record health (staleness) for this oracle
                 // regardless of outcome, so monitoring sees every query.
                 oracle_registry::record_oracle_health(
@@ -2528,12 +2571,18 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
                     max_age,
                 );
 
-                if max_age > 0 {
-                    let current_ledger = env.ledger().sequence() as u64;
-                    let age = current_ledger.saturating_sub(response.timestamp as u64);
-                    if age >= max_age {
-                        return Err(ContractError::OracleDataStale);
-                    }
+                // Issue #93 / #1050: reject stale oracle data via the single
+                // ledger-based freshness rule (shared with `record_oracle_health`
+                // above, so the funding decision and the recorded health snapshot
+                // can never disagree). It treats future-dated timestamps as stale
+                // rather than as age 0. If max_oracle_age_ledgers == 0 the rule
+                // short-circuits to "not stale" (governance escape hatch).
+                if oracle_registry::is_oracle_data_stale(
+                    env.ledger().sequence(),
+                    response.timestamp,
+                    max_age,
+                ) {
+                    return Err(ContractError::OracleDataStale);
                 }
 
                 // Issue #92: reject unverified payers.
@@ -4151,18 +4200,6 @@ fn normalize_eurc_amount(amount: i128) -> i128 {
     amount
 }
 
-fn validate_invoice_terms(
-    env: &Env,
-    amount: i128,
-    due_date: u64,
-    discount_rate: u32,
-) -> Result<(), ContractError> {
-    // Backward-compatible fallback (no token context).  Uses the minimum for a
-    // 6-decimal token (USDC).  New call-sites should prefer
-    // `validate_invoice_terms_with_token` so the check is token-aware.
-    validate_invoice_terms_for_min(env, amount, 1_000_000, due_date, discount_rate)
-}
-
 /// Validate invoice terms using the decimal precision stored for `token`.
 ///
 /// The minimum accepted amount is `1` whole unit in the token's own precision:
@@ -4171,6 +4208,11 @@ fn validate_invoice_terms(
 ///
 /// Fails with `TokenDecimalsNotConfigured` when no decimals are registered
 /// for the token. This previously fell back silently to 6 (Issue #1070).
+///
+/// Issue #1051: this is the *only* amount-floor entry point. The former
+/// decimals-blind `validate_invoice_terms` helper (which used a hardcoded
+/// 6-decimal floor) was removed so no call-site can compare amounts against an
+/// assumed scale.
 fn validate_invoice_terms_with_token(
     env: &Env,
     amount: i128,

@@ -322,6 +322,131 @@ command below and add the printed `BENCHMARK` values to
 `contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
 entries.
 
+## Oracle-freshness gate cost on funding (Issue #1050)
+
+`fund_invoice`'s oracle gate decides staleness with one shared predicate,
+`oracle_registry::is_oracle_data_stale(current_ledger, data_timestamp,
+max_age_ledgers)` (see
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#9-oracle-freshness-across-ledger-boundaries-issue-1050)).
+Issue #1050 ties that rule to a measured figure on the funding path.
+
+**Before:** the staleness check was an inline saturating subtraction
+(`current_ledger.saturating_sub(response.timestamp) >= max_age`) duplicated in the
+gate and in `record_oracle_health`. Because the subtraction saturates at zero, a
+`response.timestamp` **ahead of** the current ledger read as age 0 — "maximally
+fresh" — so a future-dated timestamp slipped past the bound. There was no
+benchmark of the *gated* funding path at all (`benchmark_fund_invoice` runs with
+`require_oracle_verification = false`).
+
+**After:** `tests_benchmarks.rs` adds
+`benchmark_fund_invoice_oracle_freshness_gate`, which funds with
+`require_oracle_verification = true` against a verifying oracle whose data sits
+exactly on the last-fresh ledger (`age == max_age - 1`), i.e. the boundary the rule
+is built around. Measured against the same absolute ceilings as the rest of the
+file:
+
+| Benchmark (`BENCHMARK` name) | Path measured |
+| ---------------------------- | ------------- |
+| `fund_invoice` (existing) | ungated: `require_oracle_verification = false`, no oracle lookup |
+| `fund_invoice_oracle_gate_fresh` | gated: `require_oracle_verification = true`, oracle resolved and freshness rule evaluated at the last-fresh boundary |
+
+The delta between the two is the cost the ledger-boundary freshness rule adds; the
+absolute figure shows the fix — which additionally rejects future-dated data the
+old formulation accepted — stays inside the same per-invocation budget. Boundary
+correctness itself is covered by the Issue #1050 tests in
+`tests_oracle_freshness.rs` (last-fresh / first-stale / one-past, a one-ledger walk
+across the boundary, the `u32` range ends, the `max_oracle_age_ledgers == 0` escape
+hatch, future-dated data end-to-end, and two proptests).
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record this as a tracked baseline, run the
+command below and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Oracle-timestamp monotonicity gate cost on funding (Issue #1052)
+
+The companion direction check to #1050 above: `fund_invoice` also rejects a
+`response.timestamp` **strictly older** than the last recorded for the **same**
+oracle on that `(feed type, token)`, using the shared predicate
+`oracle_registry::is_oracle_data_timestamp_regression` (see
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#11-monotonic-oracle-timestamp-checks-issue-1052)).
+Issue #1052 ties that check to a measured figure on the funding path.
+
+**Before:** no direction check existed — an oracle could re-serve a
+previously-seen timestamp (replay / rolled-back clock) and, as long as it was
+inside `max_oracle_age_ledgers`, the gate accepted it. There was no measured cost
+for a monotonicity comparison because there was no comparison to make.
+
+**After:** `fund_invoice`'s gate reads the persisted `OracleHealthStatus`
+snapshot (before `record_oracle_health` overwrites it) and rejects a lower
+same-oracle timestamp with `ContractError::OracleTimestampRegression`. The new
+benchmark measures the gated path with a **seeded** baseline and the oracle
+re-serving exactly that timestamp (the non-decreasing equality edge — accepted,
+so the compare actually runs), against the same absolute ceilings as the rest of
+the file:
+
+| Benchmark (`BENCHMARK` name) | Path measured |
+| ---------------------------- | ------------- |
+| `fund_invoice_oracle_gate_fresh` (Issue #1050) | gated, but **no** prior snapshot → the regression predicate short-circuits |
+| `fund_invoice_oracle_monotonic` | gated, **seeded** baseline → the regression predicate reads and compares a stored snapshot |
+
+The delta between the two gated figures is the cost the monotonicity check adds;
+the absolute figure shows it stays inside the same per-invocation budget.
+Boundary correctness itself is covered by the Issue #1052 tests in
+`tests_oracle_freshness.rs` (first read with no snapshot, equal re-read, a
+strictly-older same-oracle timestamp rejected, gate-requires-verification, the
+sequence lower bound `0`, a different oracle's timeline not compared, and a
+proptest).
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record this as a tracked baseline, run the
+command below and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Oracle duplicate-update-frequency gate cost on funding (Issue #1053)
+
+The companion to the #1052 monotonicity check above: `fund_invoice` also rejects
+a same-oracle response repeating an **identical** `timestamp` more than
+`MAX_CONSECUTIVE_DUPLICATE_UPDATES` (3) times in a row, using the shared
+predicate `oracle_registry::is_oracle_data_duplicate_update` (see
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#12-bound-duplicate-update-frequency-issue-1053)).
+Issue #1053 ties that bound to a measured figure on the funding path.
+
+**Before:** #1052's non-decreasing rule accepted an equal timestamp for as long
+as it stayed inside `max_oracle_age_ledgers` — a "frozen" oracle that never
+advanced kept passing (and kept resetting the stale streak). There was no
+counter and no measured cost for a duplicate bound.
+
+**After:** `fund_invoice`'s gate reads `OracleHealthStatus.consecutive_duplicate_count`
+off the **same** snapshot the #1052 check already fetches — no extra storage read,
+one extra comparison — and rejects the over-cap duplicate with
+`ContractError::OracleDuplicateUpdate`. The new benchmark measures the gated path
+with the duplicate streak staged one below the cap and the oracle re-serving
+exactly the recorded timestamp (the *still-accepted* duplicate edge), against the
+same absolute ceilings as the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | Path measured |
+| ---------------------------- | ------------- |
+| `fund_invoice_oracle_gate_fresh` (Issue #1050) | gated, but **no** prior snapshot |
+| `fund_invoice_oracle_monotonic` (Issue #1052) | gated, **seeded** baseline, equality edge |
+| `fund_invoice_oracle_duplicate` | gated, streak one below the cap, accepted duplicate edge |
+
+The duplicate figure should track `fund_invoice_oracle_monotonic` closely (same
+read, one extra compare); the absolute figure shows the added bound stays inside
+the same per-invocation budget. Boundary correctness itself is covered by the
+Issue #1053 tests in `tests_oracle_freshness.rs` (duplicates up to the bound
+accepted, one past the bound rejected, the `cap - 1` / `cap` boundary, an advance
+resetting the streak, gate-requires-verification, a different oracle not counted,
+and a proptest).
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record this as a tracked baseline, run the
+command below and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
 ## Updating Baselines
 
 After an intentional optimisation or contract change:

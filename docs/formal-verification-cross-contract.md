@@ -117,8 +117,19 @@ invoice id — there is no silent 6-decimal fallback.
 transfer in distribution / insurance are denominated in the token's own
 precision; assuming 6 for a 7-decimal asset under-enforces the floor 10×.
 
+**Single amount-floor path (Issue #1051):** the floor is enforced *solely*
+through the token's registered decimals. The former decimals-blind
+`validate_invoice_terms` helper — a hardcoded 6-decimal floor — has been
+removed, and `submit_invoice`, `update_invoice` and `submit_invoices_batch` all
+validate via `validate_invoice_terms_with_token` (which fails closed when
+decimals are missing). The allowlist check runs first, so an unlisted token is
+rejected as `Unauthorized`, never as a decimals or amount error.
+
 **Verified by:** `c1_*` in `contracts/tests/audit_regression_test.rs`
-(registration/bounds paths: `tests_token_safety.rs`)
+(submit fail-closed, unlisted-token precedence, and `update_invoice`
+fail-closed); per-entry-point floor/precision paths in
+`tests_min_invoice_amount.rs` (`test_issue_1051_*`); registration/bounds paths
+in `tests_token_safety.rs`.
 
 ---
 

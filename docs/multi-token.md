@@ -207,6 +207,17 @@ Frozen accounts and issuer clawback are handled at runtime by escrowing
 payouts and by typed errors. See [token-safety.md](token-safety.md) for the
 operator runbook.
 
+### Amount floor (Issue #1051)
+
+The minimum invoice amount is **1 whole unit in the token's own precision**
+(USDC: 1_000_000 = 1 USDC; XLM: 10_000_000 = 1 XLM). This floor is enforced
+solely through each token's *registered* decimals: `add_token` records them
+(validated against the token's `decimals()`), and `submit_invoice`,
+`update_invoice` and `submit_invoices_batch` all reject an amount below the
+floor with `InvalidAmount`. An approved token with no decimals entry fails
+closed with `TokenDecimalsNotConfigured` — there is no silent 6-decimal
+fallback. An unlisted token is rejected first as `Unauthorized`.
+
 ## Adding a New Token via Governance
 
 New tokens require a governance proposal and community vote.

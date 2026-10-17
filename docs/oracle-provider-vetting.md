@@ -217,6 +217,14 @@ outlier handling, who can write updates and how that access is controlled>
 ### 3. Update frequency / freshness SLA
 <Documented refresh cadence and SLA, comparison against the max_oracle_age
 this proposal intends to configure, provider's own freshness monitoring>
+Note: the contract does not only bound *how old* a response may be — a
+provider that stops advancing is also bounded. `fund_invoice` rejects a
+`timestamp` strictly older than the last recorded for the same oracle
+(`OracleTimestampRegression`, Issue #1052) and rejects one that repeats an
+identical value more than `MAX_CONSECUTIVE_DUPLICATE_UPDATES` (3) times in a row
+(`OracleDuplicateUpdate`, Issue #1053). A provider whose cadence can leave the
+`timestamp` unchanged across several consecutive queries must explain why, or
+it will be treated as stalled.
 
 ### 4. Past incident history
 <Known outages/incidents with dates, postmortems linked, or "None known" —

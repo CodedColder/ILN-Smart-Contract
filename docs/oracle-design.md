@@ -49,6 +49,7 @@ This design keeps the oracle stateless from ILN's perspective and avoids the com
 | No oracle registered | Permissive — verification always passes |
 | Oracle reports `verified = false` | Check fails; payer cannot proceed |
 | Oracle data is stale (age > 7 days) | Treated as unverified; check fails |
+| Oracle re-serves an older timestamp than it last reported (Issue #1052) | Rejected with `OracleTimestampRegression`; funding fails |
 | Oracle contract panics / traps | Treated as unverified (caller catches trap) |
 | Oracle contract address is wrong / undeployed | Cross-contract call panics; ILN treats as unverified |
 
@@ -67,6 +68,12 @@ now_seconds - oracle_timestamp > ORACLE_STALENESS_THRESHOLD_SECS
 where `now_seconds` comes from `env.ledger().timestamp()`.
 
 Oracle operators **must** refresh verification records at least every 7 days to keep payers active. The threshold can be tightened by changing the constant in a future contract upgrade if stricter freshness is required.
+
+> **Note (live rule, Issue #1050).** The constant above is **not** the rule the on-chain gate actually enforces. `fund_invoice`'s `require_oracle_verification` block uses a **ledger-sequence** window — `max_oracle_age_ledgers`, default `DEFAULT_MAX_ORACLE_AGE_LEDGERS` (17 280 ledgers ≈ 24h) — compared against `env.ledger().sequence()`, not seconds against `env.ledger().timestamp()` (see [`oracle-attack-economics.md`](oracle-attack-economics.md) §6). That rule is the single shared predicate `oracle_registry::is_oracle_data_stale(current_ledger, data_timestamp, max_age_ledgers)`, also used by `record_oracle_health`. A `data_timestamp` **ahead of** the current ledger sequence is treated as **stale** (not as age 0), so a future-dated timestamp can no longer read as maximally fresh; and `max_oracle_age_ledgers == 0` disables the check entirely (governance escape hatch). Oracle operators should therefore refresh on the ledger window, not the 7-day one.
+>
+> **Note (monotonicity, Issue #1052).** The freshness gate bounds *how old* a response may be but not its *direction*, so — before #1052 — an oracle could re-serve a response it had already served (replayed data, or a rolled-back clock) and still pass while inside the window. `fund_invoice` now also rejects a `data_timestamp` **strictly older** than the last timestamp recorded for the **same** oracle on that `(feed type, token)` with `ContractError::OracleTimestampRegression`. The baseline is the per-`(feed type, token)` `OracleHealthStatus.last_data_timestamp` maintained by `record_oracle_health`, read *before* the snapshot is overwritten. Equal timestamps are allowed (the rule is non-decreasing), a first read with no snapshot is allowed, and a *different* oracle's timeline is never compared (so a failover oracle isn't a false positive). Combined with the #1050 rule, an accepted response must lie in `[last_recorded, current_ledger]`.
+>
+> **Note (duplicate update frequency, Issue #1053).** #1052's non-decreasing rule allows an *equal* timestamp, which left the opposite hole: an oracle that simply **stands still** re-serves an identical `timestamp` on every read, stays inside the freshness window, and keeps resetting the consecutive-stale streak — so a stalled/compromised oracle could keep funding open indefinitely at no cost. `fund_invoice` now also rejects a same-oracle response repeating an identical `data_timestamp` more than `MAX_CONSECUTIVE_DUPLICATE_UPDATES` (3) times in a row with `ContractError::OracleDuplicateUpdate`. The streak is `OracleHealthStatus.consecutive_duplicate_count`, maintained by `record_oracle_health` (read *before* it is overwritten), reset to `0` by any advance or oracle failover, and mirrored on the `oracle_health_recorded` event. Duplicates up to the cap are still accepted, and a rejected funding call rolls its write back so the gate does not advance by retrying — it re-opens only when the oracle actually advances (or governance changes the resolved oracle).
 
 ---
 

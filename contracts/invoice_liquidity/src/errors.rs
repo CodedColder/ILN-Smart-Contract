@@ -175,4 +175,16 @@ pub enum ContractError {
     /// bounds the number of `PriceOutlierRejected` events a single
     /// `get_verified_price` invocation can emit.
     TooManyPriceSources = 76,
+    /// Issue #1052: the oracle returned a data timestamp *older* than the last
+    /// timestamp recorded for the same oracle on this feed type + token — a
+    /// regression (replayed / rolled-back data). Oracle-gated funding is
+    /// rejected so an oracle's reported timeline must be monotonically
+    /// non-decreasing.
+    OracleTimestampRegression = 77,
+    /// Issue #1053: the oracle re-served the *same* data timestamp more than
+    /// `MAX_CONSECUTIVE_DUPLICATE_UPDATES` times in a row — a "frozen" oracle
+    /// that has stopped advancing. Oracle-gated funding is rejected so
+    /// duplicate (unchanged) updates cannot keep a stalled oracle looking live
+    /// — and standing in for real verification — indefinitely.
+    OracleDuplicateUpdate = 78,
 }

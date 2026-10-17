@@ -157,3 +157,171 @@ changed — this is a declaration-plus-measurement remediation. `RESOURCE_ENVELO
 is a `pub const` slice read only by tests and docs, so no migration is required
 (see [`storage-layout.md`](storage-layout.md) and [`benchmarks.md`](benchmarks.md)
 for the before/after detail).
+
+## 9. Oracle freshness across ledger boundaries (Issue #1050)
+
+The ledger-based staleness gate in `fund_invoice` computed age with a *saturating*
+subtraction: `age = env.ledger().sequence().saturating_sub(response.timestamp)`,
+then rejected when `age >= max_oracle_age_ledgers`. Because the subtraction
+saturates at zero, any `response.timestamp` **greater than** the current ledger
+sequence collapses to `age == 0` — the freshest possible reading. An oracle (or a
+buggy one) reporting a future ledger sequence therefore made its data look
+maximally fresh on *every* ledger until the chain caught up with the fake
+timestamp, defeating the freshness bound the gate exists to enforce. The
+`record_oracle_health` snapshot used the same saturating subtraction, so the
+recorded health state agreed with the (wrong) funding decision.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Freshness rule owner | duplicated inline in `fund_invoice`; same saturating formula re-derived in `record_oracle_health` | one shared `oracle_registry::is_oracle_data_stale(current_ledger, data_timestamp, max_age_ledgers)` |
+| Future-dated `response.timestamp` (`> current_ledger`) | `age` saturates to `0` → treated as **fresh** → funding allowed | treated as **stale** → `ContractError::OracleDataStale` (34) |
+| Future region bounded | no — up to `u32::MAX` read as age 0 | yes — the bound now holds across the full `u32` ledger range |
+| `max_oracle_age_ledgers == 0` escape hatch | disables the check | unchanged — still disables the check (short-circuit before the future-region test) |
+| Gate ⇄ health-snapshot agreement | same formula, so consistently wrong on future data | both call the shared rule, so the funding decision and the recorded health snapshot cannot disagree |
+| Boundary coverage | interior scenarios only | `tests_oracle_freshness.rs` Tests 13–21: last-fresh / first-stale / one-past, one-ledger walk across the boundary, `u32` range ends, escape hatch applied to futures, future-dated data end-to-end (funded-path → `OracleDataStale`; `verify=false` path → funds), health snapshot at the future boundary, plus two proptests (reference-formula equivalence; monotonicity as the ledger advances) |
+
+**Behaviour.** The freshness predicate is extracted to
+`oracle_registry::is_oracle_data_stale`, which returns `false` immediately when
+`max_age_ledgers == 0` (the governance escape hatch), `true` when
+`data_timestamp > current_ledger` (the future region), and otherwise
+`(current_ledger - data_timestamp) >= max_age_ledgers`. `fund_invoice`'s
+`require_oracle_verification` block and `record_oracle_health` both call it, so a
+single rule drives both the funding decision and the recorded health snapshot. All
+interior behaviour (age `<` max → fresh; age `>=` max → stale) is unchanged; only
+the previously-unbounded future region moves from *fresh* to *stale*. No storage
+key, value encoding, or TTL constant changed, so no data migration is required
+(see [`threat-model.md`](threat-model.md), [`error-codes.md`](error-codes.md) and
+[`oracle-attack-economics.md`](oracle-attack-economics.md) for the before/after
+detail).
+
+## 10. Missing decimals weakening precision (Issue #1051)
+
+Follow-up to control C1 above. #1070 made the amount floor fail closed by
+resolving decimals from the token (`token_safety::registered_token_decimals`)
+instead of a silent `.unwrap_or(6)`. But a **second, decimals-blind** validator
+survived alongside it: `validate_invoice_terms` compared every amount against a
+hardcoded 6-decimal floor (`min_amount = 1_000_000`) and still ran *before* the
+token-aware check at three entry points. Because the token-aware check happened
+to run afterwards it masked the weaker floor — but the amount was still being
+compared against an assumed scale, so any reordering, early return, or future
+call-site that kept the blind check and dropped the token-aware one would
+under-enforce the floor: for a 7-decimal asset (XLM) the legacy floor
+(1_000_000) is 10× smaller than the correct one (10_000_000).
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Amount-floor entry points | two — decimals-blind `validate_invoice_terms` (hardcoded 6) *and* token-aware `validate_invoice_terms_with_token` | one — `validate_invoice_terms_with_token` only |
+| `submit_invoice` | blind check, then allowlist, then token-aware check | allowlist, then token-aware check |
+| `update_invoice` | blind check, then token-aware check | token-aware check |
+| `submit_invoices_batch` | blind check, then allowlist, then token-aware check | allowlist, then token-aware check |
+| Non-6-decimal asset below its own floor | accepted by the blind check (blocked only by the later token-aware check) | rejected directly with `InvalidAmount` |
+| Missing decimals | `TokenDecimalsNotConfigured` from the token-aware check | unchanged — the *only* check fails closed |
+| Unlisted token | `Unauthorized` | unchanged — the allowlist check runs first, so no decimals/amount error leaks |
+| Regression coverage | `c1_*` on submit only | `c1_*` on submit **and** update, plus `tests_min_invoice_amount.rs` `test_issue_1051_*` for submit/update/batch success, failure, authorization precedence and fail-closed |
+
+**Behaviour.** `validate_invoice_terms` is removed; `is_approved_token` runs
+before the amount check at `submit_invoice` and `submit_invoices_batch`
+(preserving `Unauthorized` for unlisted tokens), and every entry point now
+validates solely through `validate_invoice_terms_with_token`, which resolves the
+token's registered decimals and fails closed with `TokenDecimalsNotConfigured`
+when they are absent. Valid submissions, the 6-decimal floor (USDC: 1_000_000)
+and the 7-decimal floor (XLM: 10_000_000) are unchanged; only the previously
+reachable decimals-blind comparison is gone. No storage key, value encoding,
+error code, or TTL constant changed, so no data migration is required (see
+[`formal-verification-cross-contract.md`](formal-verification-cross-contract.md)
+§7, [`token-safety.md`](token-safety.md) and [`multi-token.md`](multi-token.md)
+for the before/after detail).
+
+## 11. Monotonic oracle timestamp checks (Issue #1052)
+
+Companion to the freshness control in §9 (#1050). #1050 bounded *how old* an
+oracle response may be (`[current_ledger - max_age, current_ledger]`), but said
+nothing about *direction*: an oracle could re-serve a response it had already
+served before — replayed data, or data from a rolled-back internal clock — and
+as long as it was still inside the freshness window the gate accepted it. A
+replayed response can mean a payer that was verified at ledger L is re-attested
+at L again later (so a previously-fresh verification is presented as if it were
+current) and, more generally, that the oracle's reported timeline is not a
+reliable monotonic progress indicator.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Direction check | none — any timestamp inside the freshness window accepted, including one *older* than the last recorded for the same oracle | a timestamp strictly older than the last recorded for the same `(feed type, token, oracle)` is rejected with `OracleTimestampRegression` |
+| Baseline source | — | the per-`(feed type, token)` `OracleHealthStatus.last_data_timestamp` snapshot already maintained by `record_oracle_health` |
+| Accepted-timestamp envelope | `[current_ledger - max_age, current_ledger]` | `[last_recorded, current_ledger]` |
+| Equal timestamp re-read | accepted | accepted (rule is *non-decreasing*, not strictly increasing) |
+| First read (no snapshot) | accepted | accepted — monotonicity is defined relative to a recorded baseline |
+| Oracle swap / failover | n/a | not compared: the predicate only fires for the **same** oracle address, so a failover oracle starting on an older timeline is not a false positive |
+| Interaction with #1050 | future-dated data already stale | unchanged — the regression gate runs first, then the shared freshness predicate |
+| Regression coverage | — | `tests_oracle_freshness.rs` `test_1052_*` (first read, equal re-read, regression rejected, gate-requires-verification, ledger lower-bound `0`, different-oracle non-regression) plus `prop_1052_regression_iff_strictly_older_for_same_oracle` |
+
+**Behaviour.** A new shared predicate,
+`oracle_registry::is_oracle_data_timestamp_regression(env, feed_type, token,
+oracle, data_timestamp)`, returns `true` iff a snapshot exists for that
+`(feed type, token)`, it was recorded for the **same** oracle address, and the
+new `data_timestamp` is strictly smaller than the snapshot's
+`last_data_timestamp`; it returns `false` when no snapshot exists or the oracle
+address differs. `fund_invoice`'s `require_oracle_verification` block calls it
+**before** `record_oracle_health` (so the previous snapshot is read before being
+overwritten) and returns `ContractError::OracleTimestampRegression` on a
+violation. Because a rejected `fund_invoice` rolls back all of its storage
+writes, the baseline can never be *lowered* through funding; `check_oracle_health`
+still records every observed snapshot as-is (including a regression) so
+monitoring sees the anomaly. Valid responses, the freshness rule, and the
+`max_oracle_age_ledgers == 0` escape hatch are unchanged; the only new behaviour
+is that a strictly-older same-oracle timestamp is now rejected. No storage key,
+value encoding, or TTL constant changed, so no data migration is required (see
+[`oracle-design.md`](oracle-design.md),
+[`oracle-attack-economics.md`](oracle-attack-economics.md),
+[`threat-model.md`](threat-model.md) and [`error-codes.md`](error-codes.md) for
+the before/after detail).
+
+## 12. Bound duplicate update frequency (Issue #1053)
+
+Companion to the monotonicity control in §11 (#1052). #1052 forbade a
+timestamp going *backwards* but deliberately allowed an *equal* one — the rule
+is *non-decreasing*, not strictly increasing — precisely so a legitimate
+re-read of unchanged data is not treated as a replayed response. That left the
+opposite hole: an oracle that simply **stands still** produces an identical
+timestamp on every read, which is always inside the freshness window (§9,
+#1050) and always *non-stale*, so `record_oracle_health` keeps resetting the
+consecutive-stale streak and the circuit breaker never trips. A stalled or
+compromised oracle could therefore keep oracle-gated funding open — standing in
+for live verification — indefinitely, at no cost, just by not advancing.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Duplicate (unchanged) timestamp | accepted for as long as the value stays inside the freshness window; each read resets the stale streak | the **same** oracle may serve an identical timestamp at most `MAX_CONSECUTIVE_DUPLICATE_UPDATES` (3) consecutive times; the next duplicate is rejected with `OracleDuplicateUpdate` |
+| Duplicate counter | none recorded | `OracleHealthStatus.consecutive_duplicate_count`, exposed on the `oracle_health_recorded` event |
+| Reset condition | n/a | the moment the timestamp **advances**, or resolution fails over to a **different** oracle — the streak is per `(feed type, token, oracle)` |
+| Interaction with #1052 | equal timestamps always accepted | unchanged — a duplicate is only counted when it is *not* a regression; the regression gate still runs first |
+| Interaction with #1050 | a re-served value eventually ages out of the window | unchanged — the freshness rule still applies; the duplicate bound additionally rejects a value that stays frozen *while still fresh* |
+| Writes back | n/a | a rejected `fund_invoice` rolls its health write back, so a rejected duplicate never advances the streak — the gate stays shut until the oracle actually advances (no "reset by retrying") |
+| Monitoring | — | `check_oracle_health` (never errors) records every duplicate as-is, so keepers can watch the streak build before funding starts failing |
+| Coverage | — | `tests_oracle_freshness.rs` `test_1053_*` (up-to-bound accepted, over-bound rejected, boundary at `cap - 1` / `cap`, advance resets, gate-requires-verification, different-oracle non-duplicate) plus `prop_1053_duplicate_predicate_matches_streak_bound` |
+
+**Behaviour.** A new shared predicate,
+`oracle_registry::is_oracle_data_duplicate_update(env, feed_type, token, oracle,
+data_timestamp)`, returns `true` iff a snapshot exists for that
+`(feed type, token)`, it was recorded for the **same** oracle address, the new
+`data_timestamp` **equals** the snapshot's `last_data_timestamp`, and the
+snapshot's `consecutive_duplicate_count` has already reached
+`MAX_CONSECUTIVE_DUPLICATE_UPDATES` (3, mirroring `MAX_CONSECUTIVE_STALE_QUERIES`).
+`fund_invoice`'s `require_oracle_verification` block calls it immediately after
+the #1052 regression check and **before** `record_oracle_health` (so the previous
+snapshot — including its streak — is read before being overwritten), returning
+`ContractError::OracleDuplicateUpdate` on a violation. `record_oracle_health`
+maintains the streak: an identical `data_timestamp` from the same oracle
+increments it, while the first read, any advance, or any oracle change resets it
+to `0`; the value is persisted on `OracleHealthStatus` and mirrored on the
+`oracle_health_recorded` event. Valid responses, the freshness rule, the
+monotonicity rule, and the `max_oracle_age_ledgers == 0` escape hatch are
+unchanged; the only new behaviour is that a same-oracle response repeating an
+identical timestamp more than the cap admits is now rejected. The added state is
+a single bounded scalar on an existing record — no new storage key or collection
+(so it does not affect the [`storage.rs` `RESOURCE_ENVELOPE`](../contracts/invoice_liquidity/src/storage.rs)
+bounds) and no value-encoding migration is required (see
+[`oracle-design.md`](oracle-design.md),
+[`oracle-attack-economics.md`](oracle-attack-economics.md),
+[`threat-model.md`](threat-model.md) and [`error-codes.md`](error-codes.md) for
+the before/after detail).

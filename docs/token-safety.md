@@ -179,6 +179,16 @@ that's deliberate, not an oversight left unfixed.
 - Tokens added through `add_token` before this change already have
   registered decimals and are unaffected. They were not re-validated against
   their on-chain `decimals()`; review them with `get_token_decimals`.
+- **Issue #1051 (single amount-floor path).** The decimals-blind
+  `validate_invoice_terms` helper (a hardcoded 6-decimal floor) has been
+  removed; `submit_invoice`, `update_invoice` and `submit_invoices_batch` now
+  enforce the floor solely through `validate_invoice_terms_with_token` (the
+  token's registered decimals, fail closed). This is a pure code-path change:
+  no storage key, value encoding, error code, or `CURRENT_STORAGE_VERSION`
+  changed, so it needs no migration. Existing invoices that were accepted with
+  a correct token floor stay valid; an amount that only cleared the old
+  6-decimal floor for a 7-decimal token (e.g. 1_000_000…9_999_999 XLM) was
+  already rejected by the token-aware check and continues to be.
 - Integrators: handle error codes 68–73. `claim_pending_payout` and
   `get_pending_payout` are additive. Existing entry-point signatures are
   unchanged.
