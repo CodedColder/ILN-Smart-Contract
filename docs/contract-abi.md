@@ -19,6 +19,8 @@
 | add_token | env: Env, token: Address, decimals: u32 | Result<(), ContractError> | Access: Admin only |
 | remove_token | env: Env, token: Address | Result<(), ContractError> | Access: Admin only |
 | get_token_decimals | env: Env, token: Address | Option<u32> | /// Access: Anyone |
+| audit_token_decimals | env: Env, token: Address | token_safety::TokenDecimalsAudit | Access: Anyone |
+| correct_token_decimals | env: Env, token: Address, decimals: u32 | Result<(), ContractError> | Access: Admin only |
 | pause | env: Env | Result<(), ContractError> | Access: Admin only |
 | unpause | env: Env | Result<(), ContractError> | Access: Admin only |
 | upgrade | env: Env, new_wasm_hash: BytesN<32> | Result<(), ContractError> | /// Access: Admin only |
