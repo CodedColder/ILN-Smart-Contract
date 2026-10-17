@@ -56,7 +56,9 @@ parameterized by a unique id/address, no collisions occur.
 ### Persistent Storage
 | Variant | Stored Value | Purpose |
 | ------- | ------------ | ------- |
-| `Invoice(u64)` | `Invoice` | Individual invoice state |
+| `Invoice(u64)` | `Invoice` | Individual invoice state (legacy monolithic format, retained for backward compatibility) |
+| `InvoiceCore(u64)` | `InvoiceCore` | Hot-path invoice state (amount, status, due_date, token, payer, submitter; accessed >95% of operations) |
+| `InvoiceMetadata(u64)` | `InvoiceMetadata` | Cold-path invoice metadata (retained separately to minimize read footprint) |
 | `InvoiceCount` | `u64` | Legacy invoice counter |
 | `Token` | `Address` | Primary token address |
 | `PayerScore(Address)` | `ReputationScore` | Payer reputation + last-activity ledger |
@@ -86,9 +88,10 @@ parameterized by a unique id/address, no collisions occur.
 | `TopPayersHeap` | fixed-size heap | Top payers by reputation score (Issue #77) |
 | `InvoiceNft(u64)` | `InvoiceNftMetadata` | NFT metadata for a funded invoice (Issue #423) |
 | `InvoiceNftOwner(u64)` | `Address` | NFT owner tracking (Issue #423) |
+| `StorageVersion` | `u32` | Storage schema version (defaults to 1 if unset; current version is 2) |
 
 No two variants share the same name, and every parameterized variant
-(`Invoice(u64)`, `PayerScore(Address)`, etc.) is disambiguated by its type and
+(`Invoice(u64)`, `InvoiceCore(u64)`, `PayerScore(Address)`, etc.) is disambiguated by its type and
 value — a `u64` invoice id and an `Address` can never serialize identically.
 
 ### TTL Management and Upgrade Guard (Issue #1082)
@@ -362,25 +365,34 @@ collisions regardless of how similarly the two contracts name their keys.
   `GovToken`, etc.) never collide.
 
 ## 9. Upgrade/Migration Notes
+
+### 9.1 Key Enum Evolution
 `invoice_liquidity` previously used separate `ConfigKey`/`StorageKey` enums
 which were merged into the single `DataKey` enum. Variant names were
 preserved during the merge, so existing serialized data remains
 byte-compatible.
 
-### 9.1 Purely additive governance keys (Issues #1098, #1099)
-`iln_governance::StorageKey` gained two new variants, both **appended at the end
-of the enum** so no existing variant's ordinal changes:
-
-- `Delegators(Address)` (#1098) — reverse delegation adjacency.
-- `VoteReceipt(u64, Address)` and `VetoApprovalReceipt(u64, Address)` (#1099) —
-  durable mirrors of the temporary vote/veto receipts.
-
-Because these are additive and read with fail-safe defaults (`unwrap_or(0)`,
-`unwrap_or(false)`, or an empty `Vec`), a contract upgrade requires **no data
-migration**: pre-existing proposals, votes, delegations, and veto state remain
-valid, and the new keys are simply absent until the first write on the new code.
-This follows the additive-change pattern accepted by the storage freeze in §10.1.
-
+### 9.2 Storage Schema Versioning & Sequencing (Issue #1086)
+`invoice_liquidity` uses `DataKey::StorageVersion` in instance storage to track
+the schema migration level:
+- **Baseline (Version 1):** If `DataKey::StorageVersion` is unset in instance storage,
+  it defaults to `1` (`LEGACY_STORAGE_VERSION`). Legacy state stores invoices monolithically
+  under `DataKey::Invoice(u64)`.
+- **Target (Version 2):** Current schema version is `2` (`CURRENT_STORAGE_VERSION`).
+  Invoices are split into hot-path `DataKey::InvoiceCore(u64)` and cold-path
+  `DataKey::InvoiceMetadata(u64)`.
+- **Backward-Compatible Fallback:** The accessor `try_load_invoice_core` (and `load_invoice`)
+  checks `DataKey::InvoiceCore(id)` first; if missing, it transparently falls back to
+  reading legacy monolithic `DataKey::Invoice(id)`. This prevents read regressions for
+  invoices written under prior schema versions.
+- **Migration Function:** The `migrate()` entrypoint verifies caller authorization (`admin.require_auth()`),
+  checks that the current storage version is `< CURRENT_STORAGE_VERSION`, advances
+  `DataKey::StorageVersion` to `CURRENT_STORAGE_VERSION`, and returns the updated version.
+  Calling `migrate()` when already at `CURRENT_STORAGE_VERSION` is an idempotent no-op
+  that succeeds and returns the current version without state disruption.
+- **Operational Sequencing:** State migrations must be coordinated with contract code upgrades
+  following the authoritative 6-step operational procedure (Pause -> Upgrade -> Migrate -> Validate -> Unpause -> Contingency).
+  See [Upgrade Guide: Upgrade Migration Sequencing & State Versioning](upgrade-guide.md#upgrade-migration-sequencing--state-versioning-issue-1086).
 
 ## 10. Storage Layout Freeze — Sign-off Gate (Issue #651)
 
