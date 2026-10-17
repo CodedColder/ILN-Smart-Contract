@@ -2213,6 +2213,32 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             return Ok(approved);
         }
 
+        // Issue #1017: prevent finalizing a fund queue's still-unresolved
+        // economic state once the invoice itself has already been cleaned
+        // up (cancelled, expired, defaulted, disputed, appealed) or
+        // otherwise left the fundable Pending/PartiallyFunded window.
+        // Mirrors join_fund_queue's existing status gate just below —
+        // without this, anyone could call resolve_fund_queue on a dead
+        // invoice and have it pick and announce a "winning" LP
+        // (FundQueueResolved: a real, reputation-weighted economic
+        // decision) for funding that can never actually happen, stranding
+        // that decision as confusing/exploitable on-chain state instead of
+        // letting it die along with the invoice. A queue resolved *before*
+        // the invoice left Pending/PartiallyFunded is unaffected — the
+        // "already resolved" check above returns that historical result
+        // regardless of the invoice's current status.
+        let invoice = load_invoice(&env, invoice_id);
+        match invoice.status {
+            InvoiceStatus::Pending | InvoiceStatus::PartiallyFunded => {}
+            InvoiceStatus::Funded => return Err(ContractError::AlreadyFunded),
+            InvoiceStatus::Paid => return Err(ContractError::AlreadyPaid),
+            InvoiceStatus::Defaulted => return Err(ContractError::InvoiceDefaulted),
+            InvoiceStatus::Appealed => return Err(ContractError::InvoiceAppealed),
+            InvoiceStatus::Disputed => return Err(ContractError::InvoiceDisputed),
+            InvoiceStatus::Expired => return Err(ContractError::InvoiceExpired),
+            InvoiceStatus::Cancelled => return Err(ContractError::AlreadyCancelled),
+        }
+
         let queue = get_fund_queue(&env, invoice_id);
         if queue.is_empty() {
             return Err(ContractError::NotFunded); // no one in queue
@@ -4225,6 +4251,15 @@ mod tests_storage;
 mod tests_storage_layout;
 // Issue #MEV-1: resolve_fund_queue maturity delay
 mod tests_mev_mitigation;
+// Issue #1012: archival/retention tests for fund-queue state (Issues
+// #1011/#1013/#1014/#1015)
+mod tests_queue_archival;
+// Issue #1018: property tests generalizing #1012's renewal/archival
+// scenarios across arbitrary join-spacing sequences
+mod tests_queue_renewal_proptest;
+// Issue #1017: resolve_fund_queue must not finalize a queue's unresolved
+// economic state once the invoice has already been cancelled/expired/etc.
+mod tests_queue_status_gate;
 // Issue #invoice-count: get_invoice_count underflow safety
 mod tests_invoice_count;
 // Issue #batch-reputation: batch_submit increments invoices_submitted

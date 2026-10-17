@@ -46,6 +46,19 @@ pub enum ReferralCode {
 //   Operations on invoice i never read or write invoice j (i != j).
 // INVARIANT S2: Submitter invoice index and LP invoice index are eventually
 //   consistent — every invoice appears in at least one index.
+//
+// == Fund-Queue Invariants (Issue #1017) ==
+// INVARIANT Q1: resolve_fund_queue only finalizes a *not-yet-resolved*
+//   queue while invoice.status is Pending or PartiallyFunded — matching
+//   join_fund_queue's own status gate. cancel_invoice / expire_invoice
+//   never touch FundQueue / FundQueueOpenedAt / QueueResolution, so without
+//   this check a queue left unresolved when the invoice was cancelled or
+//   expired would still be resolvable afterward, announcing a reputation-
+//   weighted "winner" for funding that can never happen.
+// INVARIANT Q2: a queue already resolved (QueueResolution present) before
+//   cleanup stays resolved — cancel_invoice / expire_invoice cannot erase a
+//   decision that already finalized; resolve_fund_queue's cache check for
+//   an existing QueueResolution runs before Q1's status gate.
 // ----------------------------------------------------------------
 
 // ----------------------------------------------------------------

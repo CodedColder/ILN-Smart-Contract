@@ -1,9 +1,7 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
 
 use crate::config::Config;
-use crate::invoice::{
-    AppealRecord, Invoice, InvoiceCore, InvoiceMetadata, LpFundRequest, ReputationScore,
-};
+use crate::invoice::{AppealRecord, Invoice, InvoiceCore, InvoiceMetadata, ReputationScore};
 use crate::multisig::AdminAction;
 
 #[contracttype]
@@ -428,65 +426,24 @@ pub fn set_lp_score(env: &Env, lp: &Address, score: u32) {
 
 // ----------------------------------------------------------------
 // LP Queue Helpers
+//
+// Issue #1014: centralized. These keys (`FundQueue`, `FundQueueOpenedAt`,
+// `QueueResolution`) and their TTL-extension logic live in exactly one
+// place — `invoice::save_fund_queue`, `invoice::try_set_fund_queue_opened_at`,
+// `invoice::save_queue_resolution`, and the private `invoice::extend_queue_key_ttl`
+// they all call — because that is the module `lib.rs` actually imports from
+// for `join_fund_queue` / `resolve_fund_queue`.
+//
+// This file used to carry a second, parallel copy of the same six functions
+// (added for Issue #1091) that called `extend_ttl` while the `invoice.rs`
+// copies did not, so the TTL-extension fix lived in code nothing ever called
+// — `lib.rs` only ever imported the `invoice.rs` versions. Issue #1011 moved
+// the `extend_ttl` logic into the copies that are actually on the call path,
+// which made this module's copies fully redundant; they have been removed
+// so there is only one implementation to maintain and no risk of a future
+// change landing in the unused half again. See `docs/storage-layout.md` §
+// "Queued-entry retention guarantees" for the full before/after history.
 // ----------------------------------------------------------------
-
-pub fn get_fund_queue(env: &Env, invoice_id: u64) -> soroban_sdk::Vec<LpFundRequest> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::FundQueue(invoice_id))
-        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
-}
-
-pub fn save_fund_queue(env: &Env, invoice_id: u64, queue: &soroban_sdk::Vec<LpFundRequest>) {
-    let key = DataKey::FundQueue(invoice_id);
-    env.storage().persistent().set(&key, queue);
-    extend_queue_key_ttl(env, &key);
-}
-
-pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::QueueResolution(invoice_id))
-}
-
-pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
-    let key = DataKey::QueueResolution(invoice_id);
-    env.storage().persistent().set(&key, approved_lp);
-    extend_queue_key_ttl(env, &key);
-}
-
-/// Record the ledger sequence when the first LP joined the fund queue.
-/// Must only be called once per invoice (when the queue transitions from empty
-/// to non-empty).  Subsequent joins do not overwrite this timestamp.
-pub fn try_set_fund_queue_opened_at(env: &Env, invoice_id: u64) {
-    let key = DataKey::FundQueueOpenedAt(invoice_id);
-    if !env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .set(&key, &env.ledger().sequence());
-    }
-    extend_queue_key_ttl(env, &key);
-}
-
-/// Return the ledger sequence when the fund queue for `invoice_id` was first
-/// opened (i.e. the first LP join), or `None` if the queue is still empty.
-pub fn get_fund_queue_opened_at(env: &Env, invoice_id: u64) -> Option<u32> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::FundQueueOpenedAt(invoice_id))
-}
-
-/// Issue #1091: keep a queue key alive at least as long as the invoice it
-/// gates (see `FUND_QUEUE_TTL_*`). Before this, queue keys were written with
-/// the default persistent TTL while the invoice was extended to 1M–2M
-/// ledgers, so a slow-to-resolve queue could be archived mid-flight.
-fn extend_queue_key_ttl(env: &Env, key: &DataKey) {
-    env.storage().persistent().extend_ttl(
-        key,
-        crate::constants::FUND_QUEUE_TTL_THRESHOLD,
-        crate::constants::FUND_QUEUE_TTL_EXTEND_TO,
-    );
-}
 
 // ----------------------------------------------------------------
 // Appeal Helpers
@@ -685,8 +642,9 @@ pub fn get_total_paid(env: &Env) -> u64 {
 ///
 /// Before retrying the upgrade the admin should call `save_invoice` for the
 /// affected invoices (which calls `extend_ttl`) and/or the relevant queue
-/// helpers (`save_fund_queue`, `save_queue_resolution`,
-/// `try_set_fund_queue_opened_at`) to restore TTLs.
+/// helpers in `invoice.rs` (`invoice::save_fund_queue`,
+/// `invoice::save_queue_resolution`, `invoice::try_set_fund_queue_opened_at`
+/// — the module `lib.rs` actually calls; see Issue #1014) to restore TTLs.
 pub fn validate_ttl_fields_pre_upgrade(
     env: &Env,
 ) -> Result<(), crate::errors::ContractError> {

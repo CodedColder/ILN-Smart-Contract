@@ -115,17 +115,18 @@ affected entries by re-invoking the relevant storage helper before retrying.
 
 > **Note on the "TTL managed by" column:** the functions named above are the
 > ones in `invoice.rs` that `lib.rs` actually imports and calls from
-> `join_fund_queue` / `resolve_fund_queue`. `storage.rs` also defines a
-> second, identically-named set of `get_fund_queue` / `save_fund_queue` /
-> `get_queue_resolution` / `save_queue_resolution` /
+> `join_fund_queue` / `resolve_fund_queue`. Until Issue #1014, `storage.rs`
+> also defined a second, identically-named set of `get_fund_queue` /
+> `save_fund_queue` / `get_queue_resolution` / `save_queue_resolution` /
 > `try_set_fund_queue_opened_at` / `get_fund_queue_opened_at` helpers (keyed
-> off the same `DataKey` enum, re-exported as `StorageKey` in `invoice.rs`);
-> those are **not called from anywhere** and exist only as an earlier,
-> superseded draft of the fix described below. Do not add new callers of the
-> `storage.rs` copies — extend the `invoice.rs` ones instead, and prefer
-> deleting the dead copies entirely in any follow-up cleanup.
+> off the same `DataKey` enum, re-exported as `StorageKey` in `invoice.rs`)
+> that were **never called from anywhere** — an earlier, superseded draft of
+> the Issue #1091/#1011 TTL-extension fix that landed in the wrong module.
+> Issue #1014 removed that dead copy, so the `invoice.rs` functions above are
+> now the only implementation. Extend TTL logic there only; do not
+> reintroduce a parallel copy in `storage.rs`.
 
-### Queued-entry retention guarantees (Issues #1011, #1013, #1015, #1016)
+### Queued-entry retention guarantees (Issues #1011, #1012, #1013, #1014, #1015, #1016, #1018)
 
 `resolve_fund_queue`'s MEV-mitigation delay (Issue #MEV-1, `QUEUE_DELAY_LEDGERS`
 = 120 ledgers ≈ 10 minutes) depends entirely on `FundQueueOpenedAt(id)` still
@@ -176,6 +177,24 @@ lost record as an error.
   (#1082) or the `QueueStateArchived` failure path (#1013) — see
   [`docs/exploit-pattern-monitoring.md`](exploit-pattern-monitoring.md).
 
+**Regression coverage (#1012):**
+[`contracts/invoice_liquidity/src/tests_queue_archival.rs`](../contracts/invoice_liquidity/src/tests_queue_archival.rs)
+exercises all of the above: retention (TTL extension on `join_fund_queue` /
+`resolve_fund_queue`, including that a second join refreshes
+`FundQueueOpenedAt`'s TTL), the fail-closed `QueueStateArchived` path
+(including that it's distinguished from the ordinary `QueueNotMature` and
+`NotFunded` cases, so the new guard doesn't misfire), the
+`get_fund_queue_ttl_margins` instrumentation (including the exact ledger at
+which its margin crosses zero), and that neither of the touched entry points
+gates on caller identity.
+[`tests_queue_renewal_proptest.rs`](../contracts/invoice_liquidity/src/tests_queue_renewal_proptest.rs)
+(#1018) generalizes the renewal and fail-closed-archival scenarios into two
+properties checked across randomly-spaced, arbitrary-length join sequences,
+rather than just the fixed scenarios above: renewal never loses the record
+as long as gaps between joins stay under `FUND_QUEUE_TTL_THRESHOLD`, and the
+fail-closed rejection fires regardless of how much renewal history or
+post-loss delay preceded it.
+
 **Guarantee going forward:** as long as at least one `join_fund_queue` call
 has ever succeeded for an invoice, `FundQueue(id)` and `FundQueueOpenedAt(id)`
 are retained for ≥1,000,000 ledgers from that call, and `QueueResolution(id)`
@@ -193,6 +212,46 @@ on its pre-fix (un-extended) TTL. Operators should run
 after deploying this fix and, for any with a low or negative margin, prompt a
 new LP join (or have the admin re-invoke the relevant `invoice::save_*`
 helper) to refresh the TTL before it actually expires.
+
+### Resolving a queue after invoice cleanup (Issue #1017)
+
+Distinct from the TTL/retention guarantees above: `resolve_fund_queue` had
+no awareness of `invoice.status` at all — unlike `join_fund_queue`, which
+gates every call on it. `cancel_invoice` and `expire_invoice` never touch
+`FundQueue` / `FundQueueOpenedAt` / `QueueResolution`, so a queue that was
+non-empty but not yet resolved when the invoice was cancelled or expired
+stayed fully resolvable afterward: anyone could still call
+`resolve_fund_queue` and have it pick and announce a reputation-weighted
+"winning" LP (`FundQueueResolved`) for an invoice that could never actually
+be funded.
+
+**Before:** `resolve_fund_queue` succeeded (or failed only on
+`QueueNotMature` / `QueueStateArchived` / empty-queue grounds) regardless of
+`invoice.status`.
+
+**After:** `resolve_fund_queue` loads the invoice and applies the same
+status match `join_fund_queue` already uses. Once the invoice has left
+`Pending` / `PartiallyFunded`, resolving a *not-yet-resolved* queue now
+fails with the matching status-specific error (`AlreadyCancelled`,
+`InvoiceExpired`, `AlreadyFunded`, `AlreadyPaid`, `InvoiceDefaulted`,
+`InvoiceAppealed`, `InvoiceDisputed`) instead of finalizing dead economic
+state. A queue resolved *before* cleanup is unaffected — the pre-existing
+"already resolved" cache check still runs first and keeps returning that
+historical winner. See `INVARIANT Q1`/`Q2` in
+[`invoice.rs`](../contracts/invoice_liquidity/src/invoice.rs)'s formal
+verification header, and
+[`tests_queue_status_gate.rs`](../contracts/invoice_liquidity/src/tests_queue_status_gate.rs)
+for the regression suite (cancelled/expired-with-unresolved-queue,
+resolved-before-cleanup-is-preserved, and the ordinary success path).
+
+**Migration note:** behavior-only change, no storage or key format impact.
+Any invoice that was cancelled/expired in the past while its queue was
+non-empty and unresolved will simply have its queue permanently
+unresolvable now (it already was unfundable; this only stops a late,
+misleading `resolve_fund_queue` call from pretending otherwise). No backfill
+is needed — there is nothing to migrate in existing `QueueResolution` data,
+since none could have been incorrectly written by the old code for an
+*already-terminal* invoice in a way this fix needs to undo.
 
 ---
 
