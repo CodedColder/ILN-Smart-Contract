@@ -177,12 +177,6 @@ pub enum DataKey {
     /// reputation reads (ADR-015). If not set, premium calculation
     /// ignores reputation scores.
     ReputationContract,
-    /// Proposed risk multiplier numerator awaiting timelock expiry (Issue #528).
-    PendingRiskMultiplierNumerator,
-    /// Proposed risk multiplier denominator awaiting timelock expiry (Issue #528).
-    PendingRiskMultiplierDenominator,
-    /// Ledger timestamp at which the pending risk multiplier becomes executable.
-    RiskMultiplierEta,
 }
 
 /// Solvency snapshot returned by `get_pool_health`, so LPs can judge
@@ -1666,10 +1660,7 @@ impl InsurancePoolInterface for InsurancePool {
 
         // Transfer tokens from LP to pool (checks-effects-interactions pattern).
         // State changes above must complete before this external call.
-        let token = match Self::get_token_client(&env) {
-            Ok(client) => client,
-            Err(err) => panic_with_error!(&env, err),
-        };
+        let token = Self::get_token_client(&env).unwrap_or_else(|e| panic_with_error!(&env, e));
         token.transfer(
             &lp,                             // from (caller)
             &env.current_contract_address(), // to (this contract)
@@ -1730,10 +1721,7 @@ impl InsurancePoolInterface for InsurancePool {
                 .set(&DataKey::Claimed(invoice_id), &true);
 
             // Transfer tokens from pool to LP (Issue #527).
-            let token = match Self::get_token_client(&env) {
-                Ok(client) => client,
-                Err(err) => panic_with_error!(&env, err),
-            };
+            let token = Self::get_token_client(&env).unwrap_or_else(|e| panic_with_error!(&env, e));
             token.transfer(
                 &env.current_contract_address(), // from (this contract)
                 &lp,                             // to

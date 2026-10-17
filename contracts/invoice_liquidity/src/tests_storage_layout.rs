@@ -23,10 +23,13 @@
 /// `Err(ContractError::UpgradeRemovesTtlFields)` and the WASM is **never
 /// swapped** (fail-closed).
 #[cfg(test)]
-mod split_layout {
+mod tests {
+    use crate::constants::CURRENT_STORAGE_VERSION;
     use crate::invoice::{Invoice, InvoiceCore, InvoiceMetadata, InvoiceStatus, ReferralCode};
-    use soroban_sdk::testutils::Address as TestAddress;
-    use soroban_sdk::{Address, Env};
+    use crate::storage::{load_invoice, save_invoice, try_load_invoice_core, DataKey};
+    use crate::{InvoiceLiquidityContract, InvoiceLiquidityContractClient};
+    use soroban_sdk::testutils::{Address as TestAddress, MockAuth, MockAuthInvoke};
+    use soroban_sdk::{Address, Env, IntoVal};
 
     #[test]
     fn test_invoice_to_core_split() {
@@ -155,6 +158,174 @@ mod split_layout {
             invoice.submitter_reputation,
             reconstructed.submitter_reputation
         );
+    }
+
+    #[test]
+    fn test_upgrade_migration_sequencing_full_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let usdc = Address::generate(&env);
+        let eurc = Address::generate(&env);
+        let xlm = Address::generate(&env);
+
+        let contract_id = env.register(InvoiceLiquidityContract, ());
+        let client = InvoiceLiquidityContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &usdc, &eurc, &xlm);
+
+        // Pre-migration state: schema version defaults to 1
+        assert_eq!(client.get_storage_version(), 1);
+
+        // Seed a legacy monolithic invoice (v1 format: DataKey::Invoice(100))
+        let freelancer = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let legacy_invoice = Invoice {
+            id: 100,
+            freelancer: freelancer.clone(),
+            payer: payer.clone(),
+            token: usdc.clone(),
+            amount: 1_000_000,
+            due_date: 1_700_000_000,
+            discount_rate: 300,
+            status: InvoiceStatus::Pending,
+            funder: None,
+            funded_at: None,
+            amount_funded: 0,
+            amount_paid: 0,
+            referral_code: ReferralCode::None,
+            submitter_reputation: 50,
+        };
+
+        // Write directly using the legacy monolithic DataKey::Invoice(100)
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Invoice(100), &legacy_invoice);
+        });
+
+        // Verify backward-compatible loading of legacy record before migration
+        env.as_contract(&contract_id, || {
+            let loaded = load_invoice(&env, 100);
+            assert_eq!(loaded.id, 100);
+            assert_eq!(loaded.freelancer, freelancer);
+            assert_eq!(loaded.amount, 1_000_000);
+
+            let core = try_load_invoice_core(&env, 100).expect("legacy core should load");
+            assert_eq!(core.id, 100);
+            assert_eq!(core.status, InvoiceStatus::Pending);
+        });
+
+        // Upgrade step: execute migrate()
+        let migrated_version = client.migrate();
+        assert_eq!(migrated_version, CURRENT_STORAGE_VERSION);
+        assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION);
+
+        // Idempotency check: repeated migrate() call is safe and returns current version
+        let idempotent_run = client.migrate();
+        assert_eq!(idempotent_run, CURRENT_STORAGE_VERSION);
+        assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION);
+
+        // Verify backward-compatible loading continues to work after migration
+        env.as_contract(&contract_id, || {
+            let loaded_after = load_invoice(&env, 100);
+            assert_eq!(loaded_after.id, 100);
+            assert_eq!(loaded_after.freelancer, freelancer);
+
+            // New invoice written post-migration uses split storage
+            let new_invoice = Invoice {
+                id: 101,
+                freelancer: freelancer.clone(),
+                payer: payer.clone(),
+                token: usdc.clone(),
+                amount: 2_000_000,
+                due_date: 1_700_001_000,
+                discount_rate: 250,
+                status: InvoiceStatus::Pending,
+                funder: None,
+                funded_at: None,
+                amount_funded: 0,
+                amount_paid: 0,
+                referral_code: ReferralCode::None,
+                submitter_reputation: 60,
+            };
+            save_invoice(&env, &new_invoice);
+
+            // Verify new invoice is stored in hot/cold split keys
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::InvoiceCore(101)));
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::InvoiceMetadata(101)));
+
+            let loaded_new = load_invoice(&env, 101);
+            assert_eq!(loaded_new.id, 101);
+            assert_eq!(loaded_new.amount, 2_000_000);
+        });
+    }
+
+    #[test]
+    fn test_upgrade_migration_sequencing_authorization() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let usdc = Address::generate(&env);
+        let eurc = Address::generate(&env);
+        let xlm = Address::generate(&env);
+
+        let contract_id = env.register(InvoiceLiquidityContract, ());
+        let client = InvoiceLiquidityContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &usdc, &eurc, &xlm);
+
+        let imposter = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &imposter,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "migrate",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let res = client.try_migrate();
+        assert!(res.is_err(), "migrate should fail for non-admin caller");
+
+        // Admin call succeeds
+        env.mock_all_auths();
+        let res_admin = client.try_migrate();
+        assert!(res_admin.is_ok(), "migrate should succeed for admin caller");
+        assert_eq!(res_admin.unwrap().unwrap(), CURRENT_STORAGE_VERSION);
+    }
+
+    #[test]
+    fn test_upgrade_migration_sequencing_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let usdc = Address::generate(&env);
+        let eurc = Address::generate(&env);
+        let xlm = Address::generate(&env);
+
+        let contract_id = env.register(InvoiceLiquidityContract, ());
+        let client = InvoiceLiquidityContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &usdc, &eurc, &xlm);
+
+        // Protocol paused during upgrade
+        client.pause();
+        assert_eq!(client.is_paused(), true);
+
+        // Storage migration succeeds while paused
+        let res = client.migrate();
+        assert_eq!(res, CURRENT_STORAGE_VERSION);
+        assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION);
+
+        // Unpause after migration verified
+        client.unpause();
+        assert_eq!(client.is_paused(), false);
     }
 }
 
