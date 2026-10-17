@@ -177,12 +177,6 @@ pub enum DataKey {
     /// reputation reads (ADR-015). If not set, premium calculation
     /// ignores reputation scores.
     ReputationContract,
-    /// Proposed risk multiplier numerator awaiting timelock expiry (Issue #528).
-    PendingRiskMultiplierNumerator,
-    /// Proposed risk multiplier denominator awaiting timelock expiry (Issue #528).
-    PendingRiskMultiplierDenominator,
-    /// Ledger timestamp at which the pending risk multiplier becomes executable.
-    RiskMultiplierEta,
 }
 
 /// Solvency snapshot returned by `get_pool_health`, so LPs can judge

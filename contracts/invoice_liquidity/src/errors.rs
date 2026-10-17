@@ -170,4 +170,15 @@ pub enum ContractError {
     /// the MEV-mitigation maturity delay instead of rejecting the call; it is
     /// now a hard failure so corrupted/archived queue state fails closed.
     QueueStateArchived = 75,
+    /// Issue #1082: pre-upgrade TTL sampling found one or more persistent
+    /// entries whose TTL is below `TTL_MIN_LEDGERS_BEFORE_UPGRADE`, meaning a
+    /// WASM upgrade that changes storage layout could archive them before
+    /// the new code runs. The upgrade must be rejected until TTLs are
+    /// extended (via `extend_ttl` calls or normal contract activity).
+    UpgradeRemovesTtlFields = 76,
+    /// Issue #1083: rollback rehearsal found that rolling back to a prior
+    /// WASM version would leave some invoice data inaccessible because the
+    /// current layout uses keys the old code doesn't understand. The
+    /// rollback is rejected as unsafe.
+    RollbackUnsafe = 77,
 }

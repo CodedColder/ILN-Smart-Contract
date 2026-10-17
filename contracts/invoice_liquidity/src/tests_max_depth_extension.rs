@@ -18,6 +18,7 @@ use crate::constants::{
 use crate::errors::ContractError;
 use crate::invoice::{LpFundRequest, ReferralCode};
 use crate::storage::{validate_ttl_fields_pre_upgrade, DataKey};
+use soroban_sdk::testutils::storage::Persistent as _;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},

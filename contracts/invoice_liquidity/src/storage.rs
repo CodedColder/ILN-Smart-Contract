@@ -1,4 +1,5 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::testutils::storage::Persistent as _;
 
 use crate::config::Config;
 use crate::invoice::{
