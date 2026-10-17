@@ -623,6 +623,10 @@ pub fn set_max_oracle_age(env: Env, max_age_ledgers: u64) -> Result<(), Contract
     /// Unlike `fund_invoice`'s inline check, this never errors on stale or
     /// unverified data — it only reports the observation — making it safe
     /// for off-chain monitors/keepers to poll independent of funding activity.
+    /// It also drives Issue #1048's half-open circuit-breaker auto-recovery:
+    /// each healthy observation from a tripped oracle advances its recovery
+    /// streak (a `fund_invoice` call cannot, since it rejects before querying
+    /// while the breaker is open).
     /// Access: Anyone
     pub fn check_oracle_health(
         env: Env,
@@ -633,20 +637,64 @@ pub fn set_max_oracle_age(env: Env, max_age_ledgers: u64) -> Result<(), Contract
         oracle_registry::check_oracle_health(env, feed_type, token, payer)
     }
 
+    /// Issue #1049: permissionless, never-erroring diagnostic for the Identity
+    /// verification gate. It runs the *same* shared decision logic as
+    /// `fund_invoice` (multi-oracle quorum, then the legacy single-oracle
+    /// path: circuit breaker, timestamp monotonicity, duplicate-update cap,
+    /// ledger freshness, verified flag) — but reports the outcome instead of
+    /// erroring, so its side effects actually commit: the
+    /// `oracle_stale_data_rejected` and `oracle_feeder_disagreement` failure
+    /// events and the recorded oracle health. `fund_invoice` still returns
+    /// `Err` on every failing outcome, and Soroban rolls back events for an
+    /// `Err`-returning invocation, which is why those failures need this
+    /// committed diagnostic to be observable on chain.
+    ///
+    /// Returns `IdentityVerificationOutcome::Verified` when the payer passes
+    /// the gate (or when no oracle is resolvable — the historical fail-open).
+    /// The recorded health also drives Issue #1048's half-open circuit-breaker
+    /// auto-recovery, exactly like `check_oracle_health`.
+    /// Access: Anyone
+    pub fn check_oracle_verification(
+        env: Env,
+        feed_type: OracleFeedType,
+        token: Address,
+        payer: Address,
+    ) -> oracle_registry::IdentityVerificationOutcome {
+        oracle_registry::check_oracle_verification(env, feed_type, token, payer)
+    }
+
     /// Whether the oracle circuit breaker for `feed_type` + `token` is
     /// currently tripped (from `MAX_CONSECUTIVE_STALE_QUERIES` consecutive
     /// stale responses) and therefore excluded from `fund_invoice`'s
-    /// oracle-gated resolution until governance calls
-    /// `reset_oracle_circuit`.
+    /// oracle-gated resolution. A tripped breaker is cleared either by
+    /// governance's `reset_oracle_circuit` fast path or automatically once
+    /// the tripping oracle demonstrates a sustained run of healthy
+    /// observations (Issue #1048).
     /// Access: Anyone
     pub fn is_oracle_circuit_tripped(env: Env, feed_type: OracleFeedType, token: Address) -> bool {
         oracle_registry::is_oracle_circuit_tripped(&env, feed_type, &token)
     }
 
-    /// Reset a tripped oracle circuit breaker for `feed_type` + `token`.
-    /// There is no automatic recovery on a single fresh query — this
-    /// explicit, governance-gated call is required, so a flapping oracle
-    /// can't quietly resume being trusted by the funding path.
+    /// Issue #1048: the in-progress half-open recovery of a tripped breaker
+    /// for `feed_type` + `token` — the tripping oracle plus the length and
+    /// start ledger of its current healthy-observation streak — or `None`
+    /// when nothing is recovering. Lets operators observe whether a breaker
+    /// is on track to auto-recover or is stuck (feeding the
+    /// `oracle_circuit_recovered` event).
+    /// Access: Anyone
+    pub fn get_circuit_recovery_state(
+        env: Env,
+        feed_type: OracleFeedType,
+        token: Address,
+    ) -> Option<oracle_registry::CircuitRecoveryState> {
+        oracle_registry::get_circuit_recovery_state(env, feed_type, token)
+    }
+
+    /// Reset a tripped oracle circuit breaker for `feed_type` + `token`. This
+    /// explicit, governance-gated call is the fast path; a breaker also
+    /// auto-recovers (Issue #1048) once the tripping oracle serves a sustained
+    /// run of fresh, advancing responses — never on a single fresh query, so
+    /// a flapping oracle can't quietly resume being trusted.
     /// Access: Admin only (governance-controlled via cross-contract proposal
     /// execution, same pattern as `register_oracle` / `remove_oracle`).
     pub fn reset_oracle_circuit(
@@ -703,6 +751,55 @@ pub fn set_max_oracle_age(env: Env, max_age_ledgers: u64) -> Result<(), Contract
     /// Access: Anyone
     pub fn get_max_price_deviation_bps(env: Env) -> u32 {
         oracle_registry::get_max_price_deviation_bps(env)
+    }
+
+    // ── Issue #1047: multi-oracle Identity quorum ──────────────────────
+
+    /// Register `oracle` as an Identity feeder in `feed_type`'s multi-oracle
+    /// quorum list. When the list is non-empty, `fund_invoice`'s
+    /// oracle-gated path queries every registered feeder and requires the
+    /// configured quorum (`set_identity_quorum`) to agree the payer is
+    /// verified; disagreement fails closed. An empty list preserves the
+    /// prior single-oracle behavior.
+    /// Access: Admin only (governance-controlled via cross-contract proposal
+    /// execution, same pattern as `register_oracle` / `add_price_source`).
+    pub fn add_identity_oracle(
+        env: Env,
+        feed_type: OracleFeedType,
+        oracle: Address,
+    ) -> Result<(), ContractError> {
+        oracle_registry::add_identity_oracle(&env, feed_type, oracle)
+    }
+
+    /// Remove `oracle` from `feed_type`'s Identity-oracle quorum list.
+    /// Access: Admin only.
+    pub fn remove_identity_oracle(
+        env: Env,
+        feed_type: OracleFeedType,
+        oracle: Address,
+    ) -> Result<(), ContractError> {
+        oracle_registry::remove_identity_oracle(&env, feed_type, oracle)
+    }
+
+    /// The currently registered Identity oracles for `feed_type`.
+    /// Access: Anyone
+    pub fn get_identity_oracles(env: Env, feed_type: OracleFeedType) -> soroban_sdk::Vec<Address> {
+        oracle_registry::get_identity_oracles(env, feed_type)
+    }
+
+    /// Set the number of registered Identity oracles that must agree the payer
+    /// is verified before oracle-gated funding proceeds (the `N` in `N`-of-`M`).
+    /// Must be in `[1, MAX_IDENTITY_ORACLES_PER_FEED]`.
+    /// Access: Admin only.
+    pub fn set_identity_quorum(env: Env, quorum: u32) -> Result<(), ContractError> {
+        oracle_registry::set_identity_quorum(&env, quorum)
+    }
+
+    /// The currently configured Identity verification quorum. Defaults to
+    /// [`oracle_registry::DEFAULT_IDENTITY_QUORUM`] (1) until set.
+    /// Access: Anyone
+    pub fn get_identity_quorum(env: Env) -> u32 {
+        oracle_registry::get_identity_quorum(env)
     }
 
     /// Query every registered price source for `feed_type` + `token` and
@@ -2599,103 +2696,75 @@ pub fn update_fee_tiers(env: Env, tiers: Vec<(i128, u32)>) -> Result<(), Contrac
             return Err(ContractError::PayerReputationTooLow);
         }
 
-        // Issues #92 + #93 + #532 + circuit-breaker: optional oracle
+        // Issues #92 + #93 + #532 + circuit-breaker + #1047: optional oracle
         // verification with a data-freshness guard. When
         // require_oracle_verification is true, the oracle registry is
-        // queried for the Identity feed, resolved per the invoice's token
-        // (per-token override, then feed-type default, then the legacy
-        // price_oracle config field) — skipping any level that's
-        // circuit-tripped from repeated staleness. If nothing was ever
-        // registered, the flag is a no-op (existing fail-open behavior). If
-        // everything registered is circuit-tripped, funding is rejected
-        // rather than silently proceeding as if no oracle existed.
+        // consulted for the Identity feed. Two modes:
+        //   * Issue #1047 (multi-oracle quorum): if governance has registered
+        //     Identity feeders via `add_identity_oracle`, EVERY registered
+        //     feeder is queried and the configured quorum
+        //     (`set_identity_quorum`) must agree the payer is verified with
+        //     fresh data. Disagreement fails closed as `PayerUnverified`.
+        //   * Legacy single-oracle mode (empty quorum list): resolved per the
+        //     invoice's token (per-token override, then feed-type default,
+        //     then the legacy price_oracle config field) — skipping any level
+        //     that's circuit-tripped from repeated staleness.
+        // If nothing was ever registered, the flag is a no-op (existing
+        // fail-open behavior). If everything registered is circuit-tripped,
+        // funding is rejected rather than silently proceeding as if no oracle
+        // existed.
         if require_oracle_verification {
-            let resolution = oracle_registry::resolve_oracle_for_verification(
+            // Issue #93: the max age bound is shared by the multi-oracle quorum
+            // check and the single-oracle path below.
+            let max_age = crate::storage::get_config(&env)
+                .map(|c| c.max_oracle_age_ledgers)
+                .unwrap_or(DEFAULT_MAX_ORACLE_AGE_LEDGERS);
+
+            // Issue #1049: run the *shared* identity gate. The exact same helper
+            // backs the public, never-erroring `check_oracle_verification`
+            // diagnostic — the only path whose stale / disagreement events can
+            // survive into a ledger, because an `Err`-returning invocation rolls
+            // every emitted event (and storage write) back. This block therefore
+            // keeps returning the same errors as before, but the decision itself
+            // — and the order it is reached in (quorum → circuit → monotonicity →
+            // duplicate → health record → freshness → verified) — now lives in
+            // one place so the two paths can never drift.
+            match oracle_registry::evaluate_identity_verification(
                 &env,
                 OracleFeedType::Identity,
                 &invoice.token,
-            );
-            if resolution == oracle_registry::OracleResolution::CircuitOpen {
-                return Err(ContractError::OracleCircuitOpen);
-            }
-            if let oracle_registry::OracleResolution::Available(oracle_addr) = resolution {
-                let response: OracleVerificationResponse = env.invoke_contract(
-                    &oracle_addr,
-                    &Symbol::new(&env, "get_payer_data"),
-                    vec![&env, invoice.payer.clone().into_val(&env)],
-                );
-
-                // Issue #93: reject stale oracle data.
-                // Staleness = current_ledger_sequence - oracle.timestamp >= max_oracle_age_ledgers.
-                // If max_oracle_age_ledgers == 0 the check is disabled (governance escape hatch).
-                let max_age = crate::storage::get_config(&env)
-                    .map(|c| c.max_oracle_age_ledgers)
-                    .unwrap_or(DEFAULT_MAX_ORACLE_AGE_LEDGERS);
-
-                // Issue #1052: monotonicity — a data timestamp must never go
-                // *backwards* for the same oracle on this feed + token
-                // (replayed / rolled-back data). Read the previous health
-                // snapshot *before* `record_oracle_health` overwrites it below.
-                // Combined with the #1050 rule (future-dated data is stale), an
-                // accepted response must lie in [last_recorded, current_ledger].
-                if oracle_registry::is_oracle_data_timestamp_regression(
-                    &env,
-                    OracleFeedType::Identity,
-                    &invoice.token,
-                    &oracle_addr,
-                    response.timestamp,
-                ) {
+                &invoice.payer,
+                max_age,
+            ) {
+                oracle_registry::IdentityVerificationOutcome::Verified => {
+                    // Payer is verified: either the multi-oracle quorum agreed, or
+                    // the legacy single-oracle path returned fresh + verified data
+                    // (or no oracle was resolvable — the historical fail-open).
+                }
+                // Issue #1047: feeders disagreed (or too few responded fresh +
+                // verified) — fail closed.
+                oracle_registry::IdentityVerificationOutcome::QuorumDisagreement => {
+                    return Err(ContractError::PayerUnverified);
+                }
+                // Everything registered for this feed is circuit-tripped from
+                // repeated staleness — reject rather than silently proceeding.
+                oracle_registry::IdentityVerificationOutcome::CircuitOpen => {
+                    return Err(ContractError::OracleCircuitOpen);
+                }
+                // Issue #1052: replayed / rolled-back data timestamp.
+                oracle_registry::IdentityVerificationOutcome::TimestampRegression => {
                     return Err(ContractError::OracleTimestampRegression);
                 }
-
-                // Issue #1053: bound duplicate update frequency. The
-                // monotonicity rule above allows an *equal* timestamp (that's
-                // what makes it non-*decreasing*), but nothing there stops an
-                // oracle from standing still: an oracle that has stopped
-                // advancing and just re-serves the same value keeps producing
-                // non-stale responses and keeps resetting the stale streak, so
-                // it could stand in for live verification indefinitely. Once
-                // the same oracle has served an identical data timestamp more
-                // than `MAX_CONSECUTIVE_DUPLICATE_UPDATES` times in a row,
-                // reject the next duplicate. Read the prior health snapshot
-                // *before* `record_oracle_health` overwrites it below.
-                if oracle_registry::is_oracle_data_duplicate_update(
-                    &env,
-                    OracleFeedType::Identity,
-                    &invoice.token,
-                    &oracle_addr,
-                    response.timestamp,
-                ) {
+                // Issue #1053: too many consecutive identical timestamps.
+                oracle_registry::IdentityVerificationOutcome::DuplicateUpdate => {
                     return Err(ContractError::OracleDuplicateUpdate);
                 }
-
-                // Issue #532: record health (staleness) for this oracle
-                // regardless of outcome, so monitoring sees every query.
-                oracle_registry::record_oracle_health(
-                    &env,
-                    OracleFeedType::Identity,
-                    &invoice.token,
-                    &oracle_addr,
-                    response.timestamp,
-                    max_age,
-                );
-
-                // Issue #93 / #1050: reject stale oracle data via the single
-                // ledger-based freshness rule (shared with `record_oracle_health`
-                // above, so the funding decision and the recorded health snapshot
-                // can never disagree). It treats future-dated timestamps as stale
-                // rather than as age 0. If max_oracle_age_ledgers == 0 the rule
-                // short-circuits to "not stale" (governance escape hatch).
-                if oracle_registry::is_oracle_data_stale(
-                    env.ledger().sequence(),
-                    response.timestamp,
-                    max_age,
-                ) {
+                // Issue #93 / #1050: stale (or future-dated) oracle data.
+                oracle_registry::IdentityVerificationOutcome::Stale => {
                     return Err(ContractError::OracleDataStale);
                 }
-
-                // Issue #92: reject unverified payers.
-                if !response.is_verified {
+                // Issue #92: oracle reports the payer is unverified.
+                oracle_registry::IdentityVerificationOutcome::Unverified => {
                     return Err(ContractError::PayerUnverified);
                 }
             }

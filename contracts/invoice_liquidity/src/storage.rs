@@ -111,6 +111,14 @@ pub enum DataKey {
     /// only via governance-gated `reset_oracle_circuit`, never auto-cleared
     /// by a fresh query, to avoid flapping).
     OracleCircuitTripped(crate::oracle_registry::OracleFeedType, Address),
+    /// Issue #1048: half-open auto-recovery bookkeeping for the circuit
+    /// breaker at this feed type + token — which oracle tripped it, and how
+    /// many consecutive healthy (fresh, timestamp-advancing) observations that
+    /// oracle has since served (plus the ledger the current streak began).
+    /// Absent = nothing to auto-recover (an admin `reset_oracle_circuit` is
+    /// required). Set when the breaker trips, advanced on each healthy
+    /// observation, and removed on auto-recovery or `reset_oracle_circuit`.
+    OracleCircuitRecovery(crate::oracle_registry::OracleFeedType, Address),
     /// Issue #price-deviation: list of registered price-reporting oracle
     /// sources for a feed type, consulted together for cross-source
     /// deviation checking. Distinct from OracleRegistry/TokenOracle (the
@@ -121,6 +129,19 @@ pub enum DataKey {
     /// deviation (basis points) between a price source's reported price
     /// and the cross-source median before it's rejected as an outlier.
     MaxPriceDeviationBps,
+    /// Issue #1047: registered Identity oracles for a feed type, queried
+    /// together so `fund_invoice` can require N-of-M agreement on a payer's
+    /// verification instead of trusting a single oracle. Bounded by
+    /// `constants::MAX_IDENTITY_ORACLES_PER_FEED`. Distinct from
+    /// `OracleRegistry`/`TokenOracle` (the single-oracle resolution chain):
+    /// when this list is non-empty it takes precedence for the `Identity`
+    /// gate, and an empty list preserves the prior single-oracle behavior.
+    IdentityOracles(crate::oracle_registry::OracleFeedType),
+    /// Issue #1047: governance-configurable number of registered Identity
+    /// oracles that must agree the payer is verified before oracle-gated
+    /// funding proceeds (the `N` in `N`-of-`M`). Absent =
+    /// `oracle_registry::DEFAULT_IDENTITY_QUORUM`. Stored as a `u32`.
+    IdentityQuorum,
     /// Issue #816: per-feed TWAP opt-in flag. `true` routes `Price`
     /// reads through the windowed TWAP average; `false` (default) keeps
     /// the existing raw spot behavior. Stored per feed type since not
@@ -227,6 +248,12 @@ pub const RESOURCE_ENVELOPE: &[(&str, u32)] = &[
     (
         "price_sources_per_feed",
         crate::constants::MAX_PRICE_SOURCES_PER_FEED,
+    ),
+    // Identity oracles per feed — `DataKey::IdentityOracles(OracleFeedType)`,
+    // bounded by `constants::MAX_IDENTITY_ORACLES_PER_FEED` (Issue #1047).
+    (
+        "identity_oracles_per_feed",
+        crate::constants::MAX_IDENTITY_ORACLES_PER_FEED,
     ),
     // Admin action audit log slots — `DataKey::AdminActionLog(u32)`, a ring
     // buffer bounded by `access::ADMIN_ACTION_LOG_CAPACITY` (Issue #645).

@@ -353,6 +353,7 @@ hand-written literal):
 | ------------- | ----------- | ------------------------ |
 | `fund_queue_entries` | `FundQueue(u64)` | `constants::MAX_FUND_QUEUE_LEN` (50) |
 | `price_sources_per_feed` | `PriceSources(OracleFeedType)` | `constants::MAX_PRICE_SOURCES_PER_FEED` (20) |
+| `identity_oracles_per_feed` | `IdentityOracles(OracleFeedType)` | `constants::MAX_IDENTITY_ORACLES_PER_FEED` (20) |
 | `admin_action_log_entries` | `AdminActionLog(u32)` | `access::ADMIN_ACTION_LOG_CAPACITY` (50) |
 | `top_payers_entries` | `TopPayersHeap` | `constants::TOP_PAYERS_CAPACITY` (50) |
 | `twap_samples_per_feed_token` | `TwapSamples(feed, token)` | `twap::MAX_TWAP_SAMPLES` (100) |
@@ -371,6 +372,92 @@ in `tests_benchmarks.rs` (`benchmark_envelope_read_views_at_cap`; see
 
 **Migration note:** documentation/measurement-only — no storage key, value
 encoding, TTL constant, or contract behavior changed. No migration is required.
+
+### Multi-oracle Identity quorum keys (Issue #1047)
+
+`fund_invoice`'s oracle-gated path can now require several Identity feeders to
+agree. Two new **instance** keys back this:
+
+| Key | Value | Notes |
+| --- | ----- | ----- |
+| `IdentityOracles(OracleFeedType)` | `Vec<Address>` | the registered Identity feeders for that feed type; bounded by `MAX_IDENTITY_ORACLES_PER_FEED` (20) |
+| `IdentityQuorum` | `u32` | the `N` in `N`-of-`M`; validated to `[1, 20]`, defaults to 1 when unset |
+
+**Before:** the Identity feed resolved a single oracle
+(`resolve_oracle_for_verification`); there was no feeder list and no quorum key.
+
+**After:** `add_identity_oracle` / `remove_identity_oracle` (admin, rate-limited)
+maintain the list — re-adding an existing feeder is a no-op, and a genuinely new
+feeder past the cap fails with `TooManyIdentityOracles` (79) — while
+`set_identity_quorum` (admin, rate-limited) sets the threshold, rejecting `0` or
+`> 20` with `InvalidIdentityQuorum` (80). When the list is non-empty,
+`check_identity_quorum` iterates it in full (one `get_payer_data` call per
+feeder), so the cap bounds the worst-case `fund_invoice` cross-contract cost and
+the `oracle_feeder_disagreement` payload's `total_oracles` field. See
+`tests_oracle_registry.rs` (quorum met / disagreement fails closed / reverting
+feeder / ledger-boundary staleness / event / cap + idempotency / authorization)
+and [`benchmarks.md`](benchmarks.md#multi-oracle-identity-quorum-cost-issue-1047).
+
+**Guarantee going forward:** the feeder list is bounded by
+`MAX_IDENTITY_ORACLES_PER_FEED`, so the number of cross-contract calls a single
+`fund_invoice` makes on the quorum path — and the size of its disagreement event
+— is bounded independent of how the list was grown.
+
+**Migration note:** the keys are absent on an upgraded contract and read as
+"empty list" / "default quorum (1)", so a plain `upgrade()` suffices and **no
+data migration is required** (storage version unchanged); an empty list preserves
+the pre-#1047 single-oracle path. The list is bounded and drift-tested in
+`tests_storage.rs` like every other entry in `RESOURCE_ENVELOPE`.
+
+### Circuit-breaker recovery key (Issue #1048)
+
+A tripped oracle circuit breaker can now auto-recover (half-open) once the
+tripping oracle proves a sustained run of healthy observations. One new
+**persistent** key backs the in-progress recovery:
+
+| Key | Value | Notes |
+| --- | ----- | ----- |
+| `OracleCircuitRecovery(OracleFeedType, Address)` | `CircuitRecoveryState { tripped_oracle, consecutive_healthy, first_healthy_ledger }` | written when a breaker trips, updated on each healthy observation, removed on recovery or admin reset |
+
+**Before:** a tripped breaker (`OracleCircuitTripped`) was sticky and could only
+be cleared by the governance `reset_oracle_circuit`; there was no per-trip
+bookkeeping.
+
+**After:** on a trip, `record_oracle_health` writes the recovery state pinned to
+the oracle that tripped it. The permissionless `check_oracle_health` path
+advances `consecutive_healthy` for fresh, timestamp-advancing observations from
+that oracle (any other observation resets it to 0). Once the streak reaches
+`CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS` (3) **and**
+`CIRCUIT_RECOVERY_MIN_LEDGERS` (120) ledgers have elapsed since the streak began,
+both this key and `OracleCircuitTripped` are removed and `oracle_circuit_recovered`
+is emitted. `reset_oracle_circuit` also removes this key. See
+`tests_oracle_registry.rs` (sustained-health success / insufficient window /
+insufficient count / frozen oracle / mid-streak stale reset / different-oracle
+isolation / recovery event / re-trip / reset clears progress) and
+[`benchmarks.md`](benchmarks.md#circuit-breaker-auto-recovery-cost-on-the-keeper-path-issue-1048).
+
+**Guarantee going forward:** the key is created only when a breaker trips and
+removed when it clears, so at most one such entry exists per currently-tripped
+`(feed type, token)` — it cannot accumulate.
+
+**Migration note:** the key is absent on an upgraded contract and simply reads as
+`None`, which the recovery helper treats as **fail-safe** — no auto-recovery, so
+an already-tripped breaker still requires the admin `reset_oracle_circuit` until
+it re-trips under the new code. No storage key, value encoding, error code, or
+TTL constant changed, so **no data migration is required**.
+
+### Oracle gate-failure events — no new keys (Issue #1049)
+
+Exposing the Identity gate through the permissionless `check_oracle_verification`
+diagnostic — so its `oracle_stale_data_rejected` / `oracle_feeder_disagreement`
+failure events commit instead of being rolled back with a rejected
+`fund_invoice` — adds **no storage key**. The shared
+`oracle_registry::evaluate_identity_verification` helper reads and writes exactly
+the same `OracleHealth` (`DataKey::OracleHealth`), price-source, Identity-feeder,
+and circuit-breaker keys the funding path already used, in the same order, so the
+storage layout is unchanged and **no data migration is required** (storage version
+unchanged). The only new on-chain artifact is the `OracleDataStaleRejected` event
+type.
 
 ### Resolving a queue after invoice cleanup (Issue #1017)
 

@@ -6,6 +6,10 @@
 //! environment.
 //!
 //! Test primitives beyond the standard oracle interface:
+//! - `set_feeder(address)` — configure the authorized feeder (oracle operator)
+//!   address. Production oracles set this once at deployment; the mock exposes
+//!   it so tests can drive the feeder gate (Issue #1046).
+//! - `get_feeder()` — read the currently configured feeder, if any.
 //! - `set_verified(address, bool)` — set per-address verification status
 //!   without any authorization check.
 //! - `set_timestamp(ts: u64)` — override the global timestamp returned for
@@ -13,6 +17,12 @@
 //! - `set_should_panic()` — arm a one-shot flag that causes the very next
 //!   `get_verification()` call to panic, simulating an oracle contract failure.
 //!   The flag is cleared after it fires so subsequent calls succeed.
+//!
+//! Issue #1046 — `update_verification` is the oracle's feeder (operator) write
+//! path and now enforces the interface's authorization requirement: it requires
+//! the configured feeder's signature and rejects the call when no feeder has
+//! been configured. The `set_*` helpers above remain unrestricted because they
+//! are test-only setup primitives, not part of the `OracleInterface` surface.
 
 #![allow(dead_code)]
 
@@ -36,6 +46,8 @@ pub struct VerificationResult {
 enum MockOracleKey {
     /// Per-address verification flag.
     Verified(Address),
+    /// Authorized feeder (oracle operator) address — Issue #1046.
+    Feeder,
     /// Global timestamp returned for all queries.
     Timestamp,
     /// One-shot panic flag.
@@ -94,15 +106,45 @@ impl MockOracle {
 
     /// Update verification status for `payer`.
     ///
-    /// Matches `OracleInterface::update_verification`.
-    /// No authorization check — unrestricted in this mock.
+    /// Matches `OracleInterface::update_verification` — and, unlike the pre-#1046
+    /// mock, enforces the interface's authorization requirement: only the
+    /// configured feeder's signature is accepted.
+    ///
+    /// Panics with `"mock oracle: feeder not configured"` when `set_feeder` was
+    /// never called; when a feeder is configured but did not sign, the host
+    /// aborts the invocation with an auth error.
     pub fn update_verification(env: Env, payer: Address, verified: bool) {
+        let feeder: Address = match env
+            .storage()
+            .persistent()
+            .get(&MockOracleKey::Feeder)
+        {
+            Some(f) => f,
+            None => panic!("mock oracle: feeder not configured"),
+        };
+        feeder.require_auth();
         env.storage()
             .persistent()
             .set(&MockOracleKey::Verified(payer), &verified);
     }
 
     // ── Mock-specific helpers ─────────────────────────────────────────────────
+
+    /// Configure the authorized feeder (oracle operator) address — Issue #1046.
+    ///
+    /// Mock setup helper with no authorization check, exactly like
+    /// `set_verified`. Production oracles set this once in their constructor /
+    /// admin path; the mock exposes it so tests can drive the feeder gate.
+    pub fn set_feeder(env: Env, feeder: Address) {
+        env.storage()
+            .persistent()
+            .set(&MockOracleKey::Feeder, &feeder);
+    }
+
+    /// Read the currently configured feeder address, if any.
+    pub fn get_feeder(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&MockOracleKey::Feeder)
+    }
 
     /// Set verification status for `address` without any authorization check —
     /// equivalent to a privileged oracle-operator update for test setup.

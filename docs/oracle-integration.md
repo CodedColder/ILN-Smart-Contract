@@ -34,7 +34,249 @@ pub struct VerificationResult {
 
 The `get_verification` method must never panic under normal conditions. If no record exists for a payer, return `VerificationResult { verified: false, timestamp: 0 }`.
 
-The `update_verification` method should enforce access control (e.g., `require_auth()` for the oracle operator address). The ILN contract never calls this method directly.
+`update_verification` is the oracle's **feeder** (operator) write path and **must** be authorized — see [Authorizing the Feeder](#authorizing-the-feeder-issue-1046) below. The ILN contract never calls this method directly.
+
+---
+
+## Authorizing the Feeder (Issue #1046)
+
+`update_verification` is the single write path that can flip a payer from
+unverified to verified. When the ILN is configured with
+`require_oracle_verification = true`, that flip is exactly what unlocks funding
+in `fund_invoice`. An **unrestricted** `update_verification` therefore lets
+anyone mint funding eligibility for any payer — the disposition/credit gate is
+only as strong as this one entry point.
+
+A conforming oracle **MUST**:
+
+1. persist a designated **feeder** (operator) address — set once by the deployer
+   / operator at deployment;
+2. require that address's signature (`feeder.require_auth()`) before mutating any
+   verification state; and
+3. reject the call when **no feeder has been configured** (fail closed — never
+   fall back to "anyone may write").
+
+The reference implementation in
+[`contracts/tests/mocks/mock_oracle.rs`](../contracts/tests/mocks/mock_oracle.rs)
+models exactly this: `set_feeder(address)` configures the operator,
+`update_verification` calls `feeder.require_auth()` and panics with
+`"mock oracle: feeder not configured"` when none is set, and `get_feeder()`
+exposes the current operator. Verified end-to-end by
+[`contracts/tests/oracle_integration_test.rs`](../contracts/tests/oracle_integration_test.rs)
+(success, unconfigured, unauthorized-signer under real auth, and feeder
+rotation) and by the funding-path tests in
+`contracts/invoice_liquidity/src/tests_oracle_freshness.rs`.
+
+### Before / after
+
+| | Before #1046 | After #1046 |
+|---|---|---|
+| `update_verification` authorization | documented in this guide and in `oracle_interface.rs`, but **not enforced** — any caller could flip any payer to verified | requires the configured feeder's `require_auth()`; an unauthorized signer is rejected and the write does not land |
+| No feeder configured | unrestricted write still succeeded | call is rejected (`feeder not configured`) |
+| Funding impact (when `require_oracle_verification = true`) | anyone could open the funding gate for any payer | only the configured feeder can open the gate |
+| ILN contract surface | unchanged — the ILN never calls `update_verification` | unchanged — authorization is enforced inside the oracle contract the registry points at |
+| Feeder rotation | n/a | re-pointing the feeder immediately revokes the previous one; the old feeder's writes are rejected, the new one's accepted |
+
+The ILN contract's own behavior is **unchanged** by this issue: the gate lives on
+the oracle's write path, which the ILN never calls. What changes is that a
+compliant oracle can no longer ship an unrestricted operator entry point.
+
+---
+
+## Handling Feeder Disagreement (Issue #1047)
+
+A single Identity oracle is a single point of both trust and failure: one
+mistaken, offline, or compromised feeder decides funding eligibility for every
+payer. #1046 closes *who may write* the oracle; #1047 closes *how many oracles
+must agree* before that write unlocks funding.
+
+Governance may register several Identity feeders, and `fund_invoice` will then
+require a configurable quorum of them to agree the payer is verified:
+
+```typescript
+// Register two more Identity feeders (admin; rate-limited).
+await ilnClient.add_identity_oracle({ feed_type: "Identity", oracle: feederB });
+await ilnClient.add_identity_oracle({ feed_type: "Identity", oracle: feederC });
+
+// Require 2 of the 3 registered feeders to agree (admin; must be in [1, 20]).
+await ilnClient.set_identity_quorum({ quorum: 2 });
+```
+
+When the list is non-empty, `fund_invoice` queries **every** registered feeder
+(via `get_payer_data`) and counts the responses that are both `is_verified`
+**and** fresh (same ledger-age rule as the single-oracle path — see
+[Staleness Policy](#staleness-policy)). If fewer than the configured quorum
+agree, funding **fails closed** with `PayerUnverified` and an
+`oracle_feeder_disagreement` event is emitted carrying `verified_count`,
+`required_quorum`, and `total_oracles` so the disagreement is observable
+off-chain.
+
+A conforming feeder therefore only has to implement the **existing**
+`OracleInterface` (`get_payer_data`) — there is no new method, no new version,
+and no ABI change; each feeder is an independent deployment. The safety property
+is *disagreement fails closed*: a feeder that reverts, returns unverified, or
+returns stale data simply contributes no agreement, so it can never **force**
+verification through. Note this cuts both ways — a **quiet** feeder (one that is
+down or stale) also withholds its agreement, so size the quorum to your
+tolerance for feeder downtime (e.g. `2-of-3`, not `3-of-3`, if one feeder may be
+offline).
+
+### Before / after
+
+| | Before #1047 | After #1047 |
+|---|---|---|
+| Identity resolution | one resolved oracle (`resolve_oracle_for_verification`) | governance registers up to `MAX_IDENTITY_ORACLES_PER_FEED` (20) feeders; `fund_invoice` queries all of them when the list is non-empty |
+| Decision rule | that one oracle's `is_verified` + freshness | `N`-of-`M` agreement, `N` = `get_identity_quorum()` (default 1) |
+| Feeder disagreement | not consultable, not observable | fails closed (`PayerUnverified`) + `oracle_feeder_disagreement` event |
+| Bad feeder impact | a single bad feeder decides the gate | a reverting / unverified / stale feeder contributes **no** agreement (cannot force verification) |
+| Empty list (default) | — | `NotConfigured` → the **unchanged** single-oracle path runs (regression/duplicate/freshness/circuit checks intact) |
+| Interface | `OracleInterface` v1 | unchanged — feeders are independent `get_payer_data` deployments |
+
+Feeder-list and quorum changes are admin-only and rate-limited
+(`add_identity_oracle`, `remove_identity_oracle`, `set_identity_quorum`); the
+read accessors `get_identity_oracles` / `get_identity_quorum` are public. The
+list is capped at 20 (`TooManyIdentityOracles` past the cap; adding an existing
+oracle is a no-op) and the quorum is validated to `[1, 20]`
+(`InvalidIdentityQuorum` otherwise) — see [access-control.md](access-control.md).
+
+---
+
+## Recovering After a Feeder Outage (Issue #1048)
+
+The per-feed circuit breaker (see [Failure Handling](#failure-handling)) trips
+after `MAX_CONSECUTIVE_STALE_QUERIES` (3) consecutive stale responses from the
+same oracle, and `fund_invoice`'s gated path then stops resolving that oracle.
+Before #1048 the breaker was **sticky**: it could only be cleared by the
+governance-gated `reset_oracle_circuit`, so a *transient* feeder outage jammed
+oracle-gated funding even after the feeder came back — with no on-chain way to
+tell "still broken" from "recovered but still latched".
+
+Since #1048 the breaker is **half-open** and self-heals: the permissionless
+keeper path, `check_oracle_health`, auto-clears it once the feeder that caused
+the trip serves a **sustained** run of healthy observations.
+
+```typescript
+// A keeper already polls this to track staleness; it now also drives recovery.
+await ilnClient.check_oracle_health({ feed_type: "Identity", token, payer });
+
+// Observe in-progress recovery (anyone): None when nothing is recovering.
+const rec = await ilnClient.get_circuit_recovery_state({ feed_type: "Identity", token });
+// rec => { tripped_oracle, consecutive_healthy, first_healthy_ledger }
+```
+
+Recovery requires **all** of:
+
+- the observations come from the oracle recorded as having *caused* the trip
+  (`CircuitRecoveryState.tripped_oracle`) — a different, even healthy, oracle
+  cannot clear this breaker;
+- `CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS` (3) **consecutive** healthy
+  observations, where "healthy" means fresh (per the [Staleness
+  Policy](#staleness-policy)) **and** timestamp-advancing versus that oracle's
+  previous snapshot (a frozen/replayed value never counts); and
+- `CIRCUIT_RECOVERY_MIN_LEDGERS` (120) ledgers elapsed since the streak began.
+
+Any stale or non-advancing observation resets the streak to 0. A single fresh
+query advances it to 1 but **never** recovers — the anti-flapping guarantee is
+preserved. When the thresholds are met the breaker is cleared and an
+`oracle_circuit_recovered` event
+(`{ feed_type, token, healthy_observations, elapsed_ledgers }`) is emitted.
+
+Recovery is **unprivileged to trigger**: keepers/monitors running
+`check_oracle_health` on their normal cadence will un-jam the gate automatically.
+It is driven by that path and **not** by `fund_invoice`, because an open breaker
+makes `fund_invoice` reject *before* it queries the oracle. The governance fast
+path `reset_oracle_circuit` remains — it is still admin-only and rate-limited,
+and now also clears any in-progress recovery bookkeeping, so an operator can
+force the gate closed immediately if needed.
+
+### Before / after
+
+| | Before #1048 | After #1048 |
+|---|---|---|
+| Tripped breaker | cleared only by admin `reset_oracle_circuit`; a genuinely recovered feeder stayed latched | **half-open** — auto-closes after a sustained healthy window |
+| Recovery trigger | governance action | permissionless `check_oracle_health` keeper path (no privilege) |
+| Recovery threshold | n/a | 3 consecutive healthy observations **and** ≥ 120 ledgers elapsed |
+| "Healthy" | n/a | fresh **and** timestamp-advancing (frozen/replayed data does not count) |
+| Single fresh query | did not clear it (sticky) | still does not clear it (streak reaches 1) — anti-flapping preserved |
+| Different oracle | n/a | cannot clear the breaker; only the tripping oracle can |
+| No recovery record | n/a | fails safe — admin `reset_oracle_circuit` still required |
+| Event | `oracle_circuit_reset` | plus `oracle_circuit_recovered` |
+| Observability | `is_oracle_circuit_tripped` | plus `get_circuit_recovery_state` (anyone) |
+
+Runtime tuning is by contract upgrade of the two constants
+(`oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS`,
+`CIRCUIT_RECOVERY_MIN_LEDGERS`); there is no admin setter, mirroring the
+`MAX_CONSECUTIVE_STALE_QUERIES` trip threshold.
+
+---
+
+## Observing Gate Failures (Issue #1049)
+
+`fund_invoice`'s Identity gate reports *every* rejection — stale data, feeder
+disagreement, a regressed or duplicated timestamp, an open breaker, an unverified
+payer — by returning `Err`. Soroban rolls back all events (and storage writes) of
+an invocation that returns an error, so those failures leave **no on-chain
+trace**: from a rejected funding transaction you can see that it failed, but not
+*why*. This is exactly the rollback problem [ADR-010](adr/ADR-010-oracle-registry.md)
+described for staleness monitoring, and it is why a failure event needs a
+committed path to land on.
+
+Since #1049 the gate's decision is exposed through a **permissionless,
+never-erroring diagnostic** that returns the outcome instead of an error, so its
+failure events commit:
+
+```typescript
+// Anyone may call this. It runs the *same* gate fund_invoice runs
+// (quorum → circuit → monotonicity → duplicate → freshness → verified) and
+// returns a structured outcome instead of an error, so its events survive.
+const outcome = await ilnClient.check_oracle_verification({
+  feed_type: "Identity",
+  token,
+  payer,
+});
+// outcome is one of:
+//   "Verified"            — the payer passes (also the legacy fail-open case)
+//   "Stale"               — fresh data rejected; emits OracleDataStaleRejected
+//   "QuorumDisagreement"  — feeders disagree; emits OracleFeederDisagreement
+//   "TimestampRegression" — replayed/rolled-back timestamp (Issue #1052)
+//   "DuplicateUpdate"     — repeated identical timestamp past the cap (#1053)
+//   "CircuitOpen"         — every candidate oracle is circuit-tripped
+//   "Unverified"          — the oracle reports the payer is not verified
+```
+
+Unlike `check_oracle_health` (which only observes the single resolved oracle),
+`check_oracle_verification` runs the **full** identity gate — including the
+multi-oracle quorum — and emits the failure events:
+
+- `oracle_stale_data_rejected` →
+  `OracleDataStaleRejected { feed_type, token, oracle, data_timestamp,
+  age_ledgers, max_age_ledgers }` (new in #1049), and
+- `oracle_feeder_disagreement` →
+  `OracleFeederDisagreement { feed_type, token, verified_count,
+  required_quorum, total_oracles }` (Issue #1047 — previously only reachable on
+  a `fund_invoice` that immediately rolled it back).
+
+It also records oracle health exactly like the gate, so it still drives the
+Issue #1048 circuit-breaker recovery. `fund_invoice` itself is unchanged in
+behaviour: it keeps returning the same errors (and rolling its own events back),
+so existing integrations need no changes.
+
+### Before / after
+
+| | Before #1049 | After #1049 |
+|---|---|---|
+| A rejected `fund_invoice` | failure reason invisible (events rolled back) | unchanged — but the reason is now observable via the diagnostic |
+| Stale-data signal | none | `oracle_stale_data_rejected` (permissionless, commits) |
+| Disagreement signal | `oracle_feeder_disagreement` only reachable on a rolled-back path | same event, now committed via the diagnostic |
+| New entry point | — | `check_oracle_verification(feed_type, token, payer)` → `IdentityVerificationOutcome` (Anyone) |
+| Gate implementation | inline in `fund_invoice` | shared `oracle_registry::evaluate_identity_verification`; funding maps the outcome back to the same error |
+| Authorization | n/a | none — the diagnostic has no `require_auth`, mirroring `check_oracle_health` |
+| Health recording | funding path only | diagnostic also records health (drives #1048 recovery) |
+
+Wire `check_oracle_verification` into your monitoring cadence alongside
+`check_oracle_health`: alert on a run of `Stale` / `QuorumDisagreement` outcomes
+(a feeder is stale, misconfigured, or compromised and funding is failing closed)
+and on `oracle_stale_data_rejected` / `oracle_feeder_disagreement` events.
 
 ---
 
@@ -78,7 +320,10 @@ Once registered, all subsequent payer-verification checks use the new oracle. Th
 
 ### Step 4 — Populate verification data
 
-The oracle operator calls `update_verification` for each verified payer:
+The oracle **feeder** (operator) calls `update_verification` for each verified
+payer, signing with the feeder key configured at deployment (Issue #1046 — see
+[Authorizing the Feeder](#authorizing-the-feeder-issue-1046)). A call not signed
+by the configured feeder is rejected:
 
 ```typescript
 await oracleClient.update_verification({
@@ -87,7 +332,8 @@ await oracleClient.update_verification({
 }, { fee: 100 });
 ```
 
-Refresh records at least every 7 days to stay within the staleness threshold.
+Refresh records more often than `max_oracle_age_ledgers` (≈24h by default) to
+stay within the enforced staleness window — see [Staleness Policy](#staleness-policy).
 
 ---
 
@@ -99,6 +345,8 @@ Refresh records at least every 7 days to stay within the staleness threshold.
 | Oracle returns `verified = false` | Payer check fails |
 | Oracle timestamp > 7 days old | Treated as unverified |
 | Oracle contract panics | Treated as unverified |
+| Identity feeders disagree (fewer than the quorum agree) | Treated as unverified (`PayerUnverified`); an `oracle_feeder_disagreement` event is emitted (Issue #1047) |
+| A single Identity feeder reverts / is stale | It contributes no agreement; the remaining feeders still satisfy the quorum (Issue #1047) |
 
 ---
 
@@ -152,9 +400,11 @@ See `contracts/tests/oracle_integration_test.rs` for complete test examples.
 
 ## Security Checklist
 
-- [ ] Oracle `update_verification` enforces `require_auth()` for the operator
+- [ ] Oracle `update_verification` requires the **configured feeder's** signature (`feeder.require_auth()`), and rejects calls when no feeder is set (Issue #1046)
+- [ ] Feeder key is a dedicated operator key — not the ILN admin key — and is rotatable (`set_feeder`) without redeploying the oracle
 - [ ] The ILN admin key that calls `set_price_oracle` is protected (hardware wallet / multisig)
 - [ ] Consider a governance timelock on oracle registration changes (see [governance.md](./governance.md))
 - [ ] Refresh verification records before they exceed 7 days
 - [ ] Monitor oracle contract for unexpected upgrades or admin key changes
-- [ ] The oracle is a single trust point — evaluate whether multi-oracle quorum is needed for your use case
+- [ ] For disagreement safety, register more than one Identity feeder (`add_identity_oracle`) and raise `set_identity_quorum` above 1 (e.g. `2-of-3`) — an empty list or a quorum of 1 keeps the single-oracle trust model (Issue #1047)
+- [ ] Monitor the `oracle_feeder_disagreement` event; repeated disagreements mean a feeder is stale, misconfigured, or compromised and funding is failing closed

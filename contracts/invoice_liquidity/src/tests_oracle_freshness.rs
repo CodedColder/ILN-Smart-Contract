@@ -34,7 +34,7 @@ const INVOICE_AMOUNT: i128 = 1_000_000_000;
 const DISCOUNT_RATE: u32 = 300;
 const DUE_DATE_OFFSET: u64 = 60 * 60 * 24 * 30;
 use soroban_sdk::{
-    contract, contractimpl,
+    contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger as _},
     Address, Env,
 };
@@ -1278,4 +1278,258 @@ proptest! {
         // streak has already reached the cap (the next duplicate exceeds it).
         prop_assert_eq!(got, new_ts == ts && duplicates >= MAX_DUPLICATE);
     }
+}
+
+// ================================================================
+// Issue #1046 — authorize oracle feeder updates
+// ================================================================
+//
+// `MockTimestampedOracle` (above) is a *read-only* fixture: it is always
+// verified and tests invert control through `set_timestamp`. It therefore
+// cannot exercise the write path that actually decides funding eligibility.
+// The oracle below models the real one: `update_verification` is the feeder
+// (operator) entry point, it is gated on the configured feeder's
+// authorization, and it stamps each accepted update with the ledger it
+// happened at — so a feeder update is a genuine data event that the ILN
+// freshness rule ages like any other.
+//
+// Before #1046: an oracle's `update_verification` was documented as requiring
+// the operator's `require_auth()` (see `oracle_interface.rs` and
+// `docs/oracle-integration.md`) but nothing enforced it, so anyone could mint
+// funding eligibility for any payer. After: only the configured feeder can, and
+// the resulting data still has to be fresh for `fund_invoice` to honour it.
+
+// ----------------------------------------------------------------
+// Feeder-authorized oracle fixture
+// ----------------------------------------------------------------
+#[contract]
+struct MockFeederOracle;
+
+#[contracttype]
+enum FeederOracleKey {
+    /// Authorized feeder (oracle operator) address.
+    Feeder,
+    /// Per-payer verification flag.
+    Verified(Address),
+    /// Ledger sequence of the last accepted feeder update.
+    Timestamp,
+}
+
+#[contractimpl]
+impl MockFeederOracle {
+    pub fn interface_version(_env: Env) -> u32 {
+        crate::oracle_interface::ORACLE_INTERFACE_VERSION
+    }
+
+    /// Feeder (oracle operator) write path — Issue #1046.
+    ///
+    /// Requires the configured feeder's authorization and rejects the call
+    /// when no feeder has been configured.
+    pub fn update_verification(env: Env, payer: Address, verified: bool) {
+        let feeder: Address = match env.storage().instance().get(&FeederOracleKey::Feeder) {
+            Some(f) => f,
+            None => panic!("feeder not configured"),
+        };
+        feeder.require_auth();
+        env.storage()
+            .persistent()
+            .set(&FeederOracleKey::Verified(payer), &verified);
+        // A successful feeder update is a real data event: stamp it with the
+        // ledger it happened at so the ILN freshness rule can age it.
+        env.storage()
+            .instance()
+            .set(&FeederOracleKey::Timestamp, &env.ledger().sequence());
+    }
+
+    pub fn get_payer_data(env: Env, payer: Address) -> OracleVerificationResponse {
+        let verified: bool = env
+            .storage()
+            .persistent()
+            .get(&FeederOracleKey::Verified(payer))
+            .unwrap_or(false);
+        let timestamp: u32 = env
+            .storage()
+            .instance()
+            .get(&FeederOracleKey::Timestamp)
+            .unwrap_or(env.ledger().sequence());
+        OracleVerificationResponse {
+            is_verified: verified,
+            timestamp,
+        }
+    }
+
+    /// Test setup helper: configure the authorized feeder address.
+    pub fn set_feeder(env: Env, feeder: Address) {
+        env.storage()
+            .instance()
+            .set(&FeederOracleKey::Feeder, &feeder);
+    }
+}
+
+/// Register a `MockFeederOracle` with `feeder` configured, wire it into the ILN
+/// config as the price oracle, and return its address.
+fn register_feeder_oracle(t: &crate::test::TestEnv, feeder: &Address) -> Address {
+    let oracle_id = t.env.register_contract(None, MockFeederOracle);
+    MockFeederOracleClient::new(&t.env, &oracle_id).set_feeder(feeder);
+    t.contract.set_price_oracle(&oracle_id).unwrap();
+    oracle_id
+}
+
+// ----------------------------------------------------------------
+// Test: only a feeder update opens the funding gate; without it the payer
+//       stays unverified and funding fails closed.
+// ----------------------------------------------------------------
+#[test]
+fn test_1046_feeder_authorized_update_opens_funding_gate() {
+    let t = setup();
+    let feeder = Address::generate(&t.env);
+    let oracle = register_feeder_oracle(&t, &feeder);
+
+    // No feeder update yet → unverified → funding blocked.
+    let blocked = make_invoice(&t);
+    assert_eq!(
+        t.contract
+            .try_fund_invoice(&t.funder, &blocked, &INVOICE_AMOUNT, &true),
+        Err(Ok(ContractError::PayerUnverified)),
+        "without a feeder update the payer must remain unverified"
+    );
+
+    // Authorized feeder update (mock_all_auths satisfies the feeder's
+    // require_auth) → payer verified with current-ledger data → funding opens.
+    MockFeederOracleClient::new(&t.env, &oracle).update_verification(&t.payer, &true);
+
+    let funded = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &funded, &INVOICE_AMOUNT, &true)
+        .unwrap();
+    assert_eq!(
+        t.contract.get_invoice(&funded).unwrap().status,
+        InvoiceStatus::Funded
+    );
+}
+
+// ----------------------------------------------------------------
+// Test: the feeder gate does not run when oracle verification is not required.
+// ----------------------------------------------------------------
+#[test]
+fn test_1046_gate_only_applies_when_oracle_required() {
+    let t = setup();
+    let feeder = Address::generate(&t.env);
+    let _oracle = register_feeder_oracle(&t, &feeder);
+
+    // require_oracle_verification = false → oracle never consulted → funding
+    // succeeds even though no feeder update ever happened.
+    let id = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &false)
+        .unwrap();
+    assert_eq!(t.contract.get_invoice(&id).unwrap().status, InvoiceStatus::Funded);
+}
+
+// ----------------------------------------------------------------
+// Test: a feeder update is a data event — it is aged by the freshness rule,
+//       and a refresh restores funding after staleness.
+// ----------------------------------------------------------------
+#[test]
+fn test_1046_feeder_update_is_subject_to_freshness() {
+    let t = setup();
+    t.contract.set_max_oracle_age(&5u64).unwrap();
+    let feeder = Address::generate(&t.env);
+    let oracle = register_feeder_oracle(&t, &feeder);
+    let client = MockFeederOracleClient::new(&t.env, &oracle);
+
+    // Feeder writes at ledger 100.
+    client.update_verification(&t.payer, &true);
+
+    // age = 4 < 5 → fresh.
+    advance_ledger(&t.env, 4);
+    let fresh = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &fresh, &INVOICE_AMOUNT, &true)
+        .unwrap();
+
+    // age = 5 == max → the stale feeder update no longer unlocks funding.
+    advance_ledger(&t.env, 1);
+    let stale = make_invoice(&t);
+    assert_eq!(
+        t.contract
+            .try_fund_invoice(&t.funder, &stale, &INVOICE_AMOUNT, &true),
+        Err(Ok(ContractError::OracleDataStale)),
+        "a feeder update must not stay fresh indefinitely"
+    );
+
+    // A fresh authorized feeder update re-opens the gate.
+    client.update_verification(&t.payer, &true);
+    let refreshed = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &refreshed, &INVOICE_AMOUNT, &true)
+        .unwrap();
+}
+
+// ----------------------------------------------------------------
+// Test: ledger-boundary walk across the feeder-update freshness window —
+//       last-fresh ledger passes, first-stale ledger rejects, and a feeder
+//       refresh exactly at the boundary restores funding.
+// ----------------------------------------------------------------
+#[test]
+fn test_1046_feeder_update_freshness_boundary_walk() {
+    let t = setup();
+    let max_age: u64 = 10;
+    t.contract.set_max_oracle_age(&max_age).unwrap();
+    let feeder = Address::generate(&t.env);
+    let oracle = register_feeder_oracle(&t, &feeder);
+    let client = MockFeederOracleClient::new(&t.env, &oracle);
+
+    // Feeder writes at ledger 100.
+    client.update_verification(&t.payer, &true);
+
+    // Ledger 109: age = 9 = max - 1 → last fresh ledger.
+    advance_ledger(&t.env, 9);
+    let fresh = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &fresh, &INVOICE_AMOUNT, &true)
+        .unwrap();
+
+    // Ledger 110: age = 10 = max → first stale ledger.
+    advance_ledger(&t.env, 1);
+    let stale = make_invoice(&t);
+    assert_eq!(
+        t.contract
+            .try_fund_invoice(&t.funder, &stale, &INVOICE_AMOUNT, &true),
+        Err(Ok(ContractError::OracleDataStale))
+    );
+
+    // Feeder refresh at the boundary → fresh again.
+    client.update_verification(&t.payer, &true);
+    let refreshed = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &refreshed, &INVOICE_AMOUNT, &true)
+        .unwrap();
+}
+
+// ----------------------------------------------------------------
+// Test: the feeder can revoke verification, and revocation is honoured by the
+//       funding gate.
+// ----------------------------------------------------------------
+#[test]
+fn test_1046_feeder_can_revoke_verification() {
+    let t = setup();
+    let feeder = Address::generate(&t.env);
+    let oracle = register_feeder_oracle(&t, &feeder);
+    let client = MockFeederOracleClient::new(&t.env, &oracle);
+
+    client.update_verification(&t.payer, &true);
+    let id1 = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &id1, &INVOICE_AMOUNT, &true)
+        .unwrap();
+
+    client.update_verification(&t.payer, &false);
+    let id2 = make_invoice(&t);
+    assert_eq!(
+        t.contract
+            .try_fund_invoice(&t.funder, &id2, &INVOICE_AMOUNT, &true),
+        Err(Ok(ContractError::PayerUnverified)),
+        "a feeder revocation must close the funding gate"
+    );
 }

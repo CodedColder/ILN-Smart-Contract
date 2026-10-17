@@ -27,6 +27,30 @@ pub struct VerificationResult {
 /// Any contract registered as the ILN payer oracle must expose these
 /// entry-points with exactly these signatures, including
 /// [`interface_version`](OracleInterface::interface_version).
+///
+/// # Authorization model (Issue #1046)
+///
+/// `get_verification` is a read and needs no authorization. `update_verification`
+/// *writes* verification state and is the oracle's **feeder** (operator) entry
+/// point: it is the single write path that can flip a payer from unverified to
+/// verified — which, when `fund_invoice` is called with
+/// `require_oracle_verification = true`, is precisely what unlocks funding.
+///
+/// An oracle implementation **MUST** authorize this entry point. Concretely it
+/// must:
+///
+/// 1. persist a designated feeder address (set once by the deployer / operator
+///    during deployment), and
+/// 2. require that address's signature (`feeder.require_auth()`) before
+///    mutating any verification state, and
+/// 3. reject the call when no feeder has been configured.
+///
+/// An unrestricted `update_verification` lets anyone mint funding eligibility
+/// for any payer, so it must not ship. See
+/// `docs/oracle-integration.md` § Security Checklist and
+/// `docs/access-control.md` (Oracle Feeder role). The ILN contract never calls
+/// this method directly, so the authorization is enforced by the oracle contract
+/// the ILN registry points at, not by the ILN contract.
 #[contractclient(name = "OracleClient")]
 pub trait OracleInterface {
     /// Returns [`ORACLE_INTERFACE_VERSION`].
@@ -35,10 +59,12 @@ pub trait OracleInterface {
     /// Returns the verification record for `payer`.
     fn get_verification(env: Env, payer: Address) -> VerificationResult;
 
-    /// Update the verification status for `payer`.
+    /// Update the verification status for `payer`. **Feeder-authorized.**
     ///
-    /// Access control is enforced inside the oracle contract; the ILN
-    /// contract never calls this method directly.
+    /// Implementations MUST require the configured feeder's authorization
+    /// (`feeder.require_auth()`) and MUST reject the call when no feeder has
+    /// been configured. The ILN contract never calls this method directly — the
+    /// authorization is enforced inside the oracle contract.
     fn update_verification(env: Env, payer: Address, verified: bool);
 }
 
