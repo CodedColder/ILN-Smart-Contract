@@ -188,11 +188,14 @@ The contract checks:
   total_votes = votes_for + votes_against
   quorum      = stored_total_supply * min_quorum_bps / 10_000  (default 10%)
 
-  If total_votes < quorum      → status = Rejected, error QuorumNotReached
+  If total_votes < quorum      → status = Rejected, deposit forfeited,
+                                 ProposalRejected{reason: QuorumNotReached} emitted, call returns Ok
   If votes_for > votes_against → status = Passed, then:
     invoke_contract(iln_contract, "update_fee_rate", [50])
-    status = Executed
-  Else                         → status = Rejected, error ProposalRejected
+    status = Executed (if the call fails: ProposalExecutionFailed emitted,
+                       call returns Ok, status stays Passed and is retryable)
+  Else                         → status = Rejected, deposit forfeited,
+                                 ProposalRejected{reason: MajorityAgainst} emitted, call returns Ok
 
 Emergency path — Admin veto before execution
 ─────────────────────────────────────────────

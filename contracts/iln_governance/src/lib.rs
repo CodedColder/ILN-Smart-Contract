@@ -301,6 +301,33 @@ pub struct ProposalExecutionFailed {
     pub action_type: ProposalAction,
 }
 
+/// Issue #1007: why a proposal transitioned `Active -> Rejected`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RejectionReason {
+    /// Total votes cast were below the configured quorum.
+    QuorumNotReached,
+    /// Quorum was met but `votes_for <= votes_against`.
+    MajorityAgainst,
+}
+
+/// Issue #1007: emitted when voting closes and a proposal is rejected.
+///
+/// Soroban discards every event and storage write of a call that returns
+/// `Err`, so the rejection is reported by a *successful* `execute_proposal`
+/// call carrying this event rather than by `QuorumNotReached` /
+/// `ProposalRejected` (those variants are retained for ABI stability).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalRejectedEvent {
+    pub proposal_id: u64,
+    pub reason: RejectionReason,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    /// Quorum (in votes) that applied when the proposal was rejected.
+    pub quorum: i128,
+}
+
 /// Issue #68: emitted when the admin vetoes a proposal.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -1097,21 +1124,18 @@ pub fn get_proposal_created_ledger(env: Env, proposal_id: u64) -> Option<u32> {
     /// call after settlement is a no-op returning `false` (no second
     /// transfer), which is what prevents double-refunds on the
     /// `Passed -> Executed` second `execute_proposal` call.
-    fn refund_proposal_deposit(env: &Env, proposal_id: u64, proposer: &Address) -> bool {
-        // Resolve the token before touching any storage: without it no
-        // refund transfer is possible, and returning early leaves the
-        // escrow intact for a later retry instead of burning it.
-        let token_addr = match Self::get_gov_token(env) {
-            Ok(addr) => addr,
-            Err(_) => return false,
-        };
+    fn refund_proposal_deposit(
+        env: &Env,
+        proposal_id: u64,
+        proposer: &Address,
+    ) -> Result<bool, GovernanceError> {
         if env
             .storage()
             .persistent()
             .get::<StorageKey, bool>(&StorageKey::ProposalDepositSettled(proposal_id))
             .unwrap_or(false)
         {
-            return false;
+            return Ok(false);
         }
         let amount: i128 = env
             .storage()
@@ -1128,7 +1152,7 @@ pub fn get_proposal_created_ledger(env: Env, proposal_id: u64) -> Option<u32> {
             env.storage()
                 .persistent()
                 .remove(&StorageKey::ProposalDeposit(proposal_id));
-            return false;
+            return Ok(false);
         }
         env.storage()
             .persistent()
@@ -1144,25 +1168,23 @@ pub fn get_proposal_created_ledger(env: Env, proposal_id: u64) -> Option<u32> {
                 amount,
             },
         );
-        true
+        Ok(true)
     }
 
     /// Forfeit the escrowed deposit to the configured sink (or lock it in
     /// this contract when no sink is set). Idempotent like the refund path.
-    fn forfeit_proposal_deposit(env: &Env, proposal_id: u64, proposer: &Address) -> bool {
-        // Same ordering as the refund path: resolve the token first so an
-        // unconfigured gov token can't consume the escrow without paying it.
-        let token_addr = match Self::get_gov_token(env) {
-            Ok(addr) => addr,
-            Err(_) => return false,
-        };
+    fn forfeit_proposal_deposit(
+        env: &Env,
+        proposal_id: u64,
+        proposer: &Address,
+    ) -> Result<bool, GovernanceError> {
         if env
             .storage()
             .persistent()
             .get::<StorageKey, bool>(&StorageKey::ProposalDepositSettled(proposal_id))
             .unwrap_or(false)
         {
-            return false;
+            return Ok(false);
         }
         let amount: i128 = env
             .storage()
@@ -1176,7 +1198,7 @@ pub fn get_proposal_created_ledger(env: Env, proposal_id: u64) -> Option<u32> {
             env.storage()
                 .persistent()
                 .remove(&StorageKey::ProposalDeposit(proposal_id));
-            return false;
+            return Ok(false);
         }
         env.storage()
             .persistent()
@@ -1199,7 +1221,7 @@ pub fn get_proposal_created_ledger(env: Env, proposal_id: u64) -> Option<u32> {
                 sink,
             },
         );
-        true
+        Ok(true)
     }
 
     // ── Issue #530: quadratic voting toggle ───────────────────────
@@ -1801,23 +1823,23 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
             };
 
             if total_votes < quorum {
-                proposal.status = ProposalStatus::Rejected;
-                env.storage()
-                    .persistent()
-                    .set(&StorageKey::Proposal(proposal_id), &proposal);
-                // Issue #814: expired without quorum — forfeit the deposit.
-                Self::forfeit_proposal_deposit(&env, proposal_id, &proposal.proposer);
-                return Err(GovernanceError::QuorumNotReached);
+                Self::reject_proposal(
+                    &env,
+                    &mut proposal,
+                    RejectionReason::QuorumNotReached,
+                    quorum,
+                )?;
+                return Ok(());
             }
 
             if proposal.votes_for <= proposal.votes_against {
-                proposal.status = ProposalStatus::Rejected;
-                env.storage()
-                    .persistent()
-                    .set(&StorageKey::Proposal(proposal_id), &proposal);
-                // Issue #814: rejected — forfeit the deposit.
-                Self::forfeit_proposal_deposit(&env, proposal_id, &proposal.proposer);
-                return Err(GovernanceError::ProposalRejected);
+                Self::reject_proposal(
+                    &env,
+                    &mut proposal,
+                    RejectionReason::MajorityAgainst,
+                    quorum,
+                )?;
+                return Ok(());
             }
 
             proposal.status = ProposalStatus::Passed;
@@ -1835,7 +1857,7 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
                 .set(&StorageKey::Proposal(proposal_id), &proposal);
             // Issue #814: passed — refund the deposit (idempotent, so the
             // later Passed -> Executed call does not double-pay).
-            Self::refund_proposal_deposit(&env, proposal_id, &proposal.proposer);
+            Self::refund_proposal_deposit(&env, proposal_id, &proposal.proposer)?;
             return Ok(());
         }
 
@@ -1991,7 +2013,11 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
                 // Proposal storage is untouched here — it remains `Passed` with
                 // its original `eta_ledger`, so calling `execute_proposal` again
                 // retries the same cross-contract call (Issue #531 retry mechanism).
-                return Err(GovernanceError::ExecutionFailed);
+                //
+                // Issue #1007: return `Ok` so the event above is committed.
+                // Returning `Err(ExecutionFailed)` would roll the event back
+                // and leave the rejected execution invisible on-chain.
+                return Ok(());
             }
 
             proposal.status = ProposalStatus::Executed;
@@ -2001,7 +2027,7 @@ pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceErro
 
             // Issue #814: executed — ensure refund (no-op if already
             // refunded at Passed time; covers zero-deposit proposals).
-            Self::refund_proposal_deposit(&env, proposal_id, &proposal.proposer);
+            Self::refund_proposal_deposit(&env, proposal_id, &proposal.proposer)?;
 
             env.events().publish(
                 (Symbol::new(&env, "proposal_executed"), proposal_id),
@@ -2308,7 +2334,7 @@ pub fn veto_proposal(
 
         // Issue #814: vetoed spam is forfeited like a rejection (documented
         // in governance-security-summary.md).
-        Self::forfeit_proposal_deposit(&env, proposal_id, &proposal.proposer);
+        Self::forfeit_proposal_deposit(&env, proposal_id, &proposal.proposer)?;
 
         env.events().publish(
             (
@@ -2558,6 +2584,34 @@ pub fn has_voted(env: Env, voter: Address, proposal_id: u64) -> bool {
             args,
         );
         matches!(result, Ok(Ok(())))
+    }
+
+    /// Issue #1007: persist the `Active -> Rejected` transition, settle the
+    /// deposit and emit `proposal_rejected`. Runs inside a call that returns
+    /// `Ok`, so the state change and the event are both committed.
+    fn reject_proposal(
+        env: &Env,
+        proposal: &mut GovernanceProposal,
+        reason: RejectionReason,
+        quorum: i128,
+    ) -> Result<(), GovernanceError> {
+        proposal.status = ProposalStatus::Rejected;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal.id), &*proposal);
+        // Issue #814: rejected / expired without quorum — forfeit the deposit.
+        Self::forfeit_proposal_deposit(env, proposal.id, &proposal.proposer)?;
+        env.events().publish(
+            (Symbol::new(env, "proposal_rejected"), proposal.id),
+            ProposalRejectedEvent {
+                proposal_id: proposal.id,
+                reason,
+                votes_for: proposal.votes_for,
+                votes_against: proposal.votes_against,
+                quorum,
+            },
+        );
+        Ok(())
     }
 
     fn get_delegate_raw(env: &Env, addr: &Address) -> Option<Address> {

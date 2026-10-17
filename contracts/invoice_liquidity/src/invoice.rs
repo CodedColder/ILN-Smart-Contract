@@ -856,73 +856,43 @@ pub fn set_lp_score(env: &Env, lp: &Address, score: u32) {
     }
 }
 
-/// Return all queued LP requests for an invoice
+/// Return all queued LP requests for an invoice.
+///
+/// Issues #1009 / #1010: the queue helpers live in `storage.rs`, where reads
+/// and writes extend the TTL of the queue, its opened-at marker and the
+/// resolution record together. These wrappers delegate so there is a single
+/// implementation.
 pub fn get_fund_queue(env: &Env, invoice_id: u64) -> soroban_sdk::Vec<LpFundRequest> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::FundQueue(invoice_id))
-        .unwrap_or(soroban_sdk::Vec::new(env))
+    crate::storage::get_fund_queue(env, invoice_id)
 }
 
 /// Persist the queue and extend its TTL (Issue #1025, #1091)
 pub fn save_fund_queue(env: &Env, invoice_id: u64, queue: &soroban_sdk::Vec<LpFundRequest>) {
-    let key = StorageKey::FundQueue(invoice_id);
-    env.storage().persistent().set(&key, queue);
-    extend_queue_key_ttl(env, &key);
+    crate::storage::save_fund_queue(env, invoice_id, queue)
 }
 
 /// Return the resolved (approved) funder for an invoice, if any
 pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::QueueResolution(invoice_id))
+    crate::storage::get_queue_resolution(env, invoice_id)
 }
 
 /// Store the approved funder chosen by the priority queue and extend its TTL (Issue #1025, #1091)
 pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
-    let key = StorageKey::QueueResolution(invoice_id);
-    env.storage().persistent().set(&key, approved_lp);
-    extend_queue_key_ttl(env, &key);
+    crate::storage::save_queue_resolution(env, invoice_id, approved_lp)
 }
 
 /// Record the ledger sequence when the first LP joined the fund queue.
 /// Called once when the queue transitions from empty to non-empty.
 /// Subsequent joins do not overwrite this value. Extends TTL (Issue #1025, #1091).
 pub fn try_set_fund_queue_opened_at(env: &Env, invoice_id: u64) {
-    let key = StorageKey::FundQueueOpenedAt(invoice_id);
-    if !env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .set(&key, &env.ledger().sequence());
-    }
-    extend_queue_key_ttl(env, &key);
-}
-
-/// Keep a fund-queue-related key (`FundQueue`, `FundQueueOpenedAt`,
-/// `QueueResolution`) alive at least until the winner is persisted.
-///
-/// Without this, these entries were written with the default persistent
-/// TTL while `resolve_fund_queue`'s maturity gate relies on
-/// `FundQueueOpenedAt` still being present: if that entry is archived
-/// before `resolve_fund_queue` is called, `get_fund_queue_opened_at`
-/// silently returns `None` and the MEV-mitigation delay (`QUEUE_DELAY_LEDGERS`)
-/// is skipped entirely, letting the queue resolve immediately. Extending the
-/// TTL on every write closes that window.
-fn extend_queue_key_ttl(env: &Env, key: &StorageKey) {
-    env.storage().persistent().extend_ttl(
-        key,
-        crate::constants::FUND_QUEUE_TTL_THRESHOLD,
-        crate::constants::FUND_QUEUE_TTL_EXTEND_TO,
-    );
+    crate::storage::try_set_fund_queue_opened_at(env, invoice_id)
 }
 
 /// Return the ledger sequence when the fund queue for `invoice_id` was first
 /// opened (i.e. when the first LP joined), or `None` if the queue is still
 /// empty.
 pub fn get_fund_queue_opened_at(env: &Env, invoice_id: u64) -> Option<u32> {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::FundQueueOpenedAt(invoice_id))
+    crate::storage::get_fund_queue_opened_at(env, invoice_id)
 }
 
 /// Issue #1015: per-key TTL headroom for the fund-queue records that gate

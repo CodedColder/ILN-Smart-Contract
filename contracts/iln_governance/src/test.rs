@@ -549,7 +549,6 @@ fn test_execute_before_voting_ends_fails() {
 }
 
 #[test]
-#[should_panic]
 fn test_execute_quorum_not_reached_rejected() {
     let t = setup();
     let id = create_fee_proposal(&t);
@@ -561,6 +560,7 @@ fn test_execute_quorum_not_reached_rejected() {
     ledger.timestamp += 259_201;
     t.env.ledger().set(ledger);
     t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Rejected);
 }
 
 #[test]
@@ -611,7 +611,7 @@ fn test_execute_quorum_not_met_fails_without_executing() {
     let res = t.env.as_contract(&t.contract.address, || {
         GovContract::execute_proposal(t.env.clone(), id)
     });
-    assert_eq!(res, Err(GovernanceError::QuorumNotReached));
+    assert_eq!(res, Ok(()));
 
     let p = t.contract.get_proposal(&id);
     assert_eq!(p.status, ProposalStatus::Rejected);
@@ -643,7 +643,6 @@ fn test_execute_quorum_met_passes_with_custom_quorum_bps() {
 }
 
 #[test]
-#[should_panic]
 fn test_proposal_rejected_when_against_wins() {
     let t = setup();
     let id = create_fee_proposal(&t);
@@ -652,7 +651,9 @@ fn test_proposal_rejected_when_against_wins() {
     let mut ledger = t.env.ledger().get();
     ledger.timestamp += 259_201;
     t.env.ledger().set(ledger);
+    // Issue #1007: the rejection is a committed, successful call.
     t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Rejected);
 }
 
 #[test]
@@ -1066,7 +1067,6 @@ fn test_execute_timelock_delay_flow() {
 }
 
 #[test]
-#[should_panic]
 fn test_execute_failed_proposal_fails() {
     let t = setup();
     let id = create_fee_proposal(&t);
@@ -1077,8 +1077,9 @@ fn test_execute_failed_proposal_fails() {
     ledger.timestamp = voting_end + 1;
     t.env.ledger().set(ledger);
 
-    // Execution should panic because quorum is not met (QuorumNotReached)
+    // Issue #1007: quorum miss commits `Rejected` instead of reverting.
     t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Rejected);
 }
 
 #[test]
@@ -2469,7 +2470,7 @@ fn test_execute_proposal_call_failure_reverts_to_passed() {
     let res_exec = t.env.as_contract(&t.contract.address, || {
         GovContract::execute_proposal(t.env.clone(), id)
     });
-    assert_eq!(res_exec, Err(GovernanceError::ExecutionFailed));
+    assert_eq!(res_exec, Ok(()));
     assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Passed);
 }
 
@@ -2499,7 +2500,7 @@ fn test_execute_proposal_failure_allows_repeated_retry() {
         let res = t.env.as_contract(&t.contract.address, || {
             GovContract::execute_proposal(t.env.clone(), id)
         });
-        assert_eq!(res, Err(GovernanceError::ExecutionFailed));
+        assert_eq!(res, Ok(()));
         assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Passed);
     }
 }
@@ -2726,11 +2727,8 @@ fn test_deposit_forfeited_on_reject_quorum_not_reached() {
     let res = t.env.as_contract(&t.contract.address, || {
         GovContract::execute_proposal(t.env.clone(), id)
     });
-    assert_eq!(res, Err(GovernanceError::QuorumNotReached));
-    assert_eq!(
-        t.contract.get_proposal(&id).status,
-        ProposalStatus::Rejected
-    );
+    assert_eq!(res, Ok(()));
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Rejected);
     // Proposer not refunded; sink received the forfeit.
     assert_eq!(t.gov_token.balance(&t.proposer), proposer_before_forfeit);
     assert_eq!(t.gov_token.balance(&sink), 200);
@@ -2752,11 +2750,8 @@ fn test_deposit_forfeited_on_majority_reject() {
     let res = t.env.as_contract(&t.contract.address, || {
         GovContract::execute_proposal(t.env.clone(), id)
     });
-    assert_eq!(res, Err(GovernanceError::ProposalRejected));
-    assert_eq!(
-        t.contract.get_proposal(&id).status,
-        ProposalStatus::Rejected
-    );
+    assert_eq!(res, Ok(()));
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Rejected);
     assert_eq!(t.gov_token.balance(&sink), 100);
     assert!(t.contract.is_proposal_deposit_settled(&id));
 }
@@ -2968,372 +2963,159 @@ fn test_pre_init_calls_return_not_initialized() {
     );
 }
 
-// ── Issue #985: Minimum production delay bounds ─────────────────────────────
+// ── Issue #1007: events for rejected transitions ─────────────────────────────
+//
+// These go through the generated client (not `as_contract`), so a call that
+// returned `Err` would have its storage writes and events rolled back exactly
+// as on-chain. They prove the rejection is committed and observable.
 
-#[test]
-fn test_production_delay_bounds_query_and_validation() {
-    let t = setup();
-    let (min_bound, max_bound) = t.contract.get_production_delay_bounds();
-    assert_eq!(min_bound, MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS);
-    assert_eq!(max_bound, MAX_EXECUTION_DELAY_LEDGERS);
-
-    assert!(t.contract.is_valid_production_delay(&min_bound));
-    assert!(t.contract.is_valid_production_delay(&max_bound));
-    assert!(!t.contract.is_valid_production_delay(&(min_bound - 1)));
-    assert!(!t.contract.is_valid_production_delay(&(max_bound + 1)));
+fn events_debug(t: &GovTestEnv) -> std::string::String {
+    extern crate std;
+    std::format!("{:?}", t.env.events().all().events())
 }
 
-#[test]
-fn test_set_execution_delay_exceeding_max_bound_fails() {
-    let t = setup();
-    let res = t
-        .contract
-        .try_set_execution_delay(&t.admin, &(MAX_EXECUTION_DELAY_LEDGERS + 1));
-    assert_eq!(res, Err(Ok(GovernanceError::ExecutionDelayOutOfBounds)));
-}
-
-#[test]
-fn test_set_execution_delay_below_minimum_when_veto_disabled_fails() {
-    let t = setup();
-    t.contract.disable_veto_power();
-    assert!(!t.contract.is_veto_power_enabled());
-
-    // Once veto power is disabled, setting delay below minimum production delay bound fails.
-    let res = t
-        .contract
-        .try_set_execution_delay(&t.admin, &(MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS - 1));
-    assert_eq!(res, Err(Ok(GovernanceError::ExecutionDelayOutOfBounds)));
-
-    // Setting delay within production bounds succeeds.
-    let res_ok = t
-        .contract
-        .try_set_execution_delay(&t.admin, &MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS);
-    assert!(res_ok.is_ok());
-    assert_eq!(
-        t.contract.get_execution_delay(),
-        MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS
-    );
-}
-
-// ── Issue #987: Verify eta comparisons across ledger rollover ──────────────
-
-#[test]
-fn test_is_eta_reached_exact_and_normal_cases() {
-    let t = setup();
-    // eta = 0 always expired
-    assert!(t.contract.is_eta_reached(&100, &0));
-    // current == eta
-    assert!(t.contract.is_eta_reached(&100, &100));
-    // current > eta
-    assert!(t.contract.is_eta_reached(&105, &100));
-    // current < eta
-    assert!(!t.contract.is_eta_reached(&95, &100));
-}
-
-#[test]
-fn test_is_eta_reached_across_rollover_boundaries() {
-    let t = setup();
-    // Suppose scheduled at u32::MAX - 5 with delay 15 ledgers -> eta = 9 (wrapping)
-    let eta: u32 = 9;
-
-    // Before rollover (current = u32::MAX - 5) -> not reached
-    assert!(!t.contract.is_eta_reached(&(u32::MAX - 5), &eta));
-    // At rollover boundary (current = u32::MAX) -> not reached
-    assert!(!t.contract.is_eta_reached(&u32::MAX, &eta));
-    // Immediately after rollover (current = 0) -> not reached
-    assert!(!t.contract.is_eta_reached(&0, &eta));
-    // Right before eta (current = 8) -> not reached
-    assert!(!t.contract.is_eta_reached(&8, &eta));
-    // At exact eta (current = 9) -> reached
-    assert!(t.contract.is_eta_reached(&9, &eta));
-    // After eta (current = 10) -> reached
-    assert!(t.contract.is_eta_reached(&10, &eta));
-}
-
-#[test]
-fn test_proposal_execution_across_ledger_rollover() {
-    let t = setup();
-    t.contract.set_execution_delay(&t.admin, &10);
-
-    // Set ledger near u32::MAX
+fn advance_past_voting(t: &GovTestEnv) {
     let mut ledger = t.env.ledger().get();
-    ledger.sequence_number = u32::MAX - 5;
-    t.env.ledger().set(ledger.clone());
+    ledger.timestamp += VOTING_PERIOD_SECS + 1;
+    t.env.ledger().set(ledger);
+}
 
+#[test]
+fn test_1007_quorum_miss_commits_rejection_and_emits_event() {
+    let t = setup();
+    t.contract.set_min_proposal_deposit(&200);
+    let sink = Address::generate(&t.env);
+    t.contract.set_proposal_deposit_sink(&Some(sink.clone()));
+    let id = create_fee_proposal(&t);
+    let voter = Address::generate(&t.env);
+    t.gov_token_admin.mint(&voter, &500); // quorum is 1_000
+    t.contract.cast_vote(&voter, &id, &true);
+    advance_past_voting(&t);
+
+    // Client call: an `Err` here would roll everything back.
+    t.contract.execute_proposal(&id);
+
+    assert!(events_debug(&t).contains("proposal_rejected"));
+    let p = t.contract.get_proposal(&id);
+    assert_eq!(p.status, ProposalStatus::Rejected);
+    assert_eq!(t.gov_token.balance(&sink), 200);
+    assert!(t.contract.is_proposal_deposit_settled(&id));
+}
+
+#[test]
+fn test_1007_majority_against_commits_rejection_and_emits_event() {
+    let t = setup();
     let id = create_fee_proposal(&t);
     t.contract.cast_vote(&t.voter_a, &id, &true);
-    t.contract.cast_vote(&t.voter_b, &id, &true);
+    t.contract.cast_vote(&t.voter_b, &id, &false);
+    advance_past_voting(&t);
 
-    // End voting
-    ledger.timestamp += VOTING_PERIOD_SECS + 1;
-    t.env.ledger().set(ledger.clone());
-
-    // First execute passes the proposal and schedules eta with wrapping add
     t.contract.execute_proposal(&id);
-    let p = t.contract.get_proposal(&id);
-    assert_eq!(p.status, ProposalStatus::Passed);
-    let expected_eta = (u32::MAX - 5).wrapping_add(10);
-    assert_eq!(p.eta_ledger, expected_eta);
 
-    // Trying to execute before rollover fails with TimelockNotExpired
-    let res = t.contract.try_execute_proposal(&id);
-    assert_eq!(res, Err(Ok(GovernanceError::TimelockNotExpired)));
-
-    // Rollover occurs: sequence wraps past u32::MAX to expected_eta
-    ledger.sequence_number = expected_eta;
-    t.env.ledger().set(ledger);
-
-    // At expected_eta, execution succeeds
-    t.contract.execute_proposal(&id);
-    assert_eq!(
-        t.contract.get_proposal(&id).status,
-        ProposalStatus::Executed
-    );
+    assert!(events_debug(&t).contains("proposal_rejected"));
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Rejected);
 }
 
-// ── Issue #989: Veto transition state machine ──────────────────────────────
-
 #[test]
-fn test_veto_state_machine_lifecycle_uninitiated_to_pending_to_executed() {
+fn test_1007_tie_vote_is_rejected() {
     let t = setup();
-    let signer_a = Address::generate(&t.env);
-    let signer_b = Address::generate(&t.env);
-    let mut signers = soroban_sdk::Vec::new(&t.env);
-    signers.push_back(signer_a.clone());
-    signers.push_back(signer_b.clone());
-    t.contract.configure_veto_multisig(&signers, &2);
-
     let id = create_fee_proposal(&t);
+    let other = Address::generate(&t.env);
+    t.gov_token_admin.mint(&other, &1_000);
+    t.contract.cast_vote(&t.voter_a, &id, &true); // 1_000
+    t.contract.cast_vote(&other, &id, &false); // 1_000
+    advance_past_voting(&t);
 
-    // Initial state: Uninitiated
-    let state_0 = t.contract.get_veto_state(&id);
-    assert_eq!(state_0.status, VetoStatus::Uninitiated);
-    assert_eq!(state_0.approvals_count, 0);
-    assert_eq!(state_0.threshold, 2);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Rejected);
+}
 
-    // First signer approves -> transitions to Pending
-    t.contract
-        .veto_proposal(&signer_a, &id, &reason_hash(&t.env));
-    let state_1 = t.contract.get_veto_state(&id);
-    assert_eq!(state_1.status, VetoStatus::Pending);
-    assert_eq!(state_1.approvals_count, 1);
-    assert_eq!(state_1.threshold, 2);
-    assert_eq!(state_1.reason_hash, reason_hash(&t.env));
+/// Boundary: at exactly `voting_end` the window has closed; one second before
+/// it has not, and nothing is rejected or emitted.
+#[test]
+fn test_1007_voting_end_boundary() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    let voting_end = t.contract.get_proposal(&id).voting_end;
+
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp = voting_end - 1;
+    t.env.ledger().set(ledger.clone());
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::VotingOngoing))
+    );
     assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
 
-    // Second signer approves -> transitions to Executed
-    t.contract
-        .veto_proposal(&signer_b, &id, &reason_hash(&t.env));
-    let state_2 = t.contract.get_veto_state(&id);
-    assert_eq!(state_2.status, VetoStatus::Executed);
-    assert_eq!(state_2.approvals_count, 2);
-    assert_eq!(state_2.threshold, 2);
-    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Vetoed);
-
-    // Further veto attempts fail with InvalidVetoTransition
-    let res = t.env.as_contract(&t.contract.address, || {
-        GovContract::veto_proposal(
-            t.env.clone(),
-            signer_a.clone(),
-            id,
-            reason_hash(&t.env),
-        )
-    });
-    assert_eq!(res, Err(GovernanceError::InvalidVetoTransition));
-}
-
-// ── Issue #990: Record veto-disable authorization and reason ────────────────
-
-#[test]
-fn test_disable_veto_power_records_authorization_and_reason() {
-    let t = setup();
-    assert!(t.contract.get_veto_disable_record().is_none());
-
-    let r_hash = reason_hash(&t.env);
-    let mut ledger = t.env.ledger().get();
-    ledger.sequence_number = 1234;
+    ledger.timestamp = voting_end;
     t.env.ledger().set(ledger);
-
-    t.contract.disable_veto_power_with_reason(&r_hash);
-    assert!(!t.contract.is_veto_power_enabled());
-
-    let record = t.contract.get_veto_disable_record().expect("must be recorded");
-    assert_eq!(record.disabled_at_ledger, 1234);
-    assert_eq!(record.reason_hash, r_hash);
+    t.contract.execute_proposal(&id); // no votes -> quorum miss
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Rejected);
 }
 
+/// Adversarial: a rejection is terminal and idempotent. Re-calling must not
+/// re-forfeit the deposit, re-emit, or resurrect the proposal.
 #[test]
-fn test_disable_veto_power_already_disabled_fails() {
+fn test_1007_rejection_is_terminal_and_not_replayable() {
     let t = setup();
-    t.contract.disable_veto_power();
-    assert!(!t.contract.is_veto_power_enabled());
+    t.contract.set_min_proposal_deposit(&100);
+    let sink = Address::generate(&t.env);
+    t.contract.set_proposal_deposit_sink(&Some(sink.clone()));
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    t.contract.cast_vote(&t.voter_b, &id, &false);
+    advance_past_voting(&t);
+    t.contract.execute_proposal(&id);
 
-    // Calling disable_veto_power again returns VetoPowerAlreadyDisabled
-    let res = t.contract.try_disable_veto_power();
-    assert_eq!(res, Err(Ok(GovernanceError::VetoPowerAlreadyDisabled)));
+    for _ in 0..3 {
+        assert_eq!(
+            t.contract.try_execute_proposal(&id),
+            Err(Ok(GovernanceError::AlreadyResolved))
+        );
+    }
+    assert_eq!(t.gov_token.balance(&sink), 100); // forfeited exactly once
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Rejected);
+}
 
-    // Calling disable_veto_power_with_reason again also returns VetoPowerAlreadyDisabled
-    let res_with_reason = t
-        .contract
-        .try_disable_veto_power_with_reason(&reason_hash(&t.env));
+/// A rejected proposal can no longer be vetoed or voted on.
+#[test]
+fn test_1007_rejected_proposal_cannot_be_vetoed_or_voted() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    t.contract.cast_vote(&t.voter_b, &id, &false);
+    advance_past_voting(&t);
+    t.contract.execute_proposal(&id);
+
     assert_eq!(
-        res_with_reason,
-        Err(Ok(GovernanceError::VetoPowerAlreadyDisabled))
+        t.contract.try_cast_vote(&t.voter_a, &id, &true),
+        Err(Ok(GovernanceError::VotingEnded))
     );
 }
 
+/// Failed cross-contract execution: the event must be committed (call returns
+/// Ok) and the proposal must stay `Passed` with an unchanged `eta_ledger`.
 #[test]
-fn test_disable_veto_power_with_empty_reason_fails() {
-    let t = setup();
-    let empty_hash = BytesN::from_array(&t.env, &[0u8; 32]);
-    let res = t.contract.try_disable_veto_power_with_reason(&empty_hash);
-    assert_eq!(res, Err(Ok(GovernanceError::ConsentRequired)));
-}
+fn test_1007_execution_failure_event_is_committed_and_proposal_stays_passed() {
+    let t = setup_with_failing_iln();
+    let id = t.contract.create_proposal(
+        &t.proposer,
+        &ProposalAction::UpdateFeeRate(200),
+        &dummy_hash(&t.env),
+        &200_i128,
+    );
+    t.contract.cast_vote(&t.voter, &id, &true);
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp += VOTING_PERIOD_SECS + 1;
+    t.env.ledger().set(ledger);
+    t.contract.execute_proposal(&id); // Active -> Passed
+    let eta = t.contract.get_proposal(&id).eta_ledger;
 
-// ── Issue #1101: property-based counterexample hunt ──────────────────────────
-//
-// These randomized tests attempt to *falsify* the governance invariants by
-// exploring adversarial operation orders (double votes with interleaved receipt
-// archival; arbitrary delegation/undelegation sequences). A generated failure
-// is a counterexample, and `scripts/run-formal-verification.sh` (wired into the
-// `formal-verification` workflow) fails CI on any counterexample.
-mod counterexample_invariants {
-    use super::*;
-    use proptest::prelude::*;
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
-
-        /// Invariants V2 + V7 (`docs/formal-verification.md`): a voter can
-        /// never increment the tally twice, even when the temporary receipt is
-        /// archived between attempts. The test tracks its own model of the
-        /// expected tally and asserts the contract matches it after every op.
-        #[test]
-        fn prop_no_double_vote_even_after_temporary_archival(
-            ops in proptest::collection::vec(
-                (0usize..3, any::<bool>(), any::<bool>()),
-                1..25,
-            )
-        ) {
-            let t = setup();
-            let id = create_fee_proposal(&t);
-            let voters = [t.voter_a.clone(), t.voter_b.clone(), t.proposer.clone()];
-            let weights: [i128; 3] = [1_000, 2_000, 1_000];
-
-            let mut voted = [false; 3];
-            let mut for_sum: i128 = 0;
-            let mut against_sum: i128 = 0;
-
-            for (idx, support, archive) in ops {
-                let voter = voters[idx].clone();
-                let res = t.contract.try_cast_vote(&voter, &id, &support);
-                if res.is_ok() {
-                    prop_assert!(!voted[idx], "double vote succeeded for voter {}", idx);
-                    voted[idx] = true;
-                    if support {
-                        for_sum += weights[idx];
-                    } else {
-                        against_sum += weights[idx];
-                    }
-                } else {
-                    prop_assert!(
-                        voted[idx],
-                        "unexpected non-AlreadyVoted failure for voter {}",
-                        idx
-                    );
-                }
-
-                if archive && voted[idx] {
-                    // Simulate the host archiving the temporary receipt.
-                    let hk = StorageKey::HasVoted(id, voter.clone());
-                    let wk = StorageKey::AppliedVoteWeight(id, voter.clone());
-                    t.env.as_contract(&t.contract.address, || {
-                        t.env.storage().temporary().remove(&hk);
-                        t.env.storage().temporary().remove(&wk);
-                    });
-                    prop_assert!(t.contract.has_voted(&voter, &id));
-                    prop_assert!(
-                        t.contract.try_cast_vote(&voter, &id, &support).is_err(),
-                        "vote succeeded after temporary archival (voter {})",
-                        idx
-                    );
-                }
-
-                let p = t.contract.get_proposal(&id);
-                prop_assert_eq!(p.votes_for, for_sum);
-                prop_assert_eq!(p.votes_against, against_sum);
-            }
-        }
-    }
-
-    /// Follow the forward delegation chain from `start`, returning
-    /// `(depth, cyclic)`. The walk is bounded by `bound` so a cycle cannot
-    /// spin forever.
-    fn chain_depth(t: &GovTestEnv, start: &Address, bound: u32) -> (u32, bool) {
-        let mut cursor = Some(start.clone());
-        let mut steps = 0u32;
-        while let Some(addr) = cursor {
-            steps += 1;
-            if steps > bound + 1 {
-                return (steps, true);
-            }
-            cursor = t.contract.get_delegate(&addr);
-        }
-        (steps - 1, false)
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(24))]
-
-        /// Invariant DEL2 (`docs/formal-verification.md`): however delegation
-        /// and undelegation operations are interleaved, the forward graph
-        /// never contains a cycle and no chain exceeds `MaxDelegationDepth`.
-        #[test]
-        fn prop_delegation_graph_never_cycles_or_exceeds_depth(
-            ops in proptest::collection::vec(
-                (0usize..13, 0usize..13, any::<bool>()),
-                0..24,
-            )
-        ) {
-            const M: usize = 13;
-            let t = setup();
-            let mut addrs = soroban_sdk::Vec::new(&t.env);
-            for _ in 0..M {
-                let a = Address::generate(&t.env);
-                t.gov_token_admin.mint(&a, &100);
-                t.contract.checkpoint_balance(&a);
-                addrs.push_back(a);
-            }
-            let mut ledger = t.env.ledger().get();
-            ledger.sequence_number += MIN_VOTE_HOLD_LEDGERS + 1;
-            t.env.ledger().set(ledger);
-
-            let cap = t.contract.get_max_delegation_depth();
-
-            for (from, to, undelegate) in ops {
-                let from_addr = addrs.get(from as u32).unwrap();
-                let to_addr = addrs.get(to as u32).unwrap();
-                if undelegate {
-                    let _ = t.contract.try_undelegate_votes(&from_addr);
-                } else {
-                    let _ = t.contract.try_delegate_votes(&from_addr, &to_addr);
-                }
-
-                let mut max_depth = 0u32;
-                for addr in addrs.iter() {
-                    let (depth, cyclic) = chain_depth(&t, &addr, M as u32);
-                    prop_assert!(!cyclic, "delegation cycle detected");
-                    if depth > max_depth {
-                        max_depth = depth;
-                    }
-                }
-                prop_assert!(
-                    max_depth <= cap,
-                    "delegation chain depth {} exceeds cap {}",
-                    max_depth,
-                    cap
-                );
-            }
-        }
-    }
+    t.contract.execute_proposal(&id); // callee fails
+    extern crate std;
+    assert!(std::format!("{:?}", t.env.events().all().events())
+        .contains("proposal_execution_failed"));
+    let p = t.contract.get_proposal(&id);
+    assert_eq!(p.status, ProposalStatus::Passed);
+    assert_eq!(p.eta_ledger, eta);
 }

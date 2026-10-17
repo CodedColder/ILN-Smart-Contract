@@ -88,97 +88,39 @@ pub enum ContractError {
     /// Issue #817: requested TWAP window is outside the governance-bounded
     /// `[MIN_TWAP_WINDOW_LEDGERS, MAX_TWAP_WINDOW_LEDGERS]` range.
     InvalidTwapWindow = 46,
-    /// Issue #1091: the fund queue is at `MAX_FUND_QUEUE_LEN` and the
-    /// joining LP's score does not strictly exceed the lowest queued score.
-    QueueFull = 47,
-    /// Issue #1090: `fund_invoice` called while LPs are queued for this
-    /// invoice but `resolve_fund_queue` has not yet selected a winner.
-    /// Funding must wait for resolution so the queue cannot be bypassed.
-    QueueUnresolved = 48,
-    /// Issue #1093: fewer price sources responded (or survived outlier
-    /// rejection) than the governance-configured minimum quorum.
-    PriceQuorumNotMet = 49,
-    // ── Variants referenced by merged code but previously undefined ──
-    // (restored so the crate compiles; codes appended, existing codes unchanged)
-    /// Multisig admin has already been initialized.
-    MultisigAlreadyConfigured = 50,
-    /// Signer set / threshold combination is invalid.
-    InvalidMultisigConfig = 51,
-    /// A multisig operation was attempted before multisig was configured.
-    MultisigNotConfigured = 52,
-    /// Caller is not in the multisig signer set.
-    NotAuthorizedSigner = 53,
-    /// An identical pending proposal already exists.
-    DuplicateProposal = 54,
-    /// No proposal exists with the given id.
-    ProposalNotFound = 55,
-    /// Proposal has already been executed.
-    ProposalAlreadyExecuted = 56,
-    /// Proposal is past its expiry and can no longer be signed or executed.
-    ProposalExpired = 57,
-    /// Signer has already approved this proposal.
-    AlreadySigned = 58,
-    /// Proposal does not yet have enough approvals to execute.
-    ThresholdNotReached = 59,
-    /// A signer rotation is already scheduled (Issue #640).
-    RotationAlreadyPending = 60,
-    /// No signer rotation is scheduled (Issue #640).
-    RotationNotFound = 61,
-    /// Signer rotation timelock has not yet elapsed (Issue #640).
-    RotationTimelockNotExpired = 62,
-    /// TWAP read requested with fewer observations than required.
-    InsufficientTwapObservations = 63,
-    /// Fund-queue index invariant violated (unreachable under normal execution).
-    QueueIndexOutOfBounds = 64,
-    /// Funder-list index invariant violated (unreachable under normal execution).
-    FunderIndexOutOfBounds = 65,
-    /// `decay_rate_bps` outside its governance bound.
-    InvalidDecayRate = 66,
-    /// `high_rep_threshold` outside its governance bound.
-    InvalidRepThreshold = 67,
-    // ── Issues #1070–#1073: token configuration and SAC safety ─────
-    /// Issue #1070: the token does not answer `decimals()`, so its
-    /// precision cannot be verified and it cannot be allowlisted.
-    TokenDecimalsUnavailable = 68,
-    /// Issue #1070: declared decimals exceed `MAX_TOKEN_DECIMALS` or differ
-    /// from the token's own `decimals()`.
-    InvalidTokenDecimals = 69,
-    /// Issue #1070: the token is allowlisted but has no registered decimals
-    /// (legacy state); re-register it or run `migrate`.
-    TokenDecimalsNotConfigured = 70,
-    /// Issue #1072: the account's trustline / balance for this token is
-    /// deauthorized (frozen) or missing.
-    AccountFrozen = 71,
-    /// Issue #1073: the token does not expose the SAC `authorized()`
-    /// interface, so issuer freezes cannot be detected.
-    TokenAuthorizationUnavailable = 72,
-    /// Issue #1071: the contract's unreserved balance cannot cover a payout
-    /// (e.g. after an issuer clawback).
-    InsufficientContractBalance = 73,
-    /// Issue #1031: an LP tried to join the fund queue while the queue
-    /// already has at least one entry, and the LP's score does not exceed
-    /// the current best score by the governance-configured tie-score margin.
-    /// The margin is set via `set_queue_tie_score_margin` (admin-only) and
-    /// raises the economic barrier to equal-score manipulation: a fresh LP
-    /// at the default score cannot silently tie with an established LP
-    /// without first building `margin` additional funded invoices.
-    ScoreBelowTieMargin = 74,
-    /// Issue #1013: `resolve_fund_queue` found a non-empty fund queue but no
-    /// `FundQueueOpenedAt` record for it. That record is only ever absent for
-    /// a non-empty queue if it was archived (TTL lapsed) or otherwise lost —
-    /// never because no LP had joined. Previously this case silently skipped
-    /// the MEV-mitigation maturity delay instead of rejecting the call; it is
-    /// now a hard failure so corrupted/archived queue state fails closed.
-    QueueStateArchived = 75,
-    /// Issue #1082: pre-upgrade TTL sampling found one or more persistent
-    /// entries whose TTL is below `TTL_MIN_LEDGERS_BEFORE_UPGRADE`, meaning a
-    /// WASM upgrade that changes storage layout could archive them before
-    /// the new code runs. The upgrade must be rejected until TTLs are
-    /// extended (via `extend_ttl` calls or normal contract activity).
-    UpgradeRemovesTtlFields = 76,
-    /// Issue #1083: rollback rehearsal found that rolling back to a prior
-    /// WASM version would leave some invoice data inaccessible because the
-    /// current layout uses keys the old code doesn't understand. The
-    /// rollback is rejected as unsafe.
-    RollbackUnsafe = 77,
+    // ── Issue #124 / #641 / #640 / #639: multisig admin ────────────
+    // These variants were lost in a merge; they are re-added after the
+    // current highest code (46) because 44-46 now belong to other errors.
+    /// Signer list/threshold combination is invalid (empty signer set,
+    /// duplicate signer, or threshold outside `1..=signers.len()`).
+    InvalidMultisigConfig = 47,
+    /// Caller is not a configured multisig signer.
+    NotAuthorizedSigner = 48,
+    /// This signer has already approved the given proposal.
+    AlreadySigned = 49,
+    /// No multisig proposal exists with the given id.
+    ProposalNotFound = 50,
+    /// The proposal has already been executed and cannot be executed again.
+    ProposalAlreadyExecuted = 51,
+    /// The proposal's approval window (`MULTISIG_WINDOW_LEDGERS`) has
+    /// elapsed; it can no longer be signed or executed.
+    ProposalExpired = 52,
+    /// The proposal has not yet collected enough signer approvals to be executed.
+    ThresholdNotReached = 53,
+    /// No multisig admin scheme has been bootstrapped yet.
+    MultisigNotConfigured = 54,
+    /// `initialize_multisig_admin` was called again after the multisig
+    /// admin scheme was already bootstrapped; reconfiguration must go
+    /// through the `UpdateMultisig` proposal flow instead.
+    MultisigAlreadyConfigured = 55,
+    /// Issue #641: a Pending, non-expired proposal already exists for this
+    /// exact admin action — reject the duplicate.
+    DuplicateProposal = 56,
+    /// Issue #640: no pending signer rotation exists to finalize or cancel.
+    RotationNotFound = 57,
+    /// Issue #640: the rotation's timelock has not yet elapsed.
+    RotationTimelockNotExpired = 58,
+    /// Issue #640: a signer rotation is already pending; only one may be
+    /// in flight at a time.
+    RotationAlreadyPending = 59,
 }

@@ -911,6 +911,39 @@ Topics: `["proposal_executed", proposal_id]`
 | `votes_for` | `i128` | Total votes in favour |
 | `votes_against` | `i128` | Total votes against |
 
+### ProposalRejected
+
+Emitted when voting has closed and an `Active` proposal is rejected (Issue #1007).
+`execute_proposal` now **returns `Ok`** for this transition: Soroban rolls back
+all storage writes and events of a call that returns `Err`, so the previous
+`Err(QuorumNotReached)` / `Err(ProposalRejected)` return meant the `Rejected`
+status, the deposit forfeiture and any event were never committed on-chain.
+
+Topics: `["proposal_rejected", proposal_id]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `proposal_id` | `u64` | Rejected proposal identifier |
+| `reason` | `RejectionReason` | `QuorumNotReached` (votes below quorum) or `MajorityAgainst` (`votes_for <= votes_against`, including ties) |
+| `votes_for` | `i128` | Votes in favour |
+| `votes_against` | `i128` | Votes against |
+| `quorum` | `i128` | Quorum (in votes) that applied |
+
+### ProposalExecutionFailed
+
+Emitted when a `Passed` proposal's cross-contract call fails (callee error,
+or the callee's `require_auth` rejects governance as caller). Since Issue #1007
+`execute_proposal` returns `Ok` after emitting it, so the event is committed;
+the proposal stays `Passed` with its original `eta_ledger` and can be retried.
+Indexers should key on this event, not on a transaction error.
+
+Topics: `["proposal_execution_failed", proposal_id]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `proposal_id` | `u64` | Proposal whose execution failed |
+| `action_type` | `ProposalAction` | The action that failed |
+
 ### ProposalVetoed
 
 Emitted when the admin vetoes a proposal.

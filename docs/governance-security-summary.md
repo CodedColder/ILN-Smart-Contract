@@ -65,6 +65,26 @@ Per [§2, finding 6](#2-findings-by-governance-hardening-area) and [ADR-012](adr
 
 ---
 
+## 4a. Rejected-transition events and cross-contract auth (Issues #1007 / #1008)
+
+* `execute_proposal` commits `Rejected` and emits `proposal_rejected` (reason:
+  `QuorumNotReached` / `MajorityAgainst`) instead of returning an `Err` that
+  Soroban rolls back; a failed cross-contract execution commits
+  `proposal_execution_failed` and leaves the proposal `Passed`.
+* A rejection is terminal: re-calling returns `AlreadyResolved`, the deposit is
+  forfeited exactly once, and a rejected proposal can no longer be voted on or
+  vetoed. No new storage keys; no unbounded growth.
+* `contracts/tests/governance_cross_contract_auth_test.rs` proves, with no
+  mocked auths on the execution path, that only a governance contract that is
+  ILN's `Admin` can drive ILN's admin setters, that a mis-wired deployment fails
+  closed, and that the timelock boundary (`eta - 1` refused, `eta` accepted)
+  holds across the contract boundary.
+* **Rollout:** deploy the new governance wasm, then update indexers/alerts to
+  consume `proposal_rejected` / `proposal_execution_failed`. **Recovery:** the
+  change is wasm-only (no storage migration); rolling back restores the old
+  `Err` returns. Proposals already `Active` past their window are rejected with
+  the new behaviour on the next `execute_proposal` call.
+
 ## 5. Adversarial Test Coverage (Issue #813)
 
 A dedicated test suite combines all governance attack vectors to verify the system rejects or economically deters combined attacks, not just isolated ones:
