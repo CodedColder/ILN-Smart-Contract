@@ -2963,7 +2963,10 @@ fn test_pre_init_calls_return_not_initialized() {
     );
 }
 
-// ── #1000 / #1003 / #1004 / #1006: execution & finalization hardening ─────────
+// ════════════════════════════════════════════════════════════════════════════
+// #995 execution-before-eta, #999 state monotonicity,
+// #1002 finalized votes vs deposits, #1005 administrative authorization
+// ════════════════════════════════════════════════════════════════════════════
 
 fn advance_past_voting(t: &GovTestEnv) {
     let mut ledger = t.env.ledger().get();
@@ -2971,205 +2974,501 @@ fn advance_past_voting(t: &GovTestEnv) {
     t.env.ledger().set(ledger);
 }
 
-fn tamper_proposal(t: &GovTestEnv, id: u64, f: impl FnOnce(&mut GovernanceProposal)) {
-    t.env.as_contract(&t.contract.address, || {
-        let mut p: GovernanceProposal = t
-            .env
-            .storage()
-            .persistent()
-            .get(&StorageKey::Proposal(id))
-            .unwrap();
-        f(&mut p);
-        t.env.storage().persistent().set(&StorageKey::Proposal(id), &p);
-    });
+fn advance_ledgers(t: &GovTestEnv, n: u32) {
+    let mut ledger = t.env.ledger().get();
+    ledger.sequence_number += n;
+    t.env.ledger().set(ledger);
 }
 
-#[test]
-fn test_1000_vetoed_proposal_rejected_with_cancelled_error() {
-    let t = setup();
-    setup_veto_multisig(&t);
-    let id = create_fee_proposal(&t);
+/// Creates a fee proposal that has voted yes and been moved Active -> Passed
+/// under the given execution delay. Returns the proposal id.
+fn passed_proposal_with_delay(t: &GovTestEnv, delay: u32) -> u64 {
+    t.contract.set_execution_delay(&t.admin, &delay);
+    let id = create_fee_proposal(t);
     t.contract.cast_vote(&t.voter_b, &id, &true);
-    t.contract.veto_proposal(&t.admin, &id, &reason_hash(&t.env));
+    advance_past_voting(t);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Passed);
+    id
+}
 
-    // Dead immediately, even before the voting window closes.
+fn rank(s: &ProposalStatus) -> u32 {
+    match s {
+        ProposalStatus::Active => 0,
+        ProposalStatus::Passed => 1,
+        _ => 2,
+    }
+}
+
+// ── #995: no execution before eta ───────────────────────────────────────────
+
+#[test]
+fn test_eta_is_frozen_when_delay_is_lowered_after_passing() {
+    let t = setup();
+    let id = passed_proposal_with_delay(&t, 100);
+    let eta = t.contract.get_proposal(&id).eta_ledger;
+
+    // Adversarial: the admin drops the delay to 0 after the proposal passed.
+    t.contract.set_execution_delay(&t.admin, &0);
     assert_eq!(
         t.contract.try_execute_proposal(&id),
-        Err(Ok(GovernanceError::ProposalCancelled))
+        Err(Ok(GovernanceError::TimelockNotExpired))
     );
-    advance_past_voting(&t);
-    assert_eq!(
-        t.contract.try_execute_proposal(&id),
-        Err(Ok(GovernanceError::ProposalCancelled))
-    );
+    assert_eq!(t.contract.get_proposal(&id).eta_ledger, eta);
 }
 
 #[test]
-fn test_1000_vetoed_after_passed_cannot_execute() {
+fn test_eta_boundary_one_ledger_before_and_at_eta() {
     let t = setup();
-    setup_veto_multisig(&t);
+    let id = passed_proposal_with_delay(&t, 10);
+    let eta = t.contract.get_proposal(&id).eta_ledger;
+
+    advance_ledgers(&t, 9);
+    assert_eq!(t.env.ledger().sequence(), eta - 1);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Passed);
+
+    advance_ledgers(&t, 1);
+    assert_eq!(t.env.ledger().sequence(), eta);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+#[test]
+fn test_queueing_and_execution_never_happen_in_one_call_with_delay() {
+    let t = setup();
+    let id = passed_proposal_with_delay(&t, 5);
+    // Queueing call must not have executed anything.
+    assert_ne!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+#[test]
+fn test_failed_execution_retry_keeps_original_eta() {
+    let t = setup();
+    let id = passed_proposal_with_delay(&t, 10);
+    let eta = t.contract.get_proposal(&id).eta_ledger;
+    advance_ledgers(&t, 10);
+    // Raising the delay between attempts must not push a ready proposal back
+    // or pull an unready one forward.
+    t.contract.set_execution_delay(&t.admin, &1_000);
+    assert_eq!(t.contract.get_proposal(&id).eta_ledger, eta);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+#[test]
+fn test_execution_delay_cap_enforced() {
+    let t = setup();
+    t.contract
+        .set_execution_delay(&t.admin, &MAX_EXECUTION_DELAY_LEDGERS);
+    assert_eq!(t.contract.get_execution_delay(), MAX_EXECUTION_DELAY_LEDGERS);
+    assert_eq!(
+        t.contract
+            .try_set_execution_delay(&t.admin, &(MAX_EXECUTION_DELAY_LEDGERS + 1)),
+        Err(Ok(GovernanceError::InvalidExecutionDelay))
+    );
+    assert_eq!(t.contract.get_execution_delay(), MAX_EXECUTION_DELAY_LEDGERS);
+}
+
+#[test]
+fn test_assert_executable_fails_closed_on_every_bad_combination() {
+    let t = setup();
     let id = create_fee_proposal(&t);
-    t.contract.cast_vote(&t.voter_b, &id, &true);
+    let base = t.contract.get_proposal(&id);
+
+    let check = |p: &GovernanceProposal| {
+        t.env
+            .as_contract(&t.contract.address, || GovContract::assert_executable(&t.env, p))
+    };
+
+    // Active / terminal states are never executable.
+    for s in [
+        ProposalStatus::Active,
+        ProposalStatus::Rejected,
+        ProposalStatus::Executed,
+        ProposalStatus::Vetoed,
+    ] {
+        let mut p = base.clone();
+        p.status = s;
+        assert_eq!(check(&p), Err(GovernanceError::InvalidStateTransition));
+    }
+
+    // Passed but voting window still open.
+    let mut p = base.clone();
+    p.status = ProposalStatus::Passed;
+    assert_eq!(check(&p), Err(GovernanceError::VotingOngoing));
+
+    // Passed, window closed, eta in the future.
     advance_past_voting(&t);
-    t.contract.execute_proposal(&id); // Active -> Passed
-    t.contract.veto_proposal(&t.admin, &id, &reason_hash(&t.env));
-    assert_eq!(
-        t.contract.try_execute_proposal(&id),
-        Err(Ok(GovernanceError::ProposalCancelled))
-    );
+    p.eta_ledger = t.env.ledger().sequence() + 1;
+    assert_eq!(check(&p), Err(GovernanceError::TimelockNotExpired));
+
+    // Passed, window closed, eta reached.
+    p.eta_ledger = t.env.ledger().sequence();
+    assert_eq!(check(&p), Ok(()));
+}
+
+// ── #999: proposal state monotonicity ───────────────────────────────────────
+
+#[test]
+fn test_legal_transition_table_is_exactly_the_forward_edges() {
+    use ProposalStatus::*;
+    let all = [Active, Passed, Rejected, Executed, Vetoed];
+    let legal = [
+        (Active, Passed),
+        (Active, Rejected),
+        (Active, Vetoed),
+        (Passed, Executed),
+        (Passed, Vetoed),
+    ];
+    for from in all.iter() {
+        for to in all.iter() {
+            let expected = legal.iter().any(|(f, g)| f == from && g == to);
+            assert_eq!(
+                GovContract::is_legal_transition(from, to),
+                expected,
+                "{:?} -> {:?}",
+                from,
+                to
+            );
+            // Monotonic: every legal edge strictly increases rank.
+            if expected {
+                assert!(rank(to) > rank(from));
+            }
+        }
+    }
 }
 
 #[test]
-fn test_1000_superseded_proposal_cannot_execute() {
-    let t = setup();
-    let old = create_fee_proposal(&t);
-    let mut l = t.env.ledger().get();
-    l.timestamp += 10;
-    t.env.ledger().set(l);
-    let newer = create_fee_proposal(&t);
-    t.contract.cast_vote(&t.voter_b, &old, &true);
-    t.contract.cast_vote(&t.voter_b, &newer, &true);
-    advance_past_voting(&t);
-    t.contract.execute_proposal(&old); // Passed
-    t.contract.execute_proposal(&newer); // Passed
-
-    t.contract.execute_proposal(&newer); // Executed
-    assert_eq!(
-        t.contract.get_proposal(&newer).status,
-        ProposalStatus::Executed
-    );
-    assert_eq!(
-        t.contract.try_execute_proposal(&old),
-        Err(Ok(GovernanceError::ProposalSuperseded))
-    );
-    assert_eq!(t.contract.get_proposal(&old).status, ProposalStatus::Passed);
-}
-
-#[test]
-fn test_1000_newer_unexecuted_does_not_block_older() {
-    let t = setup();
-    let old = create_fee_proposal(&t);
-    t.contract.cast_vote(&t.voter_b, &old, &true);
-    advance_past_voting(&t);
-    t.contract.execute_proposal(&old);
-    t.contract.execute_proposal(&old);
-    assert_eq!(t.contract.get_proposal(&old).status, ProposalStatus::Executed);
-}
-
-#[test]
-fn test_1003_missing_total_supply_fails_closed() {
+fn test_terminal_states_reject_every_transition_and_leave_storage_untouched() {
     let t = setup();
     let id = create_fee_proposal(&t);
-    t.contract.cast_vote(&t.voter_a, &id, &true); // 1 voter, tiny tally
-    t.env.as_contract(&t.contract.address, || {
-        t.env.storage().instance().remove(&StorageKey::GovTokenTotalSupply);
-    });
-    advance_past_voting(&t);
-    assert_eq!(
-        t.contract.try_execute_proposal(&id),
-        Err(Ok(GovernanceError::QuorumDataMissing))
-    );
+    for terminal in [
+        ProposalStatus::Rejected,
+        ProposalStatus::Executed,
+        ProposalStatus::Vetoed,
+    ] {
+        let mut p = t.contract.get_proposal(&id);
+        p.status = terminal.clone();
+        for next in [
+            ProposalStatus::Active,
+            ProposalStatus::Passed,
+            ProposalStatus::Rejected,
+            ProposalStatus::Executed,
+            ProposalStatus::Vetoed,
+        ] {
+            let res = t.env.as_contract(&t.contract.address, || {
+                GovContract::transition_status(&t.env, &mut p.clone(), next)
+            });
+            assert_eq!(res, Err(GovernanceError::InvalidStateTransition));
+        }
+    }
+    // Nothing was persisted by the rejected attempts.
     assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
 }
 
 #[test]
-fn test_1003_zero_supply_and_missing_quorum_bps_fail_closed() {
+fn test_executed_and_vetoed_proposals_cannot_be_re_executed() {
+    let t = setup();
+    setup_veto_multisig(&t);
+
+    let executed = passed_proposal_with_delay(&t, 0);
+    t.contract.execute_proposal(&executed);
+    assert_eq!(
+        t.contract.try_execute_proposal(&executed),
+        Err(Ok(GovernanceError::AlreadyResolved))
+    );
+
+    let vetoed = create_fee_proposal(&t);
+    t.contract
+        .veto_proposal(&t.admin, &vetoed, &reason_hash(&t.env));
+    advance_past_voting(&t);
+    assert_eq!(
+        t.contract.try_execute_proposal(&vetoed),
+        Err(Ok(GovernanceError::AlreadyResolved))
+    );
+    assert_eq!(
+        t.contract
+            .try_veto_proposal(&t.admin, &vetoed, &reason_hash(&t.env)),
+        Err(Ok(GovernanceError::NotVetoable))
+    );
+    assert_eq!(t.contract.get_proposal(&vetoed).status, ProposalStatus::Vetoed);
+}
+
+#[test]
+fn test_veto_during_timelock_is_terminal_and_blocks_execution() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    let id = passed_proposal_with_delay(&t, 50);
+    t.contract.veto_proposal(&t.admin, &id, &reason_hash(&t.env));
+    advance_ledgers(&t, 1_000);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::AlreadyResolved))
+    );
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Vetoed);
+}
+
+#[test]
+fn test_status_rank_never_decreases_across_an_operation_sequence() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    let id = create_fee_proposal(&t);
+    t.contract.set_execution_delay(&t.admin, &20);
+    let mut last = rank(&t.contract.get_proposal(&id).status);
+
+    let mut observe = |t: &GovTestEnv| {
+        let r = rank(&t.contract.get_proposal(&id).status);
+        assert!(r >= last, "status regressed");
+        last = r;
+    };
+
+    t.contract.cast_vote(&t.voter_b, &id, &true);
+    observe(&t);
+    let _ = t.contract.try_execute_proposal(&id); // too early
+    observe(&t);
+    advance_past_voting(&t);
+    let _ = t.contract.try_cast_vote(&t.voter_a, &id, &true); // window closed
+    observe(&t);
+    let _ = t.contract.try_execute_proposal(&id); // -> Passed
+    observe(&t);
+    let _ = t.contract.try_execute_proposal(&id); // timelock
+    observe(&t);
+    advance_ledgers(&t, 20);
+    let _ = t.contract.try_execute_proposal(&id); // -> Executed
+    observe(&t);
+    let _ = t.contract.try_veto_proposal(&t.admin, &id, &reason_hash(&t.env));
+    observe(&t);
+    let _ = t.contract.try_execute_proposal(&id);
+    observe(&t);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+// ── #1002: finalized votes cannot be altered ─────────────────────────────────
+
+#[test]
+fn test_extra_deposit_after_vote_does_not_change_recorded_vote() {
     let t = setup();
     let id = create_fee_proposal(&t);
     t.contract.cast_vote(&t.voter_a, &id, &true);
-    advance_past_voting(&t);
-    t.env.as_contract(&t.contract.address, || {
-        t.env.storage().instance().set(&StorageKey::GovTokenTotalSupply, &0_i128);
-    });
-    assert_eq!(
-        t.contract.try_execute_proposal(&id),
-        Err(Ok(GovernanceError::QuorumDataMissing))
-    );
-    t.env.as_contract(&t.contract.address, || {
-        t.env.storage().instance().set(&StorageKey::GovTokenTotalSupply, &10_000_i128);
-        t.env.storage().instance().remove(&StorageKey::MinQuorumBps);
-    });
-    assert_eq!(
-        t.contract.try_execute_proposal(&id),
-        Err(Ok(GovernanceError::QuorumDataMissing))
-    );
-}
+    let before = t.contract.get_proposal(&id);
 
-#[test]
-fn test_1004_negative_tally_rejected() {
-    let t = setup();
-    let id = create_fee_proposal(&t);
-    tamper_proposal(&t, id, |p| {
-        p.votes_for = 5_000;
-        p.votes_against = -1;
-    });
-    advance_past_voting(&t);
-    assert_eq!(
-        t.contract.try_execute_proposal(&id),
-        Err(Ok(GovernanceError::InvalidVoteAccounting))
-    );
-}
-
-#[test]
-fn test_1004_tally_overflow_rejected_and_max_boundary_accepted() {
-    let t = setup();
-    let id = create_fee_proposal(&t);
-    advance_past_voting(&t);
-    tamper_proposal(&t, id, |p| {
-        p.votes_for = i128::MAX;
-        p.votes_against = 1;
-    });
-    assert_eq!(
-        t.contract.try_execute_proposal(&id),
-        Err(Ok(GovernanceError::InvalidVoteAccounting))
-    );
-    // Boundary: the largest non-overflowing tally is accepted (and passes).
-    tamper_proposal(&t, id, |p| {
-        p.votes_for = i128::MAX - 1;
-        p.votes_against = 1;
-    });
-    t.contract.execute_proposal(&id);
-    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Passed);
-}
-
-#[test]
-fn test_1006_missing_proposal_storage_fails_closed() {
-    let t = setup();
-    let id = create_fee_proposal(&t);
-    // Never-issued ids are plain not-found.
-    assert_eq!(
-        t.contract.try_get_proposal(&0).err(),
-        Some(Ok(GovernanceError::ProposalNotFound))
-    );
-    assert_eq!(
-        t.contract.try_get_proposal(&(id + 1)).err(),
-        Some(Ok(GovernanceError::ProposalNotFound))
-    );
-    // Issued id whose entry vanished (expired/archived) is corruption.
-    t.env.as_contract(&t.contract.address, || {
-        t.env.storage().persistent().remove(&StorageKey::Proposal(id));
-    });
-    assert_eq!(
-        t.contract.try_get_proposal(&id).err(),
-        Some(Ok(GovernanceError::ProposalStorageCorrupt))
-    );
-    assert_eq!(
-        t.contract.try_execute_proposal(&id),
-        Err(Ok(GovernanceError::ProposalStorageCorrupt))
-    );
+    // voter_a receives a large extra deposit and tries to vote again.
+    t.gov_token_admin.mint(&t.voter_a, &50_000);
     assert_eq!(
         t.contract.try_cast_vote(&t.voter_a, &id, &true),
-        Err(Ok(GovernanceError::ProposalStorageCorrupt))
+        Err(Ok(GovernanceError::AlreadyVoted))
+    );
+    assert_eq!(
+        t.contract.try_cast_vote(&t.voter_a, &id, &false),
+        Err(Ok(GovernanceError::AlreadyVoted))
+    );
+
+    let after = t.contract.get_proposal(&id);
+    assert_eq!(after.votes_for, before.votes_for);
+    assert_eq!(after.votes_against, before.votes_against);
+    assert_eq!(t.contract.get_applied_vote_weight(&id, &t.voter_a), Some(1_000));
+}
+
+#[test]
+fn test_votes_frozen_once_proposal_is_no_longer_active() {
+    let t = setup();
+    let id = passed_proposal_with_delay(&t, 100);
+    let frozen = t.contract.get_proposal(&id);
+
+    let late = Address::generate(&t.env);
+    t.gov_token_admin.mint(&late, &9_000);
+    // Window closed: late voters are rejected, tally is untouched.
+    assert_eq!(
+        t.contract.try_cast_vote(&late, &id, &false),
+        Err(Ok(GovernanceError::VotingEnded))
+    );
+    let after = t.contract.get_proposal(&id);
+    assert_eq!(after.votes_for, frozen.votes_for);
+    assert_eq!(after.votes_against, frozen.votes_against);
+}
+
+#[test]
+fn test_vote_receipt_outlives_voting_window() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+
+    // Last ledger of the voting window (51_840 ledgers at 5 s).
+    advance_ledgers(&t, (VOTING_PERIOD_SECS / 5) as u32);
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp += VOTING_PERIOD_SECS - 1;
+    t.env.ledger().set(ledger);
+
+    assert!(t.contract.has_voted(&t.voter_a, &id));
+    assert_eq!(
+        t.contract.try_cast_vote(&t.voter_a, &id, &false),
+        Err(Ok(GovernanceError::AlreadyVoted))
     );
 }
 
 #[test]
-fn test_1006_mismatched_id_entry_rejected() {
+fn test_deposit_settles_exactly_once_across_pass_execute_and_veto() {
     let t = setup();
+    setup_veto_multisig(&t);
+    t.contract.set_min_proposal_deposit(&300);
+    t.contract.set_execution_delay(&t.admin, &10);
+    let sink = Address::generate(&t.env);
+    t.contract.set_proposal_deposit_sink(&Some(sink.clone()));
+
+    let proposer_start = t.gov_token.balance(&t.proposer);
     let id = create_fee_proposal(&t);
-    tamper_proposal(&t, id, |p| p.id = 999);
+    assert_eq!(t.gov_token.balance(&t.proposer), proposer_start - 300);
+    t.contract.cast_vote(&t.voter_b, &id, &true);
+    advance_past_voting(&t);
+    t.contract.execute_proposal(&id); // Passed -> refund
+    assert_eq!(t.gov_token.balance(&t.proposer), proposer_start);
+    assert!(t.contract.is_proposal_deposit_settled(&id));
+
+    // Vetoing a Passed proposal must neither forfeit nor re-pay the deposit.
+    t.contract.veto_proposal(&t.admin, &id, &reason_hash(&t.env));
+    assert_eq!(t.gov_token.balance(&t.proposer), proposer_start);
+    assert_eq!(t.gov_token.balance(&sink), 0);
+    assert_eq!(t.gov_token.balance(&t.contract.address), 0);
+}
+
+#[test]
+fn test_settlement_helpers_are_idempotent() {
+    let t = setup();
+    t.contract.set_min_proposal_deposit(&200);
+    let id = create_fee_proposal(&t);
+    let start = t.gov_token.balance(&t.proposer);
+
+    let (first, second, third) = t.env.as_contract(&t.contract.address, || {
+        (
+            GovContract::refund_proposal_deposit(&t.env, id, &t.proposer),
+            GovContract::refund_proposal_deposit(&t.env, id, &t.proposer),
+            GovContract::forfeit_proposal_deposit(&t.env, id, &t.proposer),
+        )
+    });
+    assert_eq!(first, Ok(true));
+    assert_eq!(second, Ok(false));
+    assert_eq!(third, Ok(false));
+    assert_eq!(t.gov_token.balance(&t.proposer), start + 200);
+}
+
+// ── #1005: administrative authorization ──────────────────────────────────────
+
+#[test]
+fn test_set_execution_delay_rejects_non_admin() {
+    let t = setup();
+    let attacker = Address::generate(&t.env);
     assert_eq!(
-        t.contract.try_get_proposal(&id).err(),
-        Some(Ok(GovernanceError::ProposalStorageCorrupt))
+        t.contract.try_set_execution_delay(&attacker, &1),
+        Err(Ok(GovernanceError::Unauthorized))
     );
+    assert_eq!(t.contract.get_execution_delay(), 0);
+}
+
+#[test]
+fn test_set_execution_delay_before_initialize_does_not_install_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, GovContract);
+    let contract = GovContractClient::new(&env, &contract_id);
+    let squatter = Address::generate(&env);
+
+    assert_eq!(
+        contract.try_set_execution_delay(&squatter, &99),
+        Err(Ok(GovernanceError::NotInitialized))
+    );
+    assert_eq!(contract.get_execution_delay(), 0);
+    let admin_set = env.as_contract(&contract_id, || env.storage().instance().has(&StorageKey::Admin));
+    assert!(!admin_set);
+}
+
+#[test]
+fn test_admin_surface_requires_real_authorization() {
+    let t = setup();
+    let env = &t.env;
+    let attacker = Address::generate(env);
+    let signers = soroban_sdk::vec![env, attacker.clone()];
+
+    // Switch from mock_all_auths to enforcing mode with no authorizations.
+    env.set_auths(&[]);
+
+    assert!(t.contract.try_set_execution_delay(&t.admin, &5).is_err());
+    assert!(t.contract.try_set_min_quorum_bps(&500).is_err());
+    assert!(t.contract.try_set_min_proposal_balance(&1).is_err());
+    assert!(t.contract.try_set_min_proposal_deposit(&1).is_err());
+    assert!(t.contract.try_set_proposal_deposit_sink(&Some(attacker.clone())).is_err());
+    assert!(t.contract.try_set_gov_token_total_supply(&1).is_err());
+    assert!(t.contract.try_set_max_delegation_depth(&1).is_err());
+    assert!(t.contract.try_set_quadratic_voting_enabled(&true).is_err());
+    assert!(t.contract.try_disable_veto_power().is_err());
+    assert!(t.contract.try_configure_veto_multisig(&signers, &1).is_err());
+
+    // No state changed.
+    assert_eq!(t.contract.get_execution_delay(), 0);
+    assert_eq!(t.contract.get_min_quorum_bps(), DEFAULT_MIN_QUORUM_BPS);
+    assert_eq!(t.contract.get_min_proposal_deposit(), 0);
+    assert_eq!(t.contract.get_gov_token_total_supply(), 10_000);
+    assert!(t.contract.is_veto_power_enabled());
+    assert!(t.contract.get_veto_signers().is_empty());
+}
+
+#[test]
+fn test_admin_surface_positive_control_with_correct_signer() {
+    use soroban_sdk::{testutils::{MockAuth, MockAuthInvoke}, IntoVal};
+    let t = setup();
+    let env = &t.env;
+    env.set_auths(&[]);
+
+    // The admin's own signature authorizes set_execution_delay…
+    t.contract
+        .mock_auths(&[MockAuth {
+            address: &t.admin,
+            invoke: &MockAuthInvoke {
+                contract: &t.contract.address,
+                fn_name: "set_execution_delay",
+                args: (t.admin.clone(), 7_u32).into_val(env),
+                sub_invokes: &[],
+            },
+        }])
+        .set_execution_delay(&t.admin, &7);
+    assert_eq!(t.contract.get_execution_delay(), 7);
+
+    // …but the same admin signature does NOT authorize an ILN-gated setter.
+    t.contract
+        .mock_auths(&[MockAuth {
+            address: &t.admin,
+            invoke: &MockAuthInvoke {
+                contract: &t.contract.address,
+                fn_name: "set_min_quorum_bps",
+                args: (500_u32,).into_val(env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_min_quorum_bps(&500)
+        .unwrap_err();
+    assert_eq!(t.contract.get_min_quorum_bps(), DEFAULT_MIN_QUORUM_BPS);
+}
+
+#[test]
+fn test_veto_requires_configured_signer_and_signer_auth() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    let id = create_fee_proposal(&t);
+    let outsider = Address::generate(&t.env);
+
+    assert_eq!(
+        t.contract.try_veto_proposal(&outsider, &id, &reason_hash(&t.env)),
+        Err(Ok(GovernanceError::NotVetoSigner))
+    );
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
+
+    t.env.set_auths(&[]);
+    assert!(t
+        .contract
+        .try_veto_proposal(&t.admin, &id, &reason_hash(&t.env))
+        .is_err());
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
 }

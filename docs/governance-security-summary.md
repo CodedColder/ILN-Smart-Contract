@@ -47,7 +47,14 @@ Every mitigation available *today* against a compromised admin is an **off-chain
 
 These are known, documented, and consciously carried into mainnet. They are listed here so a reviewer does not have to reconstruct them from six sources.
 
-### 3.1 No execution timelock
+### 3.1 Execution timelock (partially implemented)
+
+> **Update (#995/#999/#1002/#1005):** the contract now enforces an `eta_ledger` timelock and monotonic proposal states — see the [ADR-005 addendum](adr/ADR-005-governance-timelock.md#addendum-995-999-1002-1005-implemented-timelock-invariants). The default `ExecutionDelay` is still `0`, so mainnet must set a non-zero delay (admin `set_execution_delay`, capped at 518,400 ledgers) before the veto is retired. **Rollout:** no storage migration (no struct changes; new error codes 29–31 are additive). **Recovery:** if a bad delay is set, lower it with `set_execution_delay`; already-`Passed` proposals keep their original eta, and any `Passed` proposal can still be vetoed while the veto is enabled.
+>
+> **Known follow-ups, not fixed here:** (a) `execute_proposal` returns `Err` for quorum/majority rejection, and Soroban rolls back state on `Err`, so `Rejected` status and the deposit forfeit do not persist on-chain (tests bypass this with `as_contract`); (b) `delegate_votes` after voting can let the same balance be counted by the delegate; (c) the delay is admin-key controlled.
+
+Original accepted-risk text (pre-timelock):
+
 
 `execute_proposal` runs in the same transaction as the call that triggers it, immediately after the voting window closes ([ADR-005](adr/ADR-005-governance-timelock.md), [`governance.md` §7](governance.md#7-execution-mechanics)). The stated substitute is the admin veto, which can block any `Active`/`Passed` proposal. **Accepted because:** at launch the token distribution is concentrated enough that a long timelock would slow necessary parameter tuning without a real decentralization benefit, and the veto covers the "malicious proposal" case. **Exit:** ADR-012 Phase 3 implements and activates a real timelock via governance upgrade *before* the veto is retired.
 

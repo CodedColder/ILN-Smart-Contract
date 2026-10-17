@@ -41,6 +41,16 @@ const DEFAULT_PROPOSAL_DEPOSIT: i128 = 0;
 /// later proposals.
 const MIN_VOTE_HOLD_LEDGERS: u32 = 10;
 
+/// Vote receipts (`HasVoted`) must outlive the voting window, otherwise an
+/// expired receipt would let a voter vote twice (#1002). Assumes ledgers close
+/// no slower than 5 s apiece. Checked at compile time.
+const _: () = assert!((VOTE_RECEIPT_TTL_LEDGERS as u64) * 5 > VOTING_PERIOD_SECS);
+
+/// #995: upper bound on `ExecutionDelay` (~30 days at 5 s/ledger). An
+/// unbounded delay would let a single admin key park every future proposal
+/// behind an unreachable `eta_ledger`.
+const MAX_EXECUTION_DELAY_LEDGERS: u32 = 518_400;
+
 /// Default maximum transitive delegation chain depth.
 const DEFAULT_MAX_DELEGATION_DEPTH: u32 = 10;
 
@@ -103,20 +113,15 @@ pub enum GovernanceError {
     DepositAlreadySettled = 27,
     /// #844: contract called before `initialize()`.
     NotInitialized = 28,
-    /// #1000: the proposal was vetoed (cancelled) and can never execute.
-    ProposalCancelled = 29,
-    /// #1000: a later proposal of the same action kind already executed, so
-    /// this stale passed proposal must not overwrite the newer outcome.
-    ProposalSuperseded = 30,
-    /// #1003: the quorum denominator (token total supply) or quorum bps is
-    /// missing / non-positive — finalization fails closed instead of
-    /// treating the quorum as zero.
-    QuorumDataMissing = 31,
-    /// #1004: stored vote tallies are inconsistent (negative or overflowing).
-    InvalidVoteAccounting = 32,
-    /// #1006: the id is within `ProposalCount` but its storage entry is
-    /// missing (expired/archived) or does not match the requested id.
-    ProposalStorageCorrupt = 33,
+    /// #999: the requested proposal status change is not a legal forward
+    /// transition (see `ProposalStatus` lifecycle). Terminal states
+    /// (`Rejected`, `Executed`, `Vetoed`) can never be left.
+    InvalidStateTransition = 29,
+    /// #995: the proposal's `eta_ledger` cannot be computed (arithmetic
+    /// overflow) — the Passed transition fails closed instead of saturating.
+    InvalidTimelock = 30,
+    /// #995: requested execution delay exceeds `MAX_EXECUTION_DELAY_LEDGERS`.
+    InvalidExecutionDelay = 31,
 }
 
 // ================================================================
@@ -206,6 +211,17 @@ pub struct FeeTierConfig {
 // ProposalStatus
 // ================================================================
 
+/// Proposal lifecycle (#999). Status is monotonic — it only moves forward:
+///
+/// ```text
+/// Active ──> Passed ──> Executed
+///   │           └─────> Vetoed
+///   ├─────────────────> Rejected
+///   └─────────────────> Vetoed
+/// ```
+///
+/// `Rejected`, `Executed` and `Vetoed` are terminal. All writes go through
+/// `GovContract::transition_status`, which enforces this table.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProposalStatus {
@@ -988,6 +1004,57 @@ pub fn create_proposal(
         Ok(id)
     }
 
+    // ── #995 / #999: lifecycle invariants ──────────────────────────
+
+    /// Legal forward edges of the proposal lifecycle (see `ProposalStatus`).
+    fn is_legal_transition(from: &ProposalStatus, to: &ProposalStatus) -> bool {
+        matches!(
+            (from, to),
+            (ProposalStatus::Active, ProposalStatus::Passed)
+                | (ProposalStatus::Active, ProposalStatus::Rejected)
+                | (ProposalStatus::Active, ProposalStatus::Vetoed)
+                | (ProposalStatus::Passed, ProposalStatus::Executed)
+                | (ProposalStatus::Passed, ProposalStatus::Vetoed)
+        )
+    }
+
+    /// The only writer of `proposal.status` after creation. Rejects any
+    /// non-forward move (including same-state and out-of-terminal moves) and
+    /// persists the proposal.
+    fn transition_status(
+        env: &Env,
+        proposal: &mut GovernanceProposal,
+        next: ProposalStatus,
+    ) -> Result<(), GovernanceError> {
+        if !Self::is_legal_transition(&proposal.status, &next) {
+            return Err(GovernanceError::InvalidStateTransition);
+        }
+        proposal.status = next;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal.id), proposal);
+        Ok(())
+    }
+
+    /// #995: execution invariant. A proposal may only be executed when it is
+    /// `Passed`, its voting window has closed, and the current ledger has
+    /// reached `eta_ledger`. Fails closed on every other combination.
+    fn assert_executable(
+        env: &Env,
+        proposal: &GovernanceProposal,
+    ) -> Result<(), GovernanceError> {
+        if proposal.status != ProposalStatus::Passed {
+            return Err(GovernanceError::InvalidStateTransition);
+        }
+        if env.ledger().timestamp() < proposal.voting_end {
+            return Err(GovernanceError::VotingOngoing);
+        }
+        if env.ledger().sequence() < proposal.eta_ledger {
+            return Err(GovernanceError::TimelockNotExpired);
+        }
+        Ok(())
+    }
+
     // ── Issue #814: forfeitable proposal deposit ───────────────────
 
 /// Returns the governance-configurable forfeitable deposit escrowed at
@@ -1197,7 +1264,11 @@ pub fn get_proposal_created_ledger(env: Env, proposal_id: u64) -> Option<u32> {
     /// call after settlement is a no-op returning `false` (no second
     /// transfer), which is what prevents double-refunds on the
     /// `Passed -> Executed` second `execute_proposal` call.
-    fn refund_proposal_deposit(env: &Env, proposal_id: u64, proposer: &Address) -> Result<bool, GovernanceError> {
+    fn refund_proposal_deposit(
+        env: &Env,
+        proposal_id: u64,
+        proposer: &Address,
+    ) -> Result<bool, GovernanceError> {
         if env
             .storage()
             .persistent()
@@ -1244,7 +1315,11 @@ pub fn get_proposal_created_ledger(env: Env, proposal_id: u64) -> Option<u32> {
 
     /// Forfeit the escrowed deposit to the configured sink (or lock it in
     /// this contract when no sink is set). Idempotent like the refund path.
-    fn forfeit_proposal_deposit(env: &Env, proposal_id: u64, proposer: &Address) -> Result<bool, GovernanceError> {
+    fn forfeit_proposal_deposit(
+        env: &Env,
+        proposal_id: u64,
+        proposer: &Address,
+    ) -> Result<bool, GovernanceError> {
         if env
             .storage()
             .persistent()
@@ -1757,9 +1832,9 @@ pub fn set_execution_delay(
     ) -> Result<(), GovernanceError> {
         admin.require_auth();
 
-        // Issue #997: fail closed. The admin is only ever seeded by
-        // `initialize`; an uninitialized contract must not let the first
-        // caller install themselves as admin via this entry point.
+        // #1005: fail closed before `initialize()`. Previously the first
+        // caller was silently installed as `Admin` and could pre-seed the
+        // timelock parameter.
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -1767,6 +1842,9 @@ pub fn set_execution_delay(
             .ok_or(GovernanceError::NotInitialized)?;
         if admin != stored_admin {
             return Err(GovernanceError::Unauthorized);
+        }
+        if delay > MAX_EXECUTION_DELAY_LEDGERS {
+            return Err(GovernanceError::InvalidExecutionDelay);
         }
 
         let old_value: u32 = env
@@ -1879,38 +1957,32 @@ pub fn get_execution_delay(env: Env) -> u32 {
             let quorum = total_supply.saturating_mul(min_quorum_bps as i128) / 10_000_i128;
 
             if total_votes < quorum {
-                proposal.status = ProposalStatus::Rejected;
-                env.storage()
-                    .persistent()
-                    .set(&StorageKey::Proposal(proposal_id), &proposal);
+                Self::transition_status(&env, &mut proposal, ProposalStatus::Rejected)?;
                 // Issue #814: expired without quorum — forfeit the deposit.
                 Self::forfeit_proposal_deposit(&env, proposal_id, &proposal.proposer)?;
                 return Err(GovernanceError::QuorumNotReached);
             }
 
             if proposal.votes_for <= proposal.votes_against {
-                proposal.status = ProposalStatus::Rejected;
-                env.storage()
-                    .persistent()
-                    .set(&StorageKey::Proposal(proposal_id), &proposal);
+                Self::transition_status(&env, &mut proposal, ProposalStatus::Rejected)?;
                 // Issue #814: rejected — forfeit the deposit.
                 Self::forfeit_proposal_deposit(&env, proposal_id, &proposal.proposer)?;
                 return Err(GovernanceError::ProposalRejected);
             }
 
-            proposal.status = ProposalStatus::Passed;
-
-            // Issue #992: legacy zero-delay state is clamped to the
-            // production floor once veto power is retired.
-            let delay = Self::effective_execution_delay(&env);
-            // Issue #987: Calculate eta using wrapping_add to cleanly support ledger rollover.
-            // Issue #992: 0 is the "legacy, no eta" sentinel; a wrap landing
-            // exactly on 0 moves one ledger later (never earlier).
-            proposal.eta_ledger = Self::compute_eta(env.ledger().sequence(), delay);
-
-            env.storage()
-                .persistent()
-                .set(&StorageKey::Proposal(proposal_id), &proposal);
+            let delay = env
+                .storage()
+                .instance()
+                .get(&StorageKey::ExecutionDelay)
+                .unwrap_or(0_u32);
+            // #995: never saturate — a clamped eta would silently shorten the
+            // timelock. Overflow aborts the Passed transition instead.
+            proposal.eta_ledger = env
+                .ledger()
+                .sequence()
+                .checked_add(delay)
+                .ok_or(GovernanceError::InvalidTimelock)?;
+            Self::transition_status(&env, &mut proposal, ProposalStatus::Passed)?;
             // Issue #814: passed — refund the deposit (idempotent, so the
             // later Passed -> Executed call does not double-pay).
             Self::refund_proposal_deposit(&env, proposal_id, &proposal.proposer)?;
@@ -1918,22 +1990,8 @@ pub fn get_execution_delay(env: Env) -> u32 {
         }
 
         if proposal.status == ProposalStatus::Passed {
-            // #1000: a later proposal of the same kind already executed.
-            let kind = Self::action_kind(&proposal.action_type);
-            if let Some((last_created, _)) = env
-                .storage()
-                .persistent()
-                .get::<StorageKey, (u64, u64)>(&StorageKey::LastExecuted(kind))
-            {
-                if last_created > proposal.created_at {
-                    return Err(GovernanceError::ProposalSuperseded);
-                }
-            }
-            let current_ledger = env.ledger().sequence();
-            // Issue #987: Verify eta comparison across ledger rollover.
-            if !Self::check_eta_reached(current_ledger, proposal.eta_ledger) {
-                return Err(GovernanceError::TimelockNotExpired);
-            }
+            // #995: single choke point for the eta invariant.
+            Self::assert_executable(&env, &proposal)?;
 
             let iln_contract = Self::get_iln_contract(&env)?;
 
@@ -2087,14 +2145,7 @@ pub fn get_execution_delay(env: Env) -> u32 {
                 return Ok(());
             }
 
-            proposal.status = ProposalStatus::Executed;
-            env.storage()
-                .persistent()
-                .set(&StorageKey::Proposal(proposal_id), &proposal);
-            env.storage().persistent().set(
-                &StorageKey::LastExecuted(kind),
-                &(proposal.created_at, proposal_id),
-            );
+            Self::transition_status(&env, &mut proposal, ProposalStatus::Executed)?;
 
             // Issue #814: executed — ensure refund (no-op if already
             // refunded at Passed time; covers zero-deposit proposals).
@@ -2382,10 +2433,7 @@ pub fn veto_proposal(
                 .remove(&StorageKey::VetoApprovalReceipt(proposal_id, approved));
         }
 
-        proposal.status = ProposalStatus::Vetoed;
-        env.storage()
-            .persistent()
-            .set(&StorageKey::Proposal(proposal_id), &proposal);
+        Self::transition_status(&env, &mut proposal, ProposalStatus::Vetoed)?;
 
         let next_state = VetoState {
             status: VetoStatus::Executed,

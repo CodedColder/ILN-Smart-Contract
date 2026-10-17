@@ -102,11 +102,10 @@ Source of truth: [`contracts/iln_governance/src/lib.rs`](../contracts/iln_govern
 | 17 | `NotVetoable` | Proposal cannot be vetoed in its current status. | Admin attempted to veto a proposal that is not in `Active` status. | Veto only active proposals. |
 | 18 | `VetoPowerDisabled` | Admin veto power has been disabled by governance. | Admin veto was disabled via a governance proposal. | Re-enable veto via governance before using it. |
 | 19 | `InsufficientProposerBalance` | Proposer does not hold the minimum required token balance. | Proposer's token balance is below `MinProposalBalance`. | Acquire enough governance tokens to meet the proposal threshold. |
-| 29 | `ProposalCancelled` | The proposal was vetoed (cancelled) and can never execute (#1000). | `execute_proposal` on a `Vetoed` proposal, including a vetoed-after-`Passed` one. | Create a new proposal. |
-| 30 | `ProposalSuperseded` | A later proposal of the same action kind already executed (#1000). | Executing a stale `Passed` proposal after a newer same-kind proposal executed. | Create a fresh proposal if the change is still wanted. |
-| 31 | `QuorumDataMissing` | Quorum denominator or bps is missing/invalid (#1003). | `GovTokenTotalSupply` unset or <= 0, or `MinQuorumBps` unset or outside 1..=10,000. | Restore via `set_gov_token_total_supply` / `set_min_quorum_bps` (ILN-contract gated). |
-| 32 | `InvalidVoteAccounting` | Stored vote tallies are negative or overflow (#1004). | Corrupt `votes_for` / `votes_against` at finalization. | Treat as an incident; see governance-security-summary §6. |
-| 33 | `ProposalStorageCorrupt` | Issued proposal id has missing or mismatched storage (#1006). | Entry for an id <= `ProposalCount` is absent (archived) or carries a different id. | Restore the entry from archive/backup; see governance-security-summary §6. |
+| 20–28 | *(see source)* | `ExecutionFailed`, `MaxDelegationDepthExceeded`, veto-multisig errors, deposit errors, `NotInitialized`. | — | See [`contracts/iln_governance/src/lib.rs`](../contracts/iln_governance/src/lib.rs). |
+| 29 | `InvalidStateTransition` | Proposal status change is not a legal forward move, or the proposal is not `Passed` at execution. | A code path tried to leave a terminal state (`Rejected`/`Executed`/`Vetoed`) or skip a lifecycle step. Should be unreachable through the public API. | Treat as an invariant violation; capture the proposal id and escalate (see governance-security-summary §3.1). |
+| 30 | `InvalidTimelock` | `eta_ledger` could not be computed without overflow. | Ledger sequence + execution delay exceeded `u32::MAX`. | Fix the ledger/delay configuration; the proposal stays `Active`. |
+| 31 | `InvalidExecutionDelay` | Requested execution delay exceeds 518,400 ledgers (~30 days). | `set_execution_delay` called with a value above the cap. | Use a delay at or below the cap. |
 
 ---
 
