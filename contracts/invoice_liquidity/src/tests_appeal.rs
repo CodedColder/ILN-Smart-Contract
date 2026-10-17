@@ -88,7 +88,15 @@ fn setup_appeal() -> AppealTestEnv {
 fn make_defaulted_invoice(t: &AppealTestEnv) -> u64 {
     let due_date = t.env.ledger().timestamp() + DUE_DATE_OFFSET;
 
-    let id = t.contract.submit_invoice(&ReferralCode::None);
+    let id = t.contract.submit_invoice(
+        &t.freelancer,
+        &t.payer,
+        &INVOICE_AMOUNT,
+        &due_date,
+        &DISCOUNT_RATE,
+        &t.token.address,
+        &ReferralCode::None,
+    );
 
     t.contract
         .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &false);
@@ -234,7 +242,15 @@ fn test_appeal_non_defaulted_invoice_fails() {
     let t = setup_appeal();
     let due_date = t.env.ledger().timestamp() + DUE_DATE_OFFSET;
 
-    let id = t.contract.submit_invoice(&ReferralCode::None);
+    let id = t.contract.submit_invoice(
+        &t.freelancer,
+        &t.payer,
+        &INVOICE_AMOUNT,
+        &due_date,
+        &DISCOUNT_RATE,
+        &t.token.address,
+        &ReferralCode::None,
+    );
 
     // Invoice is still Pending — cannot appeal.
     let result = t.contract.try_appeal_default(&id, &evidence_hash(&t.env));

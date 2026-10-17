@@ -118,32 +118,10 @@
         }
       ]
     ],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXI7N",
-              "function_name": "sign_proposal",
-              "args": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                },
-                {
-                  "u64": "1"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
     []
   ],
   "ledger": {
-    "protocol_version": 27,
+    "protocol_version": 29,
     "sequence_number": 0,
     "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -304,26 +282,6 @@
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
               "key": {
                 "ledger_key_nonce": {
-                  "nonce": "4270020994084947596"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "ledger_key_nonce": {
                   "nonce": "4837995959683129791"
                 }
               },
@@ -453,7 +411,7 @@
                       "symbol": "expires_at"
                     },
                     "val": {
-                      "u32": 17280
+                      "u64": "17280"
                     }
                   },
                   {
@@ -494,7 +452,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 200000
       },
       {
         "entry": {
@@ -560,6 +518,33 @@
               "key": {
                 "vec": [
                   {
+                    "symbol": "TokenDecimals"
+                  },
+                  {
+                    "address": "CD3FXVGYSLQFFTW3UH6WFF2OKZH7VERGZJZAMJHTGHBWO4F6URWEJL23"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 6
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXI7N",
+              "key": {
+                "vec": [
+                  {
                     "symbol": "TokenList"
                   }
                 ]
@@ -596,7 +581,7 @@
               "val": {
                 "contract_instance": {
                   "executable": {
-                    "wasm": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    "wasm": "fdd5ccaaa8881f1ee88dad3fe519af6af78e7905af4655fea1844827c9479d96"
                   },
                   "storage": [
                     {
@@ -777,7 +762,19 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "MultisigProposalCounter"
+                            "symbol": "NextInvoiceId"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "NextProposalId"
                           }
                         ]
                       },
@@ -789,7 +786,14 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "NextInvoiceId"
+                            "symbol": "PendingActionProposal"
+                          },
+                          {
+                            "vec": [
+                              {
+                                "symbol": "Pause"
+                              }
+                            ]
                           }
                         ]
                       },
@@ -1121,8 +1125,8 @@
           "data": {
             "contract_code": {
               "ext": "v0",
-              "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-              "code": ""
+              "hash": "fdd5ccaaa8881f1ee88dad3fe519af6af78e7905af4655fea1844827c9479d96",
+              "code": "746573745f636f6e74726163745f666f725f636f6e74726163745f69645f434141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141415849374e"
             }
           },
           "ext": "v0"

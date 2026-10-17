@@ -15,7 +15,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{storage::Persistent as _, Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env,
 };
@@ -596,4 +596,179 @@ pub(crate) fn test_duplicate_prevention_with_sorted_queue() {
     t.contract.join_fund_queue(&t.lp_b, &id);
     let winner = resolve_queue_mature(&t, &id);
     assert!(winner == t.lp_a || winner == t.lp_b);
+}
+
+// ── Issues #1019–#1022: delayed resolution, recovery, bounds ─────────────────
+
+fn set_score(t: &QueueTestEnv, lp: &Address, score: u32) {
+    t.env.as_contract(&t.contract.address, || {
+        crate::storage::set_lp_score(&t.env, lp, score);
+    });
+}
+
+fn queue_len(t: &QueueTestEnv, id: u64) -> u32 {
+    t.env.as_contract(&t.contract.address, || {
+        crate::storage::get_fund_queue(&t.env, id).len()
+    })
+}
+
+fn advance_time(env: &Env, secs: u64) {
+    let mut info = env.ledger().get();
+    info.timestamp += secs;
+    env.ledger().set(info);
+}
+
+#[test]
+fn queue_full_rejects_join_and_stays_bounded() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    for _ in 0..crate::constants::MAX_FUND_QUEUE_LEN {
+        t.contract.join_fund_queue(&Address::generate(&t.env), &id);
+    }
+    let r = t.contract.try_join_fund_queue(&t.lp_a, &id);
+    assert_eq!(r, Err(Ok(ContractError::QueueFull)));
+    assert_eq!(queue_len(&t, id), crate::constants::MAX_FUND_QUEUE_LEN);
+}
+
+#[test]
+fn join_rejected_for_pending_invoice_past_due_date() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    advance_time(&t.env, DUE_DATE_OFFSET + 1);
+    let r = t.contract.try_join_fund_queue(&t.lp_a, &id);
+    assert_eq!(r, Err(Ok(ContractError::InvoiceExpired)));
+}
+
+#[test]
+fn resolve_rejected_if_invoice_cancelled_after_join() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.cancel_invoice(&id);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    let r = t.contract.try_resolve_fund_queue(&id);
+    assert_eq!(r, Err(Ok(ContractError::AlreadyCancelled)));
+    assert!(t.contract.try_recover_fund_queue(&id).is_ok());
+}
+
+#[test]
+fn resolve_rejected_once_invoice_is_past_due() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    advance_time(&t.env, DUE_DATE_OFFSET + 1);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    let r = t.contract.try_resolve_fund_queue(&id);
+    assert_eq!(r, Err(Ok(ContractError::InvoiceExpired)));
+}
+
+#[test]
+fn delayed_resolution_uses_current_score_not_stale_snapshot() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id); // snapshot 50, first in line
+    t.contract.join_fund_queue(&t.lp_b, &id); // snapshot 50
+    set_score(&t, &t.lp_a, 5); // A's reputation collapses before resolution
+    let winner = resolve_queue_mature(&t, &id);
+    assert_eq!(winner, t.lp_b);
+}
+
+#[test]
+fn recover_with_nothing_queued_fails() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    let r = t.contract.try_recover_fund_queue(&id);
+    assert_eq!(r, Err(Ok(ContractError::QueueNotStalled)));
+    let r = t.contract.try_recover_fund_queue(&999);
+    assert_eq!(r, Err(Ok(ContractError::InvoiceNotFound)));
+}
+
+#[test]
+fn recover_before_resolution_fails() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    let r = t.contract.try_recover_fund_queue(&id);
+    assert_eq!(r, Err(Ok(ContractError::QueueNotStalled)));
+    assert_eq!(queue_len(&t, id), 1);
+}
+
+#[test]
+fn recover_stalled_winner_at_ttl_boundary_and_reopen() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.join_fund_queue(&t.lp_b, &id);
+    let winner = resolve_queue_mature(&t, &id);
+    let other = if winner == t.lp_a { t.lp_b.clone() } else { t.lp_a.clone() };
+
+    // One ledger short of the TTL: still locked.
+    advance_ledgers(&t.env, crate::constants::QUEUE_RESOLUTION_TTL_LEDGERS - 1);
+    assert_eq!(
+        t.contract.try_recover_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotStalled))
+    );
+    assert_eq!(
+        t.contract.try_fund_invoice(&other, &id, &INVOICE_AMOUNT, &false),
+        Err(Ok(ContractError::NotApprovedFunder))
+    );
+
+    // Exactly at the TTL: anyone may evict the stalled winner.
+    advance_ledgers(&t.env, 1);
+    assert_eq!(t.contract.recover_fund_queue(&id), Some(winner.clone()));
+    assert_eq!(queue_len(&t, id), 1);
+
+    // Maturity restarts for the remaining LP.
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotMature))
+    );
+    assert_eq!(resolve_queue_mature(&t, &id), other);
+    t.contract.fund_invoice(&other, &id, &INVOICE_AMOUNT, &false);
+}
+
+#[test]
+fn recover_shortens_grace_when_near_expiry() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    // Move to 1 hour before the due date.
+    advance_time(&t.env, DUE_DATE_OFFSET - 3600);
+    let winner = resolve_queue_mature(&t, &id);
+    assert_eq!(winner, t.lp_a);
+    // Far below the full TTL but past QUEUE_DELAY_LEDGERS.
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(t.contract.recover_fund_queue(&id), Some(t.lp_a.clone()));
+    assert_eq!(queue_len(&t, id), 0);
+}
+
+#[test]
+fn recover_purges_state_for_cancelled_and_expired_invoices() {
+    let t = setup_queue();
+    let cancelled = submit_invoice(&t);
+    let expiring = submit_invoice(&t);
+    for id in [cancelled, expiring] {
+        t.contract.join_fund_queue(&t.lp_a, &id);
+    }
+    resolve_queue_mature(&t, &cancelled);
+    t.contract.cancel_invoice(&cancelled);
+    assert_eq!(t.contract.recover_fund_queue(&cancelled), None);
+
+    advance_time(&t.env, DUE_DATE_OFFSET + 1);
+    t.contract.expire_invoice(&expiring);
+    assert_eq!(t.contract.recover_fund_queue(&expiring), None);
+
+    for id in [cancelled, expiring] {
+        assert_eq!(queue_len(&t, id), 0);
+        t.env.as_contract(&t.contract.address, || {
+            assert!(crate::storage::get_queue_resolution(&t.env, id).is_none());
+            assert!(crate::storage::get_fund_queue_opened_at(&t.env, id).is_none());
+            assert!(crate::storage::get_queue_resolved_at(&t.env, id).is_none());
+        });
+        // Idempotent: a second purge finds nothing to do.
+        assert_eq!(
+            t.contract.try_recover_fund_queue(&id),
+            Err(Ok(ContractError::QueueNotStalled))
+        );
+    }
 }
