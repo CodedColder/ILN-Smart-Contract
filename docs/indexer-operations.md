@@ -156,12 +156,16 @@ Backups protect against infrastructure loss; reconciliation detects *semantic*
 drift between indexed data and on-chain truth. The scheduled consistency job
 samples invoices/stats, compares them against direct contract reads, and
 alerts through the notifications webhook channel when drift exceeds tolerance.
-Cadence and tolerance thresholds are documented in
+The same run re-verifies the stored ledger-header chain: a hash that no longer
+matches the chain latches a halt, posts `indexer_reorg_detected`, and runs the
+shared rollback-and-replay (the reorg the live detector could not see for
+itself — Issue #866). Cadence, tolerance thresholds, and the recovery
+guarantees are documented in
 [docs/indexer-reconciliation.md](indexer-reconciliation.md).
 
 ## 7. Related documentation
 
 - [Indexer Data-Loss Incident Runbook](indexer-incident-runbook.md) — decision tree for choosing restore vs replay vs full resync
-- [Indexer Reconciliation](indexer-reconciliation.md) — continuous drift detection with alerting
+- [Indexer Reconciliation](indexer-reconciliation.md) — continuous drift detection, reorg backstop, and rollback-and-replay recovery with alerting
 - [CI/CD Guide](ci-cd.md) — deployment pipeline that consumes these scripts in post-deploy smoke checks
 - [Events Reference](events.md) — event types handled during ingestion/replay

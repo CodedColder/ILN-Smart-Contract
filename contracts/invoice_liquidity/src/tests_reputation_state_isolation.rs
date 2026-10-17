@@ -12,7 +12,7 @@ use crate::test::setup;
 use reputation_bonus::{
     config::Config as RepBonusConfig, ReputationBonusContract, ReputationBonusContractClient,
 };
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger};
 
 const INVOICE_AMOUNT: i128 = 1_000_000_000;
 const DISCOUNT_RATE: u32 = 300;
@@ -38,7 +38,11 @@ fn test_reputation_state_is_independent_across_contracts() {
     // defaults to 50. Bonus module starts empty.
     let iln_before = t.contract.get_reputation(&address);
     let bonus_before = bonus.get_reputation(&address);
-    assert_eq!(t.contract.payer_score(&address), 50, "ILN default payer score");
+    assert_eq!(
+        t.contract.payer_score(&address),
+        50,
+        "ILN default payer score"
+    );
     assert_eq!(iln_before.score, 0, "ILN profile unset until first write");
     assert_eq!(bonus_before.score, 0, "bonus module empty profile");
     assert_eq!(bonus_before.invoices_submitted, 0);
@@ -152,12 +156,18 @@ fn test_reputation_cross_address_independence() {
     let alice_iln = t.contract.get_reputation(&alice);
     let bob_iln = t.contract.get_reputation(&bob);
     assert_eq!(alice_iln.invoices_paid, 1, "ILN tracks Alice");
-    assert_eq!(bob_iln.invoices_paid, 0, "ILN does NOT track Bob's bonus invoice");
+    assert_eq!(
+        bob_iln.invoices_paid, 0,
+        "ILN does NOT track Bob's bonus invoice"
+    );
 
     // Verify isolation: bonus module knows about Bob's payment, not Alice's
     let alice_bonus = bonus.get_reputation(&alice);
     let bob_bonus = bonus.get_reputation(&bob);
-    assert_eq!(alice_bonus.invoices_paid, 0, "bonus does NOT track Alice's ILN invoice");
+    assert_eq!(
+        alice_bonus.invoices_paid, 0,
+        "bonus does NOT track Alice's ILN invoice"
+    );
     assert_eq!(bob_bonus.invoices_paid, 1, "bonus tracks Bob");
 }
 
@@ -192,7 +202,7 @@ fn test_payer_score_reads_only_from_iln() {
             &due_date,
             &DISCOUNT_RATE,
         );
-        bonus.mark_paid(&inv_id);
+        bonus.mark_paid(&inv_id.id);
     }
 
     // bonus reputation should be 100 (10/10 paid)
@@ -257,7 +267,7 @@ fn test_iln_default_does_not_affect_bonus() {
     ledger_info.timestamp = now + DUE_DATE_OFFSET + 1;
     t.env.ledger().set(ledger_info);
 
-    t.contract.claim_default(&iln_id);
+    t.contract.claim_default(&t.funder, &iln_id);
 
     // bonus module must be untouched by ILN default
     let bonus_after = bonus.get_reputation(&address);

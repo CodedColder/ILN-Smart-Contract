@@ -1,0 +1,38 @@
+name: Event Coverage
+
+on:
+  pull_request:
+    paths:
+      - "contracts/**"
+      - "scripts/check-event-coverage.ts"
+      - "scripts/check-event-coverage.test.ts"
+      - ".github/workflows/event-coverage.yml"
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - "contracts/**"
+      - "scripts/check-event-coverage.ts"
+      - "scripts/check-event-coverage.test.ts"
+      - ".github/workflows/event-coverage.yml"
+  workflow_dispatch: {}
+
+jobs:
+  event-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Classifier unit tests
+        run: npx --yes tsx --test scripts/check-event-coverage.test.ts
+
+      # Fails the build when a state-mutating entrypoint neither publishes
+      # an event nor carries a documented exemption — the drift that kept
+      # recurring in docs/events.md (Issue #54).
+      - name: Event coverage check
+        run: npx --yes tsx scripts/check-event-coverage.ts --check

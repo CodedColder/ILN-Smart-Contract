@@ -82,6 +82,8 @@ it changes.
 ## 6. Change history
 
 User-facing changes between releases are tracked in the
-[CHANGELOG](../CHANGELOG.md). This document covers the one-time
-testnet-to-mainnet transition; it is not updated per-release the way the
-changelog is.
+[CHANGELOG](../CHANGELOG.md). See the curated
+[Mainnet Launch Release](../CHANGELOG.md#mainnet-launch) section for a
+summary of deliverables across all development and audit-hardening batches.
+This document covers the one-time testnet-to-mainnet transition; it is not
+updated per-release the way the changelog is.

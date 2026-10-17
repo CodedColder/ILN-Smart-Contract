@@ -192,6 +192,21 @@ registry.format("XLM", 5000000000n); // "500.00"
 
 ---
 
+## On-Chain Token Admission Checks
+
+`add_token(token, decimals)` enforces the following (Issues #1070, #1073):
+
+- The token must implement `decimals()`, and `decimals` must equal what it
+  reports (at most 18). Classic-asset SACs report **7**.
+- The token must expose the SAC `authorized()` interface, and both the ILN
+  contract and the admin must be authorized holders.
+- The fee-on-transfer probe (1,000,000 units from the admin) must round-trip
+  exactly.
+
+Frozen accounts and issuer clawback are handled at runtime by escrowing
+payouts and by typed errors. See [token-safety.md](token-safety.md) for the
+operator runbook.
+
 ## Adding a New Token via Governance
 
 New tokens require a governance proposal and community vote.

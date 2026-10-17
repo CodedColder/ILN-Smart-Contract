@@ -23,9 +23,11 @@ pub enum ConfigError {
     Unauthorized = 1,
     InvalidBonusBps = 2,
     InvalidMinDiscountRate = 3,
+    InvalidHighRepThreshold = 4,
 }
 
 const MAX_BONUS_BPS: u32 = 500;
+const MAX_REPUTATION_SCORE: u32 = 100;
 
 pub fn get_admin(env: &Env) -> Result<Address, ConfigError> {
     env.storage()
@@ -46,6 +48,9 @@ pub fn get_config(env: &Env) -> Result<Config, ConfigError> {
 }
 
 pub fn set_config(env: &Env, config: &Config) -> Result<(), ConfigError> {
+    if config.high_rep_threshold > MAX_REPUTATION_SCORE {
+        return Err(ConfigError::InvalidHighRepThreshold);
+    }
     if config.bonus_bps > MAX_BONUS_BPS {
         return Err(ConfigError::InvalidBonusBps);
     }

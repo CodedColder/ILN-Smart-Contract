@@ -42,7 +42,7 @@ pub struct PriceObservation {
 
 /// TWAP accumulator state for a single token pair.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TWAPState {
     /// Cumulative sum of (price * time_delta) for all observations.
     pub accumulated_price: i128,
@@ -123,11 +123,7 @@ pub fn record_observation(
 ///
 /// ## Invariant I3 Check
 /// Returned TWAP is bounded by min/max of observations in the window.
-pub fn get_twap(
-    env: &Env,
-    token: &Address,
-    lookback_seconds: u64,
-) -> Result<i128, TWAPError> {
+pub fn get_twap(env: &Env, token: &Address, lookback_seconds: u64) -> Result<i128, TWAPError> {
     let state = match get_twap_state(env, token) {
         Some(s) => s,
         None => return Ok(0),
@@ -189,7 +185,7 @@ pub enum TWAPError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     #[test]
     fn test_invariant_i1_rejects_negative_price() {
@@ -281,7 +277,7 @@ mod tests {
         let mut ledger_info = env.ledger().get();
         ledger_info.timestamp = 1000;
         ledger_info.sequence_number = 100;
-        env.ledger().set(ledger_info);
+        env.ledger().set(ledger_info.clone());
 
         // Record observation: price 100 at t=1000
         record_observation(&env, &token, 100, 1000, 100).unwrap();

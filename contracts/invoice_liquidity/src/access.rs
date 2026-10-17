@@ -131,19 +131,30 @@ pub fn unlock_reentrancy(env: &Env) {
 //   Emergency functions (pause/unpause) are deliberately exempt.
 
 /// Check whether the given rate-limited function may be called.
-/// Returns `RateLimited` if the cooldown has not yet elapsed.
-/// Otherwise records the current ledger as the last call time.
+/// Returns `RateLimited` if the cooldown has not yet elapsed since this
+/// function's last recorded call. Otherwise records the current ledger as
+/// the last call time.
+///
+/// The first-ever call of a function always passes: no record exists yet,
+/// so there is no prior call to space it out from. (The previous
+/// `unwrap_or(0)` default made `current < 0 + cooldown` reject a cold
+/// start whenever the ledger sequence was still below the cooldown —
+/// only observable on low-sequence test/local networks, since mainnet's
+/// sequence has always been far above every cooldown. Rate limiting
+/// spaces *consecutive* calls; it must not gate a function's first use.)
 pub fn check_rate_limit(
     env: &Env,
     fn_name: &str,
     cooldown_ledgers: u64,
 ) -> Result<(), ContractError> {
     let key = StorageKey::RateLimit(Symbol::new(env, fn_name));
-    let last_ledger: u32 = env.storage().instance().get(&key).unwrap_or(0);
+    let last_ledger: Option<u32> = env.storage().instance().get(&key);
     let current_ledger = env.ledger().sequence();
 
-    if current_ledger < last_ledger.saturating_add(cooldown_ledgers as u32) {
-        return Err(ContractError::RateLimited);
+    if let Some(last) = last_ledger {
+        if current_ledger < last.saturating_add(cooldown_ledgers as u32) {
+            return Err(ContractError::RateLimited);
+        }
     }
 
     env.storage().instance().set(&key, &current_ledger);

@@ -14,6 +14,12 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+# Issue #1100: the published cross-contract proof-obligation registry is a
+# JSON artifact; the validator test parses it to check it against the source.
+serde_json = "1.0"
+# Issue #1101: property-based counterexample hunt for the governance invariants
+# (delegation depth/cycles, double-vote under archival, quorum denominator).
+proptest = { workspace = true }
 # Issue #704: the E2E UpdateReputationBonusParams test needs the real
 # reputation_bonus contract (not a hand-rolled mock) to genuinely verify
 # its stored Config reflects a governance-executed change.

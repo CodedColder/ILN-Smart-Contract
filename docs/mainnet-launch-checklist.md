@@ -61,15 +61,15 @@ Status legend: `Not started`, `In progress`, `Blocked`, `Complete`.
 |------|-------------|-------|--------|------|
 | CONTRIBUTING up to date | Confirm contribution, review, testing, and local setup expectations are current. | Community lead | In progress | [CONTRIBUTING](../CONTRIBUTING.md) |
 | SECURITY up to date | Keep root security policy aligned with detailed policy and reporting channels. | Security lead | In progress | [SECURITY](../SECURITY.md) |
-| CHANGELOG up to date | Generate and review changelog entries for the launch release. | Release lead | Not started | [CHANGELOG](../CHANGELOG.md) |
-| Maintainer ownership confirmed | Confirm CODEOWNERS, release approvers, and emergency contacts. On-chain admin/multisig signers are checked against CODEOWNERS by [Admin Signer Check CI](../.github/workflows/admin-signer-check.yml). | Community lead | In progress | [CODEOWNERS](../.github/CODEOWNERS) |
-| Public support channels ready | Confirm where users report bugs, ask integration questions, and follow incidents. | Community lead | Not started | [Issue templates](../.github/ISSUE_TEMPLATE) |
+| CHANGELOG up to date | Generate and review changelog entries for the launch release. | Release lead | Complete | [CHANGELOG](../CHANGELOG.md) |
+| Maintainer ownership confirmed | Confirm CODEOWNERS, release approvers, and emergency contacts. On-chain admin/multisig signers are checked against CODEOWNERS by [Admin Signer Check CI](../.github/workflows/admin-signer-check.yml). | Community lead | Complete | [MAINTAINERS.md](../MAINTAINERS.md), [CODEOWNERS](../.github/CODEOWNERS) |
+| Public support channels ready | Confirm where users report bugs, ask integration questions, and follow incidents. | Community lead | Complete | [Support Channels](support-channels.md) |
 
 ## Maintainer Sign-off
 
 Mainnet launch requires sign-off from core maintainers after all blocking items are complete. This table reflects the state after the third issue batch's hardening work (issues #638–#792, #848–#913).
 
-| Maintainer | Area | Signed off | Date | Notes |
+| Maintainer (team) | Area | Signed off | Date | Notes |
 |------------|------|------------|------|-------|
 | Engineering Lead | Contracts | Yes | 2026-09-26 | Security audit complete; upgrade path tested and rehearsed; storage layout frozen. Insurance pool integrated and tested ≥95% coverage. All contract tests passing. |
 | Security Lead | Security | Yes | 2026-09-26 | External audit completed and remediated; threat model reviewed and updated; security policy published; incident response and game-day runbooks validated. |

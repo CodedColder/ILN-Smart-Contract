@@ -245,6 +245,55 @@ describe('GET /webhooks/:id/deliveries', () => {
     const res = await fetchApp(app, 'GET', '/webhooks/unknown/deliveries');
     expect(res.status).toBe(404);
   });
+
+  it('validates and stores an optional contact email without echoing it', async () => {
+    const { app, store } = makeApp();
+
+    const invalid = await request(app, 'POST', '/webhooks', {
+      url: 'https://example.com/hook',
+      secret: 'k',
+      eventTypes: ['A'],
+      contactEmail: 'not-an-email',
+    });
+    expect(invalid.status).toBe(400);
+    expect(invalid.body).toEqual({ error: 'invalid_contact_email' });
+    expect(store.list()).toHaveLength(0);
+
+    const created = await request(app, 'POST', '/webhooks', {
+      url: 'https://example.com/hook',
+      secret: 'k',
+      eventTypes: ['A'],
+      contactEmail: 'ops@example.com',
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.contactEmail).toBeUndefined();
+    expect(store.list()[0]?.contactEmail).toBe('ops@example.com');
+  });
+
+  it('updates or clears the contact email through PUT', async () => {
+    const { app, store } = makeApp();
+    const created = await request(app, 'POST', '/webhooks', {
+      url: 'https://example.com/hook',
+      secret: 'k',
+      eventTypes: ['A'],
+      contactEmail: 'ops@example.com',
+    });
+    const id = created.body.id as string;
+
+    const invalid = await request(app, 'PUT', `/webhooks/${id}`, { contactEmail: 'nope' });
+    expect(invalid.status).toBe(400);
+    expect(store.get(id)?.contactEmail).toBe('ops@example.com');
+
+    const cleared = await request(app, 'PUT', `/webhooks/${id}`, { contactEmail: null });
+    expect(cleared.status).toBe(200);
+    expect(store.get(id)?.contactEmail).toBeNull();
+
+    const replaced = await request(app, 'PUT', `/webhooks/${id}`, {
+      contactEmail: 'oncall@example.com',
+    });
+    expect(replaced.status).toBe(200);
+    expect(store.get(id)?.contactEmail).toBe('oncall@example.com');
+  });
 });
 
 async function fetchApp(app: express.Express, method: string, path: string, body?: any, headers?: Record<string, string>) {

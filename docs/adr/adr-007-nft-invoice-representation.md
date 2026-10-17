@@ -120,11 +120,20 @@ matches the stored owner, returning `ContractError::Unauthorized` otherwise.
   seller directly calling `transfer_invoice_nft` or a future extension to
   the ownership model.
 
+## Status update (Issue #854)
+
+The wiring described below as follow-up work has since landed:
+`nft::sync_nft_state` is now called from every invoice write path in
+`contracts/invoice_liquidity/src/lib.rs`, maintaining the invariant "NFT
+exists iff invoice is Funded / PartiallyFunded / Defaulted / Appealed /
+Disputed, holder = funder (or lead LP)". See the consolidated walkthrough in
+[`docs/reputation-model.md`](../reputation-model.md#full-lifecycle-guide-issues-854--single-cross-referenced-narrative).
+
 ## Follow-up work
 
-- Wire `mint_invoice_nft` into `submit_invoice`, `transfer_invoice_nft` into
-  `fund_invoice` (and any subsequent LP-to-LP transfer), and
-  `burn_invoice_nft` into `mark_paid` / default settlement.
+- ✅ Done: lifecycle calls are wired via `sync_nft_state` (see status update
+  above) — `mint` on funding, `transfer` on holder change, `burn` on
+  settlement/cancel/expiry.
 - Reconcile `InvoiceNftMetadata.owner` with `Invoice.funder` once the
   lifecycle is wired, so the two cannot drift.
 - Consider an `approve`/`transfer_from`-style extension if a marketplace
