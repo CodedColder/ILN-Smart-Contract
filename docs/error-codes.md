@@ -113,6 +113,9 @@ Source of truth: [`contracts/iln_governance/src/lib.rs`](../contracts/iln_govern
 | 36 | `InvalidVetoTransition` | Invalid transition in veto transition state machine. | Attempting to approve or execute a veto on a proposal that is already vetoed or in an invalid state. | Verify current veto state with `get_veto_state` before submitting veto approvals. |
 | 37 | `VetoPowerAlreadyDisabled` | Admin veto power has already been permanently disabled. | Attempted to disable veto power when it was already disabled. | Check `is_veto_power_enabled()` or `get_veto_disable_record()` before attempting disablement. |
 | 38 | `ConsentRequired` | Action requires an explicit non-empty consent reason hash. | Provided an empty (all zeros) reason hash when disabling veto power with reason. | Provide a valid non-empty 32-byte hash representing the documented justification. |
+| 39 | `LegacyDelayMigrationRequired` | A `Passed` proposal has no eta (queued before the timelock existed) while a non-zero delay regime applies. | Executing a legacy proposal after `set_execution_delay` or after veto retirement. | Call `rebase_legacy_proposal_eta(proposal_id)`, wait for the new eta, then execute. |
+| 40 | `ProposerIdentityMismatch` | The proposer on the stored proposal differs from the proposer bound at creation. | Execution or veto of a proposal whose stored `proposer` was altered. | Treat as an integrity incident: do not execute; follow the incident runbook. |
+| 41 | `SnapshotLedgerMissing` | The proposal has no recorded snapshot ledger, so no checkpoint can be bound to it. | Voting on a proposal created before snapshot-ledger tracking. | None for the voter; such proposals cannot take new votes. |
 
 ---
 

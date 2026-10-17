@@ -50,6 +50,15 @@ While v1 initially launched without an execution delay, ADR-012 Phase 3 establis
 4. **Veto-Disable Authorization and Reason Recording (Issue #990):**
    Permanent disablement of admin veto power (`disable_veto_power` / `disable_veto_power_with_reason`) records caller authorization, ledger sequence, and reason hash in `VetoDisableRecord`, prevents redundant disable calls (`VetoPowerAlreadyDisabled`), and emits structured `VetoDisableRecorded` events.
 
+5. **Legacy Zero-Delay Migration (Issue #992):**
+   A stored delay of `0` (never set) and `Passed` proposals with `eta_ledger == 0` predate the timelock. Once veto power is retired the effective delay is clamped to `MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS` (`get_effective_execution_delay`), `migrate_legacy_execution_delay` (admin, idempotent) persists the floor with an audit record, and a legacy `Passed` proposal must be re-stamped with `rebase_legacy_proposal_eta` (permissionless, can only postpone) before it can execute. A computed eta that wraps onto `0` is moved to `1` so it can never be mistaken for the legacy sentinel.
+6. **Proposer Identity Binding (Issue #998):**
+   `create_proposal` stores the proposer under `ProposalProposer(id)`. `execute_proposal` (queue and execute) and `veto_proposal` refuse with `ProposerIdentityMismatch` if the stored proposal disagrees; pre-binding proposals are backfilled once.
+7. **Checkpoints Bound to the Snapshot Ledger (Issue #1001):**
+   A vote uses the newest checkpoint recorded at least `MIN_VOTE_HOLD_LEDGERS` before the proposal's snapshot ledger. `checkpoint_balance` demotes the replaced checkpoint into one prior slot (two slots per voter, no unbounded growth), so refreshing after a snapshot no longer disenfranchises the voter. A proposal without a snapshot ledger fails with `SnapshotLedgerMissing` instead of silently using the current ledger.
+
+Threat model: [`docs/timelock-threat-model.md`](../timelock-threat-model.md).
+
 ## Alternatives Considered
 
 | Alternative | Why rejected |

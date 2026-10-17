@@ -3337,3 +3337,318 @@ mod counterexample_invariants {
         }
     }
 }
+
+// ── Issues #992 / #998 / #1001: timelock hardening ────────────────────────────
+
+/// Create a fee proposal, vote it through, close voting and queue it
+/// (Active -> Passed). Returns the proposal id.
+fn pass_and_queue(t: &GovTestEnv) -> u64 {
+    let id = create_fee_proposal(t);
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp = t.contract.get_proposal(&id).voting_end + 1;
+    t.env.ledger().set(ledger);
+    t.contract.execute_proposal(&id);
+    id
+}
+
+fn advance_ledgers(t: &GovTestEnv, n: u32) {
+    let mut ledger = t.env.ledger().get();
+    ledger.sequence_number += n;
+    t.env.ledger().set(ledger);
+}
+
+fn overwrite_proposal(t: &GovTestEnv, p: &GovernanceProposal) {
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .set(&StorageKey::Proposal(p.id), p);
+    });
+}
+
+// #992 ------------------------------------------------------------------------
+
+#[test]
+fn test_migrate_legacy_delay_sets_floor_records_and_is_idempotent() {
+    let t = setup();
+    assert_eq!(t.contract.get_execution_delay(), 0);
+    assert_eq!(t.contract.get_legacy_delay_migration(), None);
+
+    let new_delay = t.contract.migrate_legacy_execution_delay(&t.admin);
+    assert_eq!(new_delay, MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS);
+    assert_eq!(t.contract.get_execution_delay(), MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS);
+    let rec = t.contract.get_legacy_delay_migration().unwrap();
+    assert_eq!(rec.old_delay, 0);
+    assert_eq!(rec.migrated_by, t.admin);
+
+    // Second call is a no-op and keeps the original record.
+    advance_ledgers(&t, 5);
+    assert_eq!(
+        t.contract.migrate_legacy_execution_delay(&t.admin),
+        MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS
+    );
+    assert_eq!(t.contract.get_legacy_delay_migration().unwrap(), rec);
+}
+
+#[test]
+fn test_migrate_legacy_delay_rejects_non_admin() {
+    let t = setup();
+    let stranger = Address::generate(&t.env);
+    assert_eq!(
+        t.contract.try_migrate_legacy_execution_delay(&stranger),
+        Err(Ok(GovernanceError::Unauthorized))
+    );
+    assert_eq!(t.contract.get_execution_delay(), 0);
+}
+
+#[test]
+fn test_zero_delay_clamped_to_floor_after_veto_retired() {
+    let t = setup();
+    // Legacy state: delay never set (0), then veto power is retired.
+    t.contract.disable_veto_power();
+    assert_eq!(t.contract.get_execution_delay(), 0);
+    assert_eq!(
+        t.contract.get_effective_execution_delay(),
+        MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS
+    );
+
+    let id = pass_and_queue(&t);
+    let p = t.contract.get_proposal(&id);
+    assert_eq!(p.status, ProposalStatus::Passed);
+    assert_eq!(
+        p.eta_ledger,
+        t.env.ledger().sequence() + MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS
+    );
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    // Boundary: one ledger short still fails, the eta ledger succeeds.
+    advance_ledgers(&t, MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS - 1);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t, 1);
+    assert!(t.contract.try_execute_proposal(&id).is_ok());
+}
+
+#[test]
+fn test_legacy_passed_proposal_without_eta_needs_rebase_once_delay_set() {
+    let t = setup();
+    let id = pass_and_queue(&t);
+    // Simulate a proposal queued before the timelock existed.
+    let mut p = t.contract.get_proposal(&id);
+    p.eta_ledger = 0;
+    overwrite_proposal(&t, &p);
+
+    // Admin turns the timelock on; the legacy proposal must not bypass it.
+    t.contract.set_execution_delay(&t.admin, &100);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::LegacyDelayMigrationRequired))
+    );
+
+    let now = t.env.ledger().sequence();
+    assert_eq!(t.contract.rebase_legacy_proposal_eta(&id), now + 100);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t, 100);
+    assert!(t.contract.try_execute_proposal(&id).is_ok());
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+#[test]
+fn test_legacy_passed_proposal_without_eta_still_executes_in_zero_delay_regime() {
+    let t = setup();
+    let id = pass_and_queue(&t);
+    let mut p = t.contract.get_proposal(&id);
+    p.eta_ledger = 0;
+    overwrite_proposal(&t, &p);
+    // Backwards compatible: delay still 0 and veto still enabled.
+    assert!(t.contract.try_execute_proposal(&id).is_ok());
+}
+
+#[test]
+fn test_legacy_passed_proposal_without_eta_blocked_after_veto_retired() {
+    let t = setup();
+    let id = pass_and_queue(&t);
+    let mut p = t.contract.get_proposal(&id);
+    p.eta_ledger = 0;
+    overwrite_proposal(&t, &p);
+    t.contract.disable_veto_power();
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::LegacyDelayMigrationRequired))
+    );
+}
+
+#[test]
+fn test_rebase_rejects_non_legacy_and_non_passed() {
+    let t = setup();
+    let active = create_fee_proposal(&t);
+    assert_eq!(
+        t.contract.try_rebase_legacy_proposal_eta(&active),
+        Err(Ok(GovernanceError::ProposalNotActive))
+    );
+    let queued = pass_and_queue(&t);
+    assert_eq!(
+        t.contract.try_rebase_legacy_proposal_eta(&queued),
+        Err(Ok(GovernanceError::AlreadyResolved))
+    );
+    assert_eq!(
+        t.contract.try_rebase_legacy_proposal_eta(&9_999),
+        Err(Ok(GovernanceError::ProposalNotFound))
+    );
+}
+
+#[test]
+fn test_compute_eta_never_yields_legacy_sentinel() {
+    assert_eq!(GovContract::compute_eta(u32::MAX - 99, 100), 1); // wraps onto 0
+    assert_eq!(GovContract::compute_eta(u32::MAX - 98, 100), 1); // wraps past 0
+    assert_eq!(GovContract::compute_eta(10, 100), 110);
+    assert_eq!(GovContract::compute_eta(5, 0), 5);
+    // Zero-delay at sequence 0 (fresh test host) also stays off the sentinel.
+    assert_eq!(GovContract::compute_eta(0, 0), 1);
+}
+
+// #998 ------------------------------------------------------------------------
+
+#[test]
+fn test_proposer_bound_at_creation() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    assert_eq!(t.contract.get_proposal_proposer(&id), Some(t.proposer.clone()));
+    assert_eq!(t.contract.get_proposal_proposer(&777), None);
+}
+
+#[test]
+fn test_execute_rejects_tampered_proposer_identity() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp = t.contract.get_proposal(&id).voting_end + 1;
+    t.env.ledger().set(ledger);
+
+    let mut p = t.contract.get_proposal(&id);
+    p.proposer = t.voter_b.clone();
+    overwrite_proposal(&t, &p);
+
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::ProposerIdentityMismatch))
+    );
+    // No transition happened and the binding is intact.
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
+    assert_eq!(t.contract.get_proposal_proposer(&id), Some(t.proposer.clone()));
+}
+
+#[test]
+fn test_veto_rejects_tampered_proposer_identity() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    let id = create_fee_proposal(&t);
+    let mut p = t.contract.get_proposal(&id);
+    p.proposer = t.voter_b.clone();
+    overwrite_proposal(&t, &p);
+    assert_eq!(
+        t.contract.try_veto_proposal(&t.admin, &id, &dummy_hash(&t.env)),
+        Err(Ok(GovernanceError::ProposerIdentityMismatch))
+    );
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
+}
+
+#[test]
+fn test_legacy_proposal_without_binding_is_backfilled_on_transition() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .remove(&StorageKey::ProposalProposer(id));
+    });
+    assert_eq!(t.contract.get_proposal_proposer(&id), None);
+    setup_veto_multisig(&t);
+    t.contract.veto_proposal(&t.admin, &id, &dummy_hash(&t.env));
+    assert_eq!(t.contract.get_proposal_proposer(&id), Some(t.proposer.clone()));
+}
+
+// #1001 -----------------------------------------------------------------------
+
+#[test]
+fn test_refresh_after_snapshot_keeps_vote_eligibility() {
+    let t = setup();
+    let old = t.contract.get_voter_checkpoint(&t.voter_a).unwrap();
+    let id = create_fee_proposal(&t);
+    let snapshot = t.contract.get_proposal_created_ledger(&id).unwrap();
+
+    // Refresh strictly after the snapshot ledger: the latest slot is no
+    // longer eligible, the replaced one must still back the vote.
+    advance_ledgers(&t, 1);
+    t.contract.checkpoint_balance(&t.voter_a);
+    let latest = t.contract.get_voter_checkpoint(&t.voter_a).unwrap();
+    assert!(latest.ledger > snapshot);
+    assert_eq!(t.contract.get_voter_prior_checkpoint(&t.voter_a), Some(old.clone()));
+    assert_eq!(t.contract.get_eligible_checkpoint(&t.voter_a, &id), Some(old));
+
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    assert_eq!(t.contract.get_proposal(&id).votes_for, 1_000);
+}
+
+#[test]
+fn test_checkpoint_younger_than_hold_period_not_bound_to_proposal() {
+    let t = setup();
+    let newcomer = Address::generate(&t.env);
+    t.gov_token_admin.mint(&newcomer, &5_000);
+    t.contract.checkpoint_balance(&newcomer);
+    let id = create_fee_proposal(&t); // same ledger: 0 < MIN_VOTE_HOLD_LEDGERS
+    assert_eq!(t.contract.get_eligible_checkpoint(&newcomer, &id), None);
+    assert_eq!(
+        t.contract.try_cast_vote(&newcomer, &id, &true),
+        Err(Ok(GovernanceError::InsufficientHoldingPeriod))
+    );
+    // Exactly MIN_VOTE_HOLD_LEDGERS before a later proposal is accepted.
+    advance_ledgers(&t, MIN_VOTE_HOLD_LEDGERS);
+    let id2 = create_fee_proposal(&t);
+    assert!(t.contract.get_eligible_checkpoint(&newcomer, &id2).is_some());
+    t.contract.cast_vote(&newcomer, &id2, &true);
+}
+
+#[test]
+fn test_checkpoint_history_is_bounded_to_two_slots() {
+    let t = setup();
+    for _ in 0..4 {
+        advance_ledgers(&t, 1);
+        t.contract.checkpoint_balance(&t.voter_a);
+    }
+    let latest = t.contract.get_voter_checkpoint(&t.voter_a).unwrap();
+    let prior = t.contract.get_voter_prior_checkpoint(&t.voter_a).unwrap();
+    assert_eq!(prior.ledger + 1, latest.ledger);
+    // A same-ledger refresh overwrites latest and leaves prior untouched.
+    t.contract.checkpoint_balance(&t.voter_a);
+    assert_eq!(t.contract.get_voter_prior_checkpoint(&t.voter_a).unwrap(), prior);
+}
+
+#[test]
+fn test_vote_fails_closed_without_snapshot_ledger() {
+    let t = setup();
+    let id = create_fee_proposal(&t);
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .remove(&StorageKey::ProposalCreatedLedger(id));
+    });
+    assert_eq!(t.contract.get_eligible_checkpoint(&t.voter_a, &id), None);
+    assert_eq!(
+        t.contract.try_cast_vote(&t.voter_a, &id, &true),
+        Err(Ok(GovernanceError::SnapshotLedgerMissing))
+    );
+}

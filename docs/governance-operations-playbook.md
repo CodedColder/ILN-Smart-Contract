@@ -94,6 +94,16 @@ Before proposing discount, oracle-age, insurance premium/coverage, or pause-poli
 - [ ] Link simulation / testnet evidence when available
 - [ ] Schedule post-change review under [`review-cadence.md`](review-cadence.md)
 
+## Legacy zero-delay migration runbook (Issue #992)
+
+Applies to deployments upgraded from a build where `ExecutionDelay` was unset (0) or `Passed` proposals carry `eta_ledger == 0`.
+
+1. **Inspect:** `get_execution_delay()`, `get_effective_execution_delay()`, `is_veto_power_enabled()`; list `Passed` proposals and note any with `eta_ledger == 0`.
+2. **Migrate delay (admin):** `migrate_legacy_execution_delay(admin)` → stored delay becomes 17,280 ledgers; `get_legacy_delay_migration()` returns the audit record. Safe to repeat (no-op).
+3. **Rebase legacy proposals (anyone):** `rebase_legacy_proposal_eta(id)` for each legacy `Passed` proposal; execute after the new eta.
+4. **Only then** retire the veto (`disable_veto_power_with_reason`). Even if step 2 is skipped, the contract clamps the delay to the floor after retirement, but the stored value would still read 0.
+5. **Recovery:** the migration only raises the delay; a mis-set delay can be corrected with `set_execution_delay` within `17_280..=518_400` once veto is retired (any value `<= 518_400` before). Rebased proposals can be vetoed while veto power exists.
+
 ## Related reading
 
 - [Governance](governance.md)
