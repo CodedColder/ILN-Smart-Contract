@@ -5,6 +5,7 @@ import { WebhookDeliveryService, type HttpClient } from '../src/delivery/webhook
 import { EmailDeliveryService, type EmailClient, type EmailMessage } from '../src/delivery/emailDelivery';
 import { EmailSubscriptionStore } from '../src/subscriptions/emailSubscriptionStore';
 import { sendNotificationEmails, type InvoiceEmailEvent } from '../src/delivery/email';
+import { stubDnsResolver } from './helpers/dns';
 
 describe('Mainnet Event Burst Load Test (1,000 Events)', () => {
   it('absorbs 1,000 simultaneous invoice events across webhooks and email without data loss, measuring latency and verifying circuit breakers and rate limiters under load', async () => {
@@ -54,6 +55,7 @@ describe('Mainnet Event Burst Load Test (1,000 Events)', () => {
       http,
       retryQueue,
       now,
+      dnsResolver: stubDnsResolver,
     });
 
     // Set up Email Delivery

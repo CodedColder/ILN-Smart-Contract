@@ -134,3 +134,65 @@ fn es_queue_sorted_when_inserting_mid_range_scores() {
 fn es_queue_duplicate_prevention_with_sorted_queue() {
     super::tests_lp_priority_queue::test_duplicate_prevention_with_sorted_queue();
 }
+
+// --- Configuration parameter bounds enforcement (tests_config_parameter_bounds.rs) ---
+
+/// Issue #914: decay_rate_bps must not exceed 500 bps (5% per period).
+#[test]
+fn es_config_decay_rate_bps_boundary_accepted_at_max() {
+    super::tests_config_parameter_bounds::test_decay_rate_bps_boundary_accepted_at_max();
+}
+
+#[test]
+fn es_config_decay_rate_bps_exceeding_max_rejected() {
+    super::tests_config_parameter_bounds::test_decay_rate_bps_exceeding_max_rejected();
+}
+
+/// Issue #915: high_rep_threshold must stay within 0-100 (reputation score range).
+#[test]
+fn es_config_high_rep_threshold_boundary_accepted_at_max() {
+    super::tests_config_parameter_bounds::test_high_rep_threshold_boundary_accepted_at_max();
+}
+
+#[test]
+fn es_config_high_rep_threshold_exceeding_max_rejected() {
+    super::tests_config_parameter_bounds::test_high_rep_threshold_exceeding_max_rejected();
+}
+
+/// Issue #916: min_discount_rate_bps must be in (0, 10_000), i.e., 0% < x < 100%.
+#[test]
+fn es_config_min_discount_rate_bps_zero_rejected() {
+    super::tests_config_parameter_bounds::test_min_discount_rate_bps_zero_rejected();
+}
+
+#[test]
+fn es_config_min_discount_rate_bps_boundary_accepted_below_max() {
+    super::tests_config_parameter_bounds::test_min_discount_rate_bps_boundary_accepted_below_max();
+}
+
+#[test]
+fn es_config_min_discount_rate_bps_exceeding_max_rejected() {
+    super::tests_config_parameter_bounds::test_min_discount_rate_bps_exceeding_max_rejected();
+}
+
+/// Issue #918: Governance-wide regression suite ensuring no parameter bound
+/// can be silently removed without causing test failures.
+#[test]
+fn es_config_all_parameters_at_max_bounds() {
+    super::tests_config_parameter_bounds::test_all_parameters_at_max_bounds();
+}
+
+#[test]
+fn es_config_one_parameter_exceeds_bound_rejected() {
+    super::tests_config_parameter_bounds::test_one_parameter_exceeds_bound_rejected();
+}
+
+#[test]
+fn es_config_minimal_valid_parameters() {
+    super::tests_config_parameter_bounds::test_minimal_valid_parameters();
+}
+
+#[test]
+fn es_config_typical_production_parameters() {
+    super::tests_config_parameter_bounds::test_typical_production_parameters();
+}

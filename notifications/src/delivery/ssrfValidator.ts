@@ -16,6 +16,7 @@ export function isPrivateIP(ip: string): boolean {
 
   // IPv6
   if (ip.startsWith('::1')) return true;
+  if (ip.startsWith('::ffff:')) return isPrivateIP(ip.slice('::ffff:'.length));
   if (ip.startsWith('fc00:')) return true;
   if (ip.startsWith('fd')) return true;
   if (ip.startsWith('fe80:')) return true;
@@ -23,7 +24,37 @@ export function isPrivateIP(ip: string): boolean {
   return false;
 }
 
-export async function validateWebhookUrl(urlStr: string): Promise<string> {
+/** WHATWG URLs keep IPv6 literals bracketed (`[::1]`); checks use the bare IP. */
+function stripBrackets(host: string): string {
+  return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+}
+
+/**
+ * Resolves a hostname to the addresses it points at.
+ *
+ * The validator deliberately takes the resolver as an injected dependency
+ * rather than calling `dns` directly: unit tests hand in a stub so they never
+ * perform real network I/O, while production passes {@link systemDnsResolver}
+ * (the default). The *checks* themselves — localhost, private ranges, and
+ * private resolved addresses — are unchanged and always run.
+ */
+export type DnsResolver = (hostname: string) => Promise<string[]>;
+
+/** Real DNS lookup (A then AAAA). Throws when the name cannot be resolved. */
+export const systemDnsResolver: DnsResolver = async (hostname) => {
+  try {
+    return await resolve4(hostname);
+  } catch {
+    return await resolve6(hostname);
+  }
+};
+
+const IPV4_LITERAL = /^(\d{1,3}\.){3}\d{1,3}$/;
+
+export async function validateWebhookUrl(
+  urlStr: string,
+  resolver: DnsResolver = systemDnsResolver,
+): Promise<string> {
   const url = new URL(urlStr);
   const hostname = url.hostname;
 
@@ -32,22 +63,19 @@ export async function validateWebhookUrl(urlStr: string): Promise<string> {
   }
 
   // If it's already an IP address, check it
-  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname) || hostname.includes(':')) {
-    if (isPrivateIP(hostname)) {
-      throw new Error(`SSRF Validation Failed: Private IP ${hostname} is blocked`);
+  const literal = stripBrackets(hostname);
+  if (IPV4_LITERAL.test(literal) || literal.includes(':')) {
+    if (isPrivateIP(literal)) {
+      throw new Error(`SSRF Validation Failed: Private IP ${literal} is blocked`);
     }
     return urlStr;
   }
 
   let ips: string[] = [];
   try {
-    ips = await resolve4(hostname);
+    ips = await resolver(hostname);
   } catch (err) {
-    try {
-      ips = await resolve6(hostname);
-    } catch (e) {
-      throw new Error(`SSRF Validation Failed: Could not resolve ${hostname}`);
-    }
+    throw new Error(`SSRF Validation Failed: Could not resolve ${hostname}`);
   }
 
   if (ips.length === 0) {

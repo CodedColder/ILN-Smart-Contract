@@ -1,0 +1,61 @@
+name: Public Status Page
+
+# Regenerates the static public protocol-health page (Issue #892) from the
+# indexer's curated /public/health endpoint and publishes it to GitHub Pages.
+# See docs/public-status-page.md.
+#
+# Required repository variable:  STATUS_INDEXER_URL  (public indexer base URL)
+# Optional repository variable:  STATUS_PAGE_URL     (published page URL, used to
+#                                                     carry uptime history forward)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: status-page
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install indexer dependencies
+        run: pnpm install --frozen-lockfile --filter @iln/indexer...
+
+      - name: Generate status page
+        env:
+          STATUS_INDEXER_URL: ${{ vars.STATUS_INDEXER_URL }}
+          STATUS_HISTORY_URL: ${{ vars.STATUS_PAGE_URL != '' && format('{0}/history.json', vars.STATUS_PAGE_URL) || '' }}
+          STATUS_DOCS_URL: https://github.com/${{ github.repository }}/blob/main/docs/public-status-page.md
+          STATUS_OUT_DIR: status-site
+        run: pnpm --filter @iln/indexer run status-page
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: status-site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

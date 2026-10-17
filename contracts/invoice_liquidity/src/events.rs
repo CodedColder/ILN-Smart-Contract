@@ -102,6 +102,30 @@ pub struct PriceSourceRemoved {
     pub oracle: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TwapEnabledForFeed {
+    pub feed_type: OracleFeedType,
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TwapWindowUpdated {
+    pub old_window: u64,
+    pub new_window: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TwapInsufficientData {
+    pub feed_type: OracleFeedType,
+    pub token: Address,
+    pub observations: u32,
+    pub min_required: u32,
+}
+
+
 /// Emitted when a registered price source's reported price is rejected as
 /// an outlier relative to the cross-source median (Issue #price-deviation).
 #[contracttype]
@@ -146,6 +170,28 @@ pub struct TokenAdded {
     pub token: Address,
     /// Number of decimal places for this token (e.g. 6 for USDC, 7 for XLM).
     pub decimals: u32,
+}
+
+/// Issue #1072: a payout to a frozen recipient was escrowed instead of
+/// transferred.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PayoutEscrowed {
+    pub invoice_id: u64,
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    /// Recipient's total pending balance for this token after the credit.
+    pub total_pending: i128,
+}
+
+/// Issue #1072: an escrowed payout was released to its recipient.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPayoutClaimed {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
 }
 
 /// Emitted when governance removes a token from the funding allowlist (Issue #19).
@@ -449,6 +495,19 @@ pub struct FundQueueResolutionAttempted {
     pub success: bool,
 }
 
+/// Emitted by `recover_fund_queue` (Issues #1020/#1021). `evicted_lp` is the
+/// stalled approved LP removed from the queue (if any); `purged` is true when
+/// the invoice was no longer fundable and all queue state was deleted rather
+/// than reopened for the remaining `remaining_lps`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundQueueRecovered {
+    pub invoice_id: u64,
+    pub evicted_lp: Option<Address>,
+    pub remaining_lps: u32,
+    pub purged: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct InvoiceExpired {
@@ -507,4 +566,93 @@ pub struct InvoiceNftBurned {
     pub invoice_id: u64,
     pub owner: Address,
     pub timestamp: u64,
+}
+
+// ── Issue #1083: Rollback rehearsal events ────────────────────────────────────
+
+/// The outcome of a `rehearse_rollback()` call.
+///
+/// Returned by `rehearse_rollback()` and included in the
+/// `RollbackRehearsalCompleted` event so off-chain monitors can assess
+/// rollback readiness without replaying the full storage scan.
+///
+/// # Fields
+///
+/// * `invoices_checked`   — total number of invoice IDs sampled
+///   (capped at `ROLLBACK_SAMPLE_SIZE`).
+/// * `split_format_count` — invoices stored as `InvoiceCore` + `InvoiceMetadata`
+///   (new format, both halves present).
+/// * `legacy_format_count`— invoices stored as monolithic `Invoice` key
+///   (old format, fully rollback-safe by itself).
+/// * `orphaned_count`     — invoices with only one half of the split format
+///   (either `InvoiceCore` without `InvoiceMetadata`, or vice versa).
+///   **Any non-zero value means rollback is unsafe.**
+/// * `rollback_safe`      — `true` iff `orphaned_count == 0` AND every
+///   checked invoice satisfies at least one of the two safe invariants.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RollbackRehearsalReport {
+    pub invoices_checked: u32,
+    pub split_format_count: u32,
+    pub legacy_format_count: u32,
+    pub orphaned_count: u32,
+    pub rollback_safe: bool,
+}
+
+/// Emitted by `rehearse_rollback()` when the rollback safety scan completes.
+///
+/// The `rollback_safe` field mirrors `RollbackRehearsalReport::rollback_safe`
+/// and is surfaced as a top-level event field so indexers can filter on it
+/// without deserializing the full report body.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RollbackRehearsalCompleted {
+    pub admin: Address,
+    pub report: RollbackRehearsalReport,
+    pub timestamp: u64,
+}
+
+// ----------------------------------------------------------------
+// Issue #1031: Equal-score manipulation economics simulation
+// ----------------------------------------------------------------
+
+/// Emitted by `simulate_equal_score_attack()`.
+///
+/// Describes the economic cost–benefit breakdown of an equal-score
+/// queue manipulation attempt. Off-chain analytics and dashboards can
+/// consume this event to monitor whether the configured `tie_score_margin`
+/// is producing an adequate deterrent.
+///
+/// # Fields
+/// * `attacker_score`     — score the simulated attacker starts with
+/// * `defender_score`     — score of the legitimate LP being challenged
+/// * `n_attackers`        — number of colluding attacker accounts in the simulation
+/// * `invoices_to_tie`    — funded invoices needed to reach `defender_score`
+///                          (0 when `attacker_score >= defender_score`)
+/// * `invoices_to_beat`   — funded invoices needed to outscore `defender_score`
+///                          by at least 1 (including any active `tie_score_margin`)
+/// * `tie_win_probability_pct` — expected win rate at `defender_score` with
+///                          `n_attackers` colluding (0 when margin prevents joining)
+/// * `tie_score_margin`   — active margin at simulation time
+/// * `attacker_can_join`  — `true` iff the attacker score satisfies the margin
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EqualScoreManipulationSimulated {
+    pub attacker_score: u32,
+    pub defender_score: u32,
+    pub n_attackers: u32,
+    pub invoices_to_tie: u32,
+    pub invoices_to_beat: u32,
+    pub tie_win_probability_pct: u32,
+    pub tie_score_margin: u32,
+    pub attacker_can_join: bool,
+}
+
+/// Emitted by `set_queue_tie_score_margin()` when an admin updates the margin.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueueTieScoreMarginUpdated {
+    pub old_margin: u32,
+    pub new_margin: u32,
+    pub updated_by: Address,
 }

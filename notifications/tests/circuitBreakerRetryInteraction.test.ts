@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createNotificationsDatabase } from '../src/database';
 import { RetryQueue } from '../src/queue/retryQueue';
 import { WebhookDeliveryService, type HttpClient } from '../src/delivery/webhookDelivery';
+import { stubDnsResolver } from './helpers/dns';
 
 describe('Circuit Breaker and Retry Queue interaction', () => {
   it('prevents persistently failing endpoints from exhausting retry queue resources while healthy destinations operate normally', async () => {
@@ -30,6 +31,7 @@ describe('Circuit Breaker and Retry Queue interaction', () => {
       http,
       retryQueue,
       now,
+      dnsResolver: stubDnsResolver,
     });
 
     const failingEndpoint = {
@@ -180,6 +182,7 @@ describe('Circuit Breaker and Retry Queue interaction', () => {
       http,
       retryQueue,
       now,
+      dnsResolver: stubDnsResolver,
     });
 
     // Trip the circuit with 5 failures

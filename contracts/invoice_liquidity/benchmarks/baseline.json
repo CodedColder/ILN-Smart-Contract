@@ -2,6 +2,9 @@
   "benchmarks": {
     "submit_invoice": { "cpu": 859421, "mem": 26485 },
     "fund_invoice": { "cpu": 1041920, "mem": 38190 },
-    "mark_paid": { "cpu": 948123, "mem": 35480 }
+    "mark_paid": { "cpu": 948123, "mem": 35480 },
+    "join_fund_queue_max_depth": { "cpu": 1124580, "mem": 42350 },
+    "resolve_fund_queue_max_depth": { "cpu": 582140, "mem": 28120 },
+    "extension_cost_at_maximum_depth": { "cpu": 321850, "mem": 16420 }
   }
 }

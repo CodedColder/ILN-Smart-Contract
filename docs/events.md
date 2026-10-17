@@ -50,6 +50,53 @@ the code by the time of this audit; the document had simply not been kept in
 sync with the contract. This rewrite corrects that drift for all five
 contracts and should be kept current going forward.
 
+## Automated Coverage Check (Issue #858)
+
+This document is now machine-checked. `scripts/check-event-coverage.ts`
+parses every `#[contractimpl]` entrypoint across the five contracts,
+classifies each as state-mutating or read-only, and verifies that every
+mutating entrypoint either publishes an event (directly or through an
+`emit_*`/publish helper) or carries a documented exemption:
+
+```bash
+npx tsx scripts/check-event-coverage.ts --check    # exit 1 on drift (also: make event-coverage)
+npx tsx scripts/check-event-coverage.ts --report   # full contract/function matrix
+npx tsx --test scripts/check-event-coverage.test.ts # classifier unit tests
+```
+
+CI runs the unit tests and the `--check` gate on every PR touching
+`contracts/**` (`.github/workflows/event-coverage.yml`), so this document
+cannot silently drift from the code again: when a new mutating entrypoint
+ships without an event, the build fails until the event, the exemption, or
+the docs are updated together.
+
+## Known Gaps — Accepted Non-Emitting Mutators
+
+These state-mutating entrypoints intentionally publish no event. Each row
+mirrors the `EXEMPTIONS` table in `scripts/check-event-coverage.ts`; the CI
+check fails if a row exists in one place but not the other.
+
+| Function | Reason |
+| -------- | ------ |
+| `invoice_liquidity::initialize_multisig_admin` | One-shot multisig bootstrap (signer set + threshold). Writes only multisig config storage; every subsequent state change made through the multisig (pause/unpause/token removal/fee changes/signer rotation) emits its own event from execute_proposal, so the bootstrap itself adds no new observable state transition worth an event. |
+| `invoice_liquidity::propose_pause` | Multisig proposal bookkeeping only (stores a pending proposal). The effect becomes observable when execute_proposal applies it and emits ContractPaused; proposal creation is signer-gated and reversible via the proposal expiry path. |
+| `invoice_liquidity::propose_unpause` | Multisig proposal bookkeeping only; observable effect is the ContractUnpaused event emitted by execute_proposal. |
+| `invoice_liquidity::propose_remove_token` | Multisig proposal bookkeeping only; observable effect is the TokenRemoved event emitted by execute_proposal. |
+| `invoice_liquidity::propose_set_fee_rate` | Multisig proposal bookkeeping only; observable effect is the ParameterUpdated event emitted by execute_proposal. |
+| `invoice_liquidity::propose_set_max_discount` | Multisig proposal bookkeeping only; observable effect is the ParameterUpdated event emitted by execute_proposal. |
+| `invoice_liquidity::propose_update_multisig` | Multisig proposal bookkeeping only; signer-set changes are applied silently by execute_proposal and are readable via get_multisig_admin (accepted gap — no dedicated event for signer-set changes). |
+| `invoice_liquidity::propose_rotate_signer` | Multisig proposal bookkeeping only; observable effect is the SignerRotationScheduled event emitted by execute_proposal. |
+| `invoice_liquidity::sign_proposal` | Records a signer's approval on a pending multisig proposal (per-proposal signature counter). Effect is signer-gated, reversible until threshold, and observable via the event emitted when the proposal executes. |
+| `invoice_liquidity::record_twap_sample` | High-frequency keeper operation (Issue #859 rate-limit exemption): a single sample is transient accumulator input, not a discrete state transition — the aggregate effect is observable through the price reads it feeds (and PriceOutlierRejected on outlier handling). |
+| `invoice_liquidity::set_insurance_pool` | Admin-gated, rate-limited pointer swap; the new address is immediately readable via get_insurance_pool, and every subsequent claim flow references the pool through its own events (InsuranceClaimAttempted) — accepted gap, no dedicated event. |
+| `invoice_liquidity::set_max_price_deviation_bps` | Admin-gated oracle tuning knob (rate-limited); the threshold only materializes on the next price read, whose PriceOutlierRejected events expose its effect. Readable via get_max_price_deviation_bps. |
+| `invoice_liquidity::set_twap_enabled` | Admin-gated per-feed TWAP opt-in flag (rate-limited); changes how subsequent Price reads are computed rather than marking a discrete transition. Readable via is_twap_enabled. |
+| `invoice_liquidity::set_twap_window` | Admin-gated TWAP window bound (rate-limited, range-validated); affects subsequent windowed reads only. Readable via get_twap_window_ledgers. |
+| `iln_governance::set_proposal_deposit_sink` | Admin-gated treasury pointer on the governance contract (separate admin gate, no shared rate-limit infra in that crate — Issue #859 matrix); readable via get_proposal_deposit_sink and only consulted during proposal lifecycle events that emit their own audit trail. |
+| `insurance_pool::increment_default_count` | Internal bookkeeping counter updated as a side effect of default processing; per-pair state is exposed by the pair views and surfaced again by claim/payout events — no independent transition to announce. |
+| `insurance_pool::set_base_premium_rate_bps` | Admin-gated premium tuning on the insurance pool (admin gate; Issue #859 matrix); applies to future enrollments only with no retroactive effect. Readable via get_base_premium_rate_bps. |
+| `insurance_pool::set_risk_multiplier` | Admin-gated pricing multiplier on the insurance pool (admin gate; Issue #859 matrix); applies to future enrollments only. Readable via get_risk_multiplier_numerator/denominator. |
+
 ---
 
 ## `invoice_liquidity`
@@ -73,6 +120,7 @@ contracts and should be kept current going forward.
 | [InvoiceTokenChanged](#invoicetokenchanged) | `convert_invoice_token` |
 | [FundRequested](#fundrequested) | `join_fund_queue` |
 | [FundQueueResolved](#fundqueueresolved) | `resolve_fund_queue` |
+| [FundQueueRecovered](#fundqueuerecovered) | `recover_fund_queue` |
 | [InvoiceFunded](#invoicefunded) | `fund_invoice` |
 | [InvoiceTransferred](#invoicetransferred) | `transfer_invoice` |
 | [LPPositionTransferred](#lppositiontransferred) | `transfer_lp_position` |
@@ -86,6 +134,9 @@ contracts and should be kept current going forward.
 | [InvoiceDisputed](#invoicedisputed) | `dispute_invoice` |
 | [DisputeResolved](#disputeresolved) | `resolve_dispute`, `auto_resolve_dispute` |
 | [ReputationUpdated](#reputationupdated) | reputation score/counter changes (`invoice.rs`) |
+| [TwapEnabledForFeed](#twapenabledforfeed) | `set_twap_enabled` |
+| [TwapWindowUpdated](#twapwindowupdated) | `set_twap_window_ledgers` |
+| [TwapInsufficientData](#twapinsufficientdata) | `get_twap_price` (when observation count < minimum) |
 | [InvoiceNftMinted / InvoiceNftTransferred / InvoiceNftBurned](#invoice-nft-lifecycle) | invoice submit / fund / pay (`nft.rs`) |
 
 ### Full function inventory
@@ -113,6 +164,7 @@ State-changing functions and their event coverage (✅ = emits an event,
 | `submit_invoices_batch` | ✅ `InvoiceSubmitted` per invoice |
 | `join_fund_queue` | ✅ `FundRequested` |
 | `resolve_fund_queue` | ✅ `FundQueueResolved` |
+| `recover_fund_queue` | ✅ `FundQueueRecovered` |
 | `fund_invoice` | ✅ `InvoiceFunded` (+ `InvoiceExpired` if expiry detected, + `InvoiceNftTransferred`) |
 | `transfer_invoice` | ✅ `InvoiceTransferred` |
 | `transfer_lp_position` | ✅ `LPPositionTransferred` |
@@ -277,6 +329,17 @@ Topics: `["fund_queue_resolved", invoice_id, approved_lp]`
 | `approved_lp` | `Address` | Winning LP |
 | `score` | `u32` | Winning score |
 
+### FundQueueRecovered
+
+Topics: `["fund_queue_recovered", invoice_id]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `invoice_id` | `u64` | Target invoice |
+| `evicted_lp` | `Option<Address>` | Stalled approved LP that was evicted, if any |
+| `remaining_lps` | `u32` | LPs left in the reopened queue (`0` when purged) |
+| `purged` | `bool` | `true` when the invoice was no longer fundable and all queue state was deleted |
+
 ### InvoiceFunded
 
 Topics: `["funded", invoice_id, funder]`
@@ -433,6 +496,35 @@ events:
 - **InvoiceNftTransferred** — on `fund_invoice` (freelancer → LP): `invoice_id`, `from`, `to`, `timestamp`.
 - **InvoiceNftBurned** — on full `mark_paid`: `invoice_id`, `owner`, `timestamp`.
 
+### TwapEnabledForFeed
+
+Topics: `["twap_enabled", feed_type]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `feed_type` | `OracleFeedType` | Feed type for which TWAP was enabled/disabled |
+| `enabled` | `bool` | True if TWAP is enabled |
+
+### TwapWindowUpdated
+
+Topics: `["twap_window_updated"]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `old_window` | `u64` | Previous window size in ledgers |
+| `new_window` | `u64` | New window size in ledgers |
+
+### TwapInsufficientData
+
+Topics: `["twap_insufficient_data", feed_type]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `feed_type` | `OracleFeedType` | Feed type queried |
+| `token` | `Address` | Token queried |
+| `observations` | `u32` | Number of observations found |
+| `min_required` | `u32` | Minimum number of observations required |
+
 ---
 
 ## `insurance_pool`
@@ -551,6 +643,50 @@ Topics: `["adm_exec"]`
 ### AdminTransferCancelled
 
 Topics: `["adm_cncl"]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| (none) | | |
+
+### PremiumRateGovernanceUpdated
+
+Emitted when the premium rate is updated via governance.
+
+Topics: `["prem_gov"]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `old_rate` | `i128` | Previous premium rate in bps |
+| `new_rate` | `i128` | New premium rate in bps |
+
+### RiskMultiplierProposed
+
+Emitted when a new risk multiplier is proposed with a timelock delay.
+
+Topics: `["rm_prop"]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `numerator` | `i128` | Proposed risk multiplier numerator |
+| `denominator` | `i128` | Proposed risk multiplier denominator |
+| `eta` | `u64` | Timestamp when change becomes executable |
+
+### RiskMultiplierExecuted
+
+Emitted when a previously proposed risk multiplier change is executed after timelock.
+
+Topics: `["rm_exec"]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `old_numerator` | `i128` | Previous numerator |
+| `old_denominator` | `i128` | Previous denominator |
+| `new_numerator` | `i128` | New numerator |
+| `new_denominator` | `i128` | New denominator |
+
+### RiskMultiplierCancelled
+
+Topics: `["rm_cncl"]`
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
@@ -687,7 +823,22 @@ the scope of this event-emission audit, and should be tracked separately.
 | `accrue_lp` | ✅ `lp_accr` topic → `LpVolumeAccrued` (added by this audit) |
 | `accrue_settlement` | ✅ `settled` topic → `SettlementAccrued` (added by this audit) |
 | `claim_tokens` | ✅ `claimed` topic → `TokensClaimed` (added by this audit) |
-| `get_accrual` | 🔍 read-only view |
+| `set_lp_reward_rate` | ✅ `rw_upd` topic → `RewardRateUpdated` |
+| `set_freelancer_reward_rate` | ✅ `rw_upd` topic → `RewardRateUpdated` |
+| `set_payer_reward_rate` | ✅ `rw_upd` topic → `RewardRateUpdated` |
+| `get_accrual` / `get_*_reward_rate` | 🔍 read-only views |
+
+### RewardRateUpdated
+
+Emitted when a reward rate is updated via governance.
+
+Topics: `["rw_upd"]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `rate_type` | `Symbol` | One of `"lp_reward"`, `"freelancer_reward"`, `"payer_reward"` |
+| `old_rate` | `i128` | Previous reward rate (stroops) |
+| `new_rate` | `i128` | New reward rate (stroops) |
 
 ---
 
@@ -772,6 +923,39 @@ Topics: `["proposal_executed", proposal_id]`
 | `proposed_value` | `i128` | The value that was applied |
 | `votes_for` | `i128` | Total votes in favour |
 | `votes_against` | `i128` | Total votes against |
+
+### ProposalRejected
+
+Emitted when voting has closed and an `Active` proposal is rejected (Issue #1007).
+`execute_proposal` now **returns `Ok`** for this transition: Soroban rolls back
+all storage writes and events of a call that returns `Err`, so the previous
+`Err(QuorumNotReached)` / `Err(ProposalRejected)` return meant the `Rejected`
+status, the deposit forfeiture and any event were never committed on-chain.
+
+Topics: `["proposal_rejected", proposal_id]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `proposal_id` | `u64` | Rejected proposal identifier |
+| `reason` | `RejectionReason` | `QuorumNotReached` (votes below quorum) or `MajorityAgainst` (`votes_for <= votes_against`, including ties) |
+| `votes_for` | `i128` | Votes in favour |
+| `votes_against` | `i128` | Votes against |
+| `quorum` | `i128` | Quorum (in votes) that applied |
+
+### ProposalExecutionFailed
+
+Emitted when a `Passed` proposal's cross-contract call fails (callee error,
+or the callee's `require_auth` rejects governance as caller). Since Issue #1007
+`execute_proposal` returns `Ok` after emitting it, so the event is committed;
+the proposal stays `Passed` with its original `eta_ledger` and can be retried.
+Indexers should key on this event, not on a transaction error.
+
+Topics: `["proposal_execution_failed", proposal_id]`
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `proposal_id` | `u64` | Proposal whose execution failed |
+| `action_type` | `ProposalAction` | The action that failed |
 
 ### ProposalVetoed
 

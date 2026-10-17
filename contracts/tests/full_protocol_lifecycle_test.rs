@@ -95,13 +95,16 @@ fn test_full_protocol_lifecycle_across_all_five_contracts() {
     env.ledger().set(ledger);
 
     // ── 3. iln_distribution — reward accrual ────────────────────────────
-    let gov_token_admin_addr = Address::generate(&env);
-    let gov_token_id = env.register_stellar_asset_contract_v2(gov_token_admin_addr);
+    // The governance token's SAC must be administered by the distribution
+    // contract itself: `dist.initialize` enforces that invariant and
+    // `claim_tokens` mints through it (Issue #861), so the distribution
+    // contract is registered before the token it administers.
+    let dist_id = env.register_contract(None, iln_distribution::IlnDistribution);
+    let gov_token_id = env.register_stellar_asset_contract_v2(dist_id.clone());
     let gov_token_addr = gov_token_id.address();
     let gov_token_admin = StellarAssetClient::new(&env, &gov_token_addr);
     gov_token_admin.mint(&voter, &3_000); // exceeds 10% quorum on GOV_TOTAL_SUPPLY
 
-    let dist_id = env.register_contract(None, iln_distribution::IlnDistribution);
     let dist = iln_distribution::IlnDistributionClient::new(&env, &dist_id);
     dist.initialize(&iln_id, &gov_token_addr);
 
@@ -124,6 +127,11 @@ fn test_full_protocol_lifecycle_across_all_five_contracts() {
         &admin,
         &GOV_TOTAL_SUPPLY,
     );
+
+    // Issue #805: checkpoint the voter and age it past the holding period
+    // so the governance vote below exercises the eligible path.
+    governance.checkpoint_balance(&voter);
+    advance_ledger(&env, 11, 55);
 
     // reputation_bonus's admin is governance's own address, matching the
     // authorization pattern execute_proposal relies on (Issue #704).
@@ -159,7 +167,10 @@ fn test_full_protocol_lifecycle_across_all_five_contracts() {
 
     // Funding triggers ILN's notify_distribution_funding -> dist.accrue_lp.
     iln.fund_invoice(&lp, &invoice_id, &INVOICE_AMOUNT, &false);
-    assert!(dist.get_accrual(&lp) > 0, "LP funding must accrue a distribution reward");
+    assert!(
+        dist.get_accrual(&lp) > 0,
+        "LP funding must accrue a distribution reward"
+    );
 
     // Settlement triggers notify_distribution_settlement -> accrue_settlement.
     iln.mark_paid(&invoice_id, &INVOICE_AMOUNT);
@@ -176,7 +187,11 @@ fn test_full_protocol_lifecycle_across_all_five_contracts() {
     // get_accrual reports lifetime total_earned (not an unclaimed balance),
     // so it doesn't reset to 0 after claiming — a second claim of the same
     // already-claimed amount must return 0 instead.
-    assert_eq!(dist.claim_tokens(&lp), 0, "re-claiming already-claimed tokens must be a no-op");
+    assert_eq!(
+        dist.claim_tokens(&lp),
+        0,
+        "re-claiming already-claimed tokens must be a no-op"
+    );
 
     // ── Governance touches reputation_bonus (Issue #704's wiring) ───────
     let hash = dummy_hash(&env);
@@ -208,7 +223,10 @@ fn test_full_protocol_lifecycle_across_all_five_contracts() {
     assert_eq!(final_rep_config.bonus_bps, 150);
     assert_eq!(final_rep_config.min_discount_rate_bps, 75);
 
-    assert!(pool.is_enrolled(&lp), "insurance enrollment must survive the whole journey");
+    assert!(
+        pool.is_enrolled(&lp),
+        "insurance enrollment must survive the whole journey"
+    );
     assert_eq!(pool.get_pool_balance(), 600);
 
     // ILN itself is still live and functional after everything above — no

@@ -12,6 +12,7 @@
 import fs from "fs";
 import { Command } from "commander";
 import { formatError, isJsonMode } from "../format.js";
+import { loadConfig } from "../config.js";
 
 export interface InvoiceRow {
   id: string;
@@ -68,7 +69,7 @@ export function filterByDate(
 }
 
 /**
- * Fetch invoices from the network. In real usage this would call the SDK;
+ * Fetch invoices from the network. In real usage this calls the SDK;
  * here we expose a hook so tests can inject mock data.
  */
 export type InvoiceFetcher = (opts: {
@@ -76,8 +77,67 @@ export type InvoiceFetcher = (opts: {
   lp?: string;
 }) => Promise<InvoiceRow[]>;
 
+/**
+ * Default fetcher — queries the on-chain contract via the SDK for
+ * invoices matching the given submitter or LP address (#877).
+ */
+async function defaultFetcher(opts: {
+  submitter?: string;
+  lp?: string;
+}): Promise<InvoiceRow[]> {
+  // Lazy-import the SDK so the CLI doesn't fail if the SDK package
+  // isn't installed (e.g. in isolated unit tests of the CLI itself).
+  const { ILNClient, TESTNET_RPC_URL } = await import("@iln/sdk");
+  const { SorobanRpc } = await import("@stellar/stellar-sdk");
+
+  const config = loadConfig();
+  const networkPassphrase =
+    config.network === "mainnet"
+      ? "Public Global Stellar Network ; September 2015"
+      : "Test SDF Network ; September 2015";
+
+  const client = ILNClient.custom({
+    rpcUrl: config.rpcUrl || TESTNET_RPC_URL,
+    networkPassphrase,
+    contractId: "", // resolved from registry or config in production
+  });
+
+  // Use a dummy source account for read-only simulations
+  const sourceAccount = new SorobanRpc.Api.Account(
+    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    "0"
+  );
+
+  let invoices: Awaited<ReturnType<typeof import("@iln/sdk").listInvoicesBySubmitter>> = [];
+
+  if (opts.submitter) {
+    const { listInvoicesBySubmitter } = await import("@iln/sdk");
+    invoices = await listInvoicesBySubmitter(
+      client.rpc,
+      client.contractId,
+      opts.submitter,
+      sourceAccount,
+      client.networkPassphrase
+    );
+  } else if (opts.lp) {
+    invoices = await client.getLpInvoices(opts.lp);
+  }
+
+  return invoices.map((inv) => ({
+    id: String(inv.id),
+    state: inv.status,
+    submitter: inv.submitter,
+    payer: inv.payer,
+    lp: inv.lp,
+    amount: String(inv.amount),
+    token: inv.token,
+    yieldPct: String(inv.yieldPct ?? "0"),
+    settlementDate: inv.settlementDate ?? "",
+  }));
+}
+
 export function makeExportCommand(
-  fetchInvoices: InvoiceFetcher = defaultFetcher
+  fetchInvoices: InvoiceFetcher = sdkFetcher
 ): Command {
   const cmd = new Command("export").description(
     "Export invoice data to CSV or JSON"
@@ -128,10 +188,4 @@ export function makeExportCommand(
     );
 
   return cmd;
-}
-
-/** Default fetcher — placeholder for SDK integration. */
-async function defaultFetcher(): Promise<InvoiceRow[]> {
-  // TODO: replace with real SDK call once the SDK exposes a listInvoices method
-  return [];
 }

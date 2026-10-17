@@ -10,41 +10,64 @@ To regenerate: `make changelog`
 
 ---
 
-## Mainnet Launch
+## Unreleased
 
-This release marks the initial mainnet deployment of the Invoice Liquidity Network
-protocol on Stellar. Key highlights for users and integrators:
-
-### Core Protocol
-- **Multi-token support** — fund and pay invoices using any approved Stellar asset (EURC and others)
-- **Invoice lifecycle** — submit, fund, settle, cancel, and default invoices with on-chain escrow
-- **LP priority queue** — liquidity providers compete on discount rates with an appeal mechanism
-- **Payer verification oracle** — optional oracle interface for payer creditworthiness checks
-
-### Governance & Security
-- **On-chain governance** — proposals, voting, delegation, quorum requirements, and timelocked admin actions
-- **Admin veto** — governance-controlled emergency pause/unpause with configurable disable
-- **Insurance pool** — default-protection pool for liquidity providers
-- **Reputation system** — on-chain reputation scoring with lazy decay for inactive addresses
-
-### Distribution & Incentives
-- **Yield distribution** — automated incentive distribution for LPs, freelancers, and payers
-- **Reputation bonuses** — reputation-based discount bonuses integrated into invoice flows
-
-### Developer Experience
-- **TypeScript SDK** (`@iln/sdk`) — typed client library for all contract operations
-- **CLI tool** (`@iln/cli`) — terminal wallet and invoice management
-- **Event indexer** — REST API indexing Soroban events into Postgres
-- **Notifications service** — webhooks, Slack, and email delivery for invoice lifecycle events
-
-### Known Limitations
-- Insurance pool is experimental and pending additional audit coverage
-- Oracle integration is optional and not required for basic invoice flows
-- Multi-sig admin configuration is not yet deployed on mainnet
+- test(contract): regression guards for fail-closed token decimals (decimals logic itself landed in #1070) (#1094)
+- fix(contract): enforce `MAX_FUND_QUEUE_LEN` in `join_fund_queue` with strict-score displacement (#1095)
+- test: audit-path regression suite `audit_regression_test` (#1096)
+- docs: evidence → remediation control map (#1097)
 
 ---
 
-<!-- next-header -->
+## Mainnet Launch
+
+This release marks the initial mainnet launch of the Invoice Liquidity Network (ILN) protocol on Stellar. It consolidates deliverables across all three development and audit-hardening batches into a production-grade decentralized invoice factoring protocol.
+
+For operational and risk guidance, consult the [Mainnet Launch Notes & Known Limitations](docs/mainnet-launch-notes.md) and the [Mainnet Launch Checklist](docs/mainnet-launch-checklist.md).
+
+### Batch 1: Core Factoring Protocol & Multi-Asset Infrastructure
+
+- **Invoice Lifecycle Engine (`invoice_liquidity`)**: Full on-chain escrow supporting submission, discount-rate bidding queue, LP funding, payer settlement, cancellation, default declaration, and dispute appeals.
+- **Multi-Token Asset Support**: Seamless integration with Stellar Asset Contracts (SACs) for XLM, USDC, EURC, and permissioned tokens with per-token volume and fee accounting.
+- **Dual-Layer Reputation System**: Objective on-chain score progression (+1 for on-time settlement, -5 for default), lazy inactivity decay without keeper gas overhead, and distinct reputation bonus discounts (`reputation_bonus`).
+- **Transferable Debt Claims (NFT)**: Automatic tokenized representation of funded invoices granting claim ownership rights to funding liquidity providers.
+- **Client & Off-Chain Tooling**: Complete `@iln/sdk` TypeScript client library, `@iln/cli` operator terminal tool, PostgreSQL Horizon event indexer, and multi-channel notification engine (Webhooks, Slack, Email).
+
+### Batch 2: Production Hardening, Audit Readiness & Governance Security
+
+- **Strict Parameter Bounds Enforcement**: Rigorous numeric validation on all governance and administrative setters (ADR-011) ensuring parameters remain within safe economic bounds.
+- **Arithmetic Safety & Panic Elimination**: Zero unverified raw math; all token transfers, fee accruals, and tallies use saturating arithmetic, guarded by the CI `check-no-unwrap` gate.
+- **Advanced Governance Architecture (`iln_governance`)**:
+  - Timelocked execution delay for approved proposals (ADR-012 Phase 3).
+  - Snapshot voting weight aged against checkpoint ledgers, mitigating flash-loan manipulation and vote buying (#805).
+  - Optional quadratic voting reducing whale voting power.
+  - Transitive vote delegation with cycle detection and depth limit enforcement (max depth 10).
+  - Admin emergency veto with irreversible governance-controlled disable mechanism.
+  - Stable cursor-based proposal pagination keyed by proposal ID, maintaining stability under concurrent writes (#772).
+- **Automated Verification & Audit Gates**: CI-enforced state-mutating event coverage (`check-event-coverage.ts`), machine-generated access control matrix (`docs/access-control-matrix.generated.md`), and invariant property test suites (`iln_fuzz`).
+
+### Batch 3: Stellar Wave 9, Protocol Economics & Community Readiness
+
+- **Protocol Economics & Risk Framework**:
+  - Comprehensive [LP Risk Management Guide](docs/lp-risk-management-guide.md) and [Governance Operations Playbook](docs/governance-operations-playbook.md).
+  - [Token Economics Paper](docs/token-economics.md) detailing velocity and incentive distributions.
+  - Periodic risk and parameter review cadence.
+- **Community Readiness & Ecosystem Support**:
+  - Dedicated [Integration Partner Onboarding Guide](docs/integration-partner-onboarding.md) and public support directory (`docs/support-channels.md`).
+  - Standardized [Audit Findings Summary Template](docs/audit-findings-summary.md) for transparent vulnerability reporting.
+  - Established [Emergency Contacts & CODEOWNERS](docs/emergency-contacts.md).
+- **Deployment & Operational Runbooks**:
+  - Dry-run validation scripts (`scripts/deploy-mainnet.sh --dry-run`).
+  - Automated ledger reorg detection and recovery runbooks in the indexer ingestion pipeline.
+  - Mainnet rollback and state verification runbooks (`docs/mainnet-rollback-runbook.md`).
+
+### Known Limitations & Accepted Launch Risks
+
+- **Insurance Pool Experimental Status**: The `insurance_pool` contract is deployed but coverage is initially disabled pending post-launch liquidity staging. See [Launch Notes](docs/mainnet-launch-notes.md#2-known-limitations-at-mainnet-launch).
+- **Centralized Admin Keys**: Mainnet launches under a single admin operational key prior to transition to the appointed multi-sig council (`docs/mainnet-admin-signers.json`).
+- **First Live Upgrade**: State migration logic has been tested against synthetic mainnet-shaped state, but has not yet been executed on live mainnet traffic.
+
+---
 
 ## [Unreleased]
 
@@ -57,42 +80,369 @@ protocol on Stellar. Key highlights for users and integrators:
 
 ### Features
 
-- Wire full EURC token support into fund and pay instructions
-- Implement multi-token support with token management functions and associated events
-- Add paginated `list_proposals` governance view
-- Add payer-verification oracle interface and mock oracle
-- Implement `create_proposal` with voting window and balance check
-- Add reputation tracking events and update test snapshots
-- Implement admin veto with governance-controlled disable mechanism
-- Add quorum requirement for proposal passing
-- Implement `execute_proposal` with configurable timelock delay
-- Cache vote totals incrementally for gas-efficient proposal execution
-- Benchmarks, top-payers heap, lazy storage, and test coverage
+- Frontend build fix
+- Add MIT license and remove release profile from Cargo.toml
+- InvoiceSubmitted timestamp, AdminChanged event, invariants helper, governance docs
+- Add storage keys and events for contract stats, pause/unpause, and timestamp validation
+- Implement pause/unpause, get_contract_stats, and timestamp validation
 - Implement lazy reputation decay for inactive addresses
-- LP priority queue, `appeal_default`, `GovernanceProposal`, `cast_vote`
-- Implement pause/unpause, `get_contract_stats`, and timestamp validation
-- Add delegate votes support
-- Add MIT license
+- LP priority queue (#34), appeal_default (#36), GovernanceProposal (#59), cast_vote (#61)
+- Emit InvoicePaid event with full settlement details
+- Emit InvoiceFunded event with LP details and effective yield
+- Centralise access control in access.rs and document permission matrix
+- Add dispute functionality and update associated test snapshots
+- Wire reputation counter updates into invoice lifecycle
+- Implement invoice pagination and update corresponding test snapshots
+- Integrate XLM support via Stellar Asset Contract wrapper
+- Add ParameterUpdated event for all governance config changes
+- Write governance integration tests covering full proposal lifecycle
+- Token allowlist enforcement, reputation profile, threshold, hot-path reads
+- Implement vote delegation with cycle prevention
+- Add reentrancy guard to fund_invoice and mark_paid
+- Resolve issues #23, #209, #213, #216
+- Add quorum requirement for proposal passing
+- Invoice & multitoken inte
+- Implement admin veto with governance-controlled disable mechanism
+- Implement admin veto with governance-controlled disable mechanism
+- Benchmarks, top-payers heap, lazy storage, and test coverage (#76–#79)
+- Implement execute_proposal with configurable timelock delay
+- Cache vote totals incrementally for gas-efficient proposal execution
+- Add reputation tracking events and update test snapshots for invoice liquidity contract
+- Implement create_proposal with voting window and balance check
+- Add payer-verification oracle interface, mock oracle, and fix clippy warnings
+- Add paginated list_proposals governance view
+- Implement multi-token support with token management functions and associated events
+- Wire full EURC token support into fund and pay instructions
+- Add optional oracle payer verification in fund_invoice (#92)
+- Add oracle data freshness validation in fund_invoice (#93)
+- Add local development guide and Docker integration for ILN smart contracts
+- Add optional referral code tracking to submit_invoice
+- Document all contract error codes with descriptions and remediation
+- Implement Dutch auction funding for competitive rate discovery
+- Add Dutch auction funding mechanism with comprehensive tests and event tracking
+- Represent invoices as NFTs on Stellar for DeFi composability
+- Add optional LP whitelist for private invoice markets
+- Implement 2-of-3 multi-sig admin for high-security operations
+- Add get_lp_portfolio_stats view for LP analytics
+- Implement governance-controlled protocol fee collection
+- Add get_invoice_count efficient counter view
+- Batch submission, insurance pool stub, ABI spec, v1→v2 migration
+- Add Freighter adapter, ILNClient builder, getReputation, getContractStats
+- Add contract version storage and get_version view
+- Add getInvoice and listInvoices query methods
+- Implement submitInvoice with full type safety and error mapping
+- Implement markPaid with partial payment support
+- Add cancelInvoice method
+- Add automated npm release workflow with dual ESM/CJS output
+- Add centralised input validation utilities
+- Add transferLPPosition method
+- Add governance SDK methods for proposals, voting, and execution
+- Iln export, iln config, --profile flag, E2E tests
+- Add disputeInvoice helper, TokenRegistry, governance/npm prep
+- Add SubmitOptions and SubmitResult types for iln submit command
+- Add receipt table builder and bps-to-yield helper for iln submit
+- Implement iln submit with flag mode, interactive prompts, and dry-run
+- Register iln submit command in CLI entry point
+- Add types for iln cancel command (InvoiceState, CancelResult)
+- Add validatePendingState and formatConfirmMessage helpers for cancel
+- Implement iln cancel command with state guard and confirmation prompt
+- Register iln cancel command in CLI entry point
+- Add MarketplaceListing, FundOptions and FundResult types
+- Implement iln marketplace with sort and filter flags
+- Implement iln fund with confirmation prompt and --yes skip flag
+- Register iln marketplace and iln fund commands in CLI entry point
+- Add InvoiceDetail, InvoiceState, and TERMINAL_STATES types for status
+- Add stateBadge, timeUntilExpiry, and formatDetail for status output
+- Add buildTimeline helper for iln status mini status timeline
+- Implement iln status with rich output, --json, and --watch flags
+- Register iln status command in CLI entry point
+- Add reputation, wallet enhancements, shell completion, and comprehensive README
+- Add REST API endpoints with supertest tests
+- Add circuit breaker and rate limiting for webhook delivery
+- Add WebSocket endpoint for real-time event push to clients
+- Add production Docker configuration
+- Add Docker setup, Vitest coverage, and webhook infrastructure
+- Add E2E test framework, Slack notifications, delivery history, and indexer consistency tests
+- Add post-deploy verification script and E2E tests
+- Implement GET /invoices list API with pagination, filters, and sorting
+- Implement GET /events per-address event feed endpoint
+- Complete multi-token docs, add seed script, reset-testnet, and Allure E2E reporting
+- Add contract health check monitoring script
+- Add comprehensive Makefile targets for developer workflows
+- Add rate limiting and API key authentication
+- Implement Horizon event ingestion for all ILN contract events
+- Add email subscription registration with verification
+- Implement email delivery via Resend with due-date reminders
+- Migrate all packages to Vitest with shared workspace config
+- Set up pnpm workspaces with shared lockfile and Node.js 20 enforcement
+- Add shared TypeScript base config with strict settings
+- Add shared ESLint config package for consistent rules across monorepo
+- Add stellarHelpers utility module (#369)
+- Bootstrap Next.js + Storybook 8 workspace (#370)
+- Configure Storybook 8 main with a11y addon (#370)
+- Add Storybook preview with a11y config (#370)
+- Add TokenLogo component (#370)
+- Add TokenLogo Storybook stories (#370)
+- Add AddressDisplay component with copy support (#370)
+- Add AddressDisplay Storybook stories (#370)
+- Add StatusBadge component for invoice states (#370)
+- Add StatusBadge Storybook stories (#370)
+- Add Skeleton shimmer loading component (#370)
+- Add Skeleton Storybook stories (#370)
+- Add performance benchmark suite (#371)
+- Add exponential back-off retry for transient RPC failures
+- Add shared XDR decoder utilities for all contract return types
+- Add pre-flight safety checks and dry-run mode to deploy script
+- Add partial payment support and preview to iln pay command (#232)
+- Add /health and /metrics endpoints for observability
+- Add database migration system with auto-run on startup
+- Add historical event backfill catch-up mode
+- Add Telegram notification channel
+- Add @iln/types shared package
+- Add shared mock utilities package
+- Export shared @iln/types and wire workspace dependencies
+- Migrate reputation and stats to @iln/types
+- Add fee estimation utilities for pre-transaction cost preview
+- Add optional GraphQL API layer with invoice, reputation, and stats queries
+- Add reputation and stats methods, enhance xdr decoding
+- Add governance view methods for delegate, quorum, proposal balance, execution delay, and veto power
+- Migrate all packages to Vitest with shared workspace config
+- Set up pnpm workspaces with shared lockfile and Node.js 20 enforcement
+- Add shared TypeScript base config with strict settings
+- Add shared ESLint config package for consistent rules across monorepo
+- Add stellarHelpers utility module (#369)
+- Bootstrap Next.js + Storybook 8 workspace (#370)
+- Configure Storybook 8 main with a11y addon (#370)
+- Add Storybook preview with a11y config (#370)
+- Add TokenLogo component (#370)
+- Add TokenLogo Storybook stories (#370)
+- Add AddressDisplay component with copy support (#370)
+- Add AddressDisplay Storybook stories (#370)
+- Add StatusBadge component for invoice states (#370)
+- Add StatusBadge Storybook stories (#370)
+- Add Skeleton shimmer loading component (#370)
+- Add Skeleton Storybook stories (#370)
+- Add performance benchmark suite (#371)
+- Add exponential back-off retry for transient RPC failures
+- Add shared XDR decoder utilities for all contract return types
+- Add pre-flight safety checks and dry-run mode to deploy script
+- Add partial payment support and preview to iln pay command (#232)
+- Add /health and /metrics endpoints for observability
+- Add database migration system with auto-run on startup
+- Add historical event backfill catch-up mode
+- Add Telegram notification channel
+- Add @iln/types shared package
+- Add shared mock utilities package
+- Export shared @iln/types and wire workspace dependencies
+- Migrate reputation and stats to @iln/types
+- Add fee estimation utilities for pre-transaction cost preview
+- Add optional GraphQL API layer with invoice, reputation, and stats queries
+- Add reputation and stats methods, enhance xdr decoding
+- Add getInsurancePoolInfo and view functions wrapper for insurance pool
+- Add pause and unpause commands with emergency controls
+- Add getDistributionAccrual method to wrap get_accrual view
+- Add test-fuzz Makefile target (#430)
+- Add build-insurance Makefile target (#431)
+- Add SDK getTopPayers method
+- Implement getVersion method to expose contract version
+- Add getInsurancePoolInfo and view functions wrapper for insurance pool
+- Add pause and unpause commands with emergency controls
+- Add getDistributionAccrual method to wrap get_accrual view
+- Add test-fuzz Makefile target (#430)
+- Add build-insurance Makefile target (#431)
+- Add SDK getTopPayers method
+- Add appeal CLI command
+- Expose NFT query methods for invoice metadata and ownership
+- Add top-payers CLI command
+- Expose getReferralStats method to query referral counts by code
+- Add get_token_decimals method and tests
+- Add individual test targets for contract crates
+- Add referral command to query referral counts
+- Add missing tests for batch submission, oracle freshness, fee-on-transfer, and multisig expiration
+- Add missing test coverage for issues #479, #484, #485, #486
+- Implement listProposals with server-side pagination
+- Implement SDK method for hasVoted
+- Implement getSubmitterInvoices with pagination
+- Implement batch transactions and insurance pool events
+- Add timelock enforcement for admin actions
+- Emit events for previously-silent admin actions
+- Emit event on initialize
+- Emit events for all state-changing functions
+- Emit events for all state-changing functions
+- Emit events for admin setters and initialize
+- Implement rate-limiting safeguards for sensitive admin operations (Closes #541)
+- Add event types doc, SDK convenience methods, and deployment verification
+- Implement governance proposals for #545, #544, #539, #533
+- Add setDistributionContract SDK method, insurance pool health check, governance delegation examples, and dispute/appeal SDK examples
+- Add getPayerScore SDK method
+- Add addToken and removeToken SDK methods
+- Add updateFeeRate and updateMaxDiscount SDK methods
+- Add setPriceOracle and setMaxOracleAge SDK methods
+- Add SDK getLpInvoices method with pagination
+- Implement governance proposals and storage optimizations
+- Add getLpScore view method (#501)
+- Implement historical event replay and ledger catch-up
+- Add typed contract error mapping and retry guidance
+- Implement token transfers, risk-priced premiums, and governance docs (#527, #526, #528, #543)
+- Implement hot/cold storage layout optimization for invoice_liquidity contract
+- Governance benchmarks, insurance pool deploy profile, spec/ABI coverage
+- Verify proposal execution before marking Executed
+- Add quadratic voting option
+- Governance-controlled oracle registry
+- Integrate insurance pool into claim_default
+- Implement MEV queue formalization, error matrix, blocking CI coverage, and multi-crate fuzz harness
+- Implement real token settlement, claim prioritization, and TWAP accumulator
+- Add maximum delegation depth cap to bound cast_vote gas costs
+- Add randomized tie-breaking to funding queue resolution per threat model recommendation
+- Harden indexer production API, ingestion HA, and monitoring
+- Complete insurance pool mainnet readiness checklist
+- Implement and verify indexer database backup and restore procedure
+- Productionize indexer/chain consistency reconciliation as a scheduled alerting job
+- Add indexer event replay from arbitrary ledger checkpoint for incident recovery
+- Per-recipient rate limiting and delivery history retention (Closes #728, #733)
+- Complete CLI command coverage for insurance pool operations
+- Add insurance pool event ingestion and stats API to indexer
+- Formalize and property-test insurance_pool solvency invariants
+- Formalize and property-test iln_distribution reward conservation invariant
+- Add governance-gated invoice size and volume caps for staged rollout
+- Add event volume anomaly detection to indexer
+- Add on-demand escrowed-funds exposure calculation tool
+- Record the last pause timestamp (Issue #775)
+- Add public protocol status view for incident transparency
+- Read protocol status from chain (Issue #775)
+- Public protocol status service (Issue #775)
+- Structured logging + correlation IDs, mount /protocol-status (Issue #775, #776)
+- Structured logging with correlation IDs (Issue #776)
+- Add SLOs, game-day exercise plan, alert integration test, and synthetic canary
+- Forfeitable proposal deposit + TWAP accumulator port, per-feed opt-in and bounded window
+- Reconcile audit docs and add governance hardening specs
+- Publish public protocol health status page for community transparency
+- Address issues #874, #875, #876, #877
+- Audit findings template, partner onboarding, SCF tracker, cross-contract FV
+- Integrate LP reputation score into insurance premium rate calculation
+- Add SDK guard against network/contract-ID passphrase mismatch
+- Add CLI multi-network profile management with explicit mainnet confirmation
+- Access-control matrix CI, public-doc gate, SCF narrative, maintainers
+- SDK multi-network registry, CLI export fix, notifications services docs
+- Shared alert router, solvency monitor, anomaly thresholds, canary TWAP/insurance coverage (#888-#891)
+- Add reputation audit-trail dashboard with anomaly detection
+- Add LP-queue, funding-velocity, and default-rate dashboard
+- Add admin-action anomaly alerting
+- Add oracle health monitoring dashboard
+- Automate event coverage auditing across all contracts
+- Implement ADR-012 Phase 3 execution timelock on governance proposals
+- Add CLI dry-run/simulation mode for admin commands
+- Add CLI dry-run/simulation mode for governance commands
+- Monitor for exploit-attempt patterns matching known audit-finding categories
+- Implement ledger reorg detection in indexer ingestion path
+- Implement automatic rollback-and-replay recovery on detected chain reorg
+- Extend consistency reconciliation job to retroactively catch missed reorg drift
+- Wire reorg alerting and runbook
+- CLI dry-run mode for pause (882)
 
-### Bug Fixes
+### Performance
 
-- Resolve discount rate validation
-- Resolve invoice ID counter refactor
-- Fix issues #29, #30, #42, #46, #50, #51
-- Change `Config.high_rep_threshold` from `u8` to `u32` for Soroban compatibility
+- Reduce Invoice struct size to lower per-invoice storage cost
+- Batch stat counter writes to reduce storage write count
 
-### Documentation
+### Refactoring
 
-- Add architecture decision records for major design choices
-- Add README and SDK integration guide
-- Add SECURITY.md and benchmark/governance/multi-token documentation
-- Add governance docs, `InvoiceSubmitted` timestamp, `AdminChanged` event
+- Consolidate invoice liquidity logic and update test snapshots to align with revised contract state transitions and event emissions.
+- Use monotonic counter for invoice ID generation
+- Prepare quorum total supply migration
+- Remove outdated documentation and analysis files
+- Replace page-based pagination with cursor-based pagination for list_proposals
 
 ### Tests
 
-- Add mock token, discount invariant props, governance integration tests, and quickstart guide
+- Update existing tests for new timestamp validation requirements
+- Add comprehensive tests for new features
+- Update test snapshots for new features
+- Add reputation edge case test suite
+- Fix missing testutils import in xlm support tests
+- Add fuzz test suite for submit_invoice input validation
 - Add stress tests and lifecycle integration tests
-- Add fuzz test suite for `submit_invoice` input validation
+- Add mock token, discount invariant props, governance integration tests, and quickstart guide
+- Add TestContext helper to reduce test setup boilerplate
+- Add integration test suite running against Stellar testnet
+- Add flag-based mode tests for iln submit
+- Add --dry-run tests for iln submit (no sign, JSON payload)
+- Add interactive prompt mode tests for iln submit (mocked prompter)
+- Add happy-path tests for iln cancel (confirm, --yes, abort)
+- Add state guard and error path tests for iln cancel
+- Add iln marketplace listing, filter, and sort tests
+- Add iln fund tests (confirm, --yes, abort, fetch error)
+- Add rich output tests for iln status
+- Add --json flag tests for iln status (valid JSON, all fields)
+- Add --watch mode tests for iln status (interval, terminal state)
+- Add unit tests for stateBadge, timeUntilExpiry, formatDetail, buildTimeline
+- Add unit tests for bpsToYieldPct and buildReceiptRows helpers
+- Add unit tests for validatePendingState and formatConfirmMessage helpers
+- Add unit test suite with 90% coverage target
+- Add reputation system lifecycle E2E test
+- Add full invoice lifecycle E2E test
+- Add governance proposal lifecycle E2E tests
+- Add unit tests for stellarHelpers (#369)
+- Format and fix compile regressions
+- Fix subscribe.test.ts for vitest compatibility
+- Migrate FreighterSigner.test.ts to vitest globals
+- Fix KeypairSigner.test.ts for vitest
+- Fix client.test.ts vitest mock and URL compatibility
+- Fix allowance.test.ts invalid Stellar addresses
+- Fix governance.test.ts invalid addresses and mock
+- Fix reputation.test.ts vitest compatibility
+- Fix stats.test.ts vitest compatibility
+- Fix transferLPPosition.test.ts
+- Fix fundInvoice.test.ts for vitest
+- Fix cancelInvoice.test.ts invalid addresses and jest globals
+- Fix markPaid.test.ts invalid account ID
+- Fix queries.test.ts invalid Stellar addresses
+- Fix submitInvoice.test.ts jest globals and dueDate unit
+- Update stellarHelpers.test.ts for vitest
+- Add governance proposal lifecycle E2E tests
+- Add unit tests for stellarHelpers (#369)
+- Format and fix compile regressions
+- Fix subscribe.test.ts for vitest compatibility
+- Migrate FreighterSigner.test.ts to vitest globals
+- Fix KeypairSigner.test.ts for vitest
+- Fix client.test.ts vitest mock and URL compatibility
+- Fix allowance.test.ts invalid Stellar addresses
+- Fix governance.test.ts invalid addresses and mock
+- Fix reputation.test.ts vitest compatibility
+- Fix stats.test.ts vitest compatibility
+- Fix transferLPPosition.test.ts
+- Fix fundInvoice.test.ts for vitest
+- Fix cancelInvoice.test.ts invalid addresses and jest globals
+- Fix markPaid.test.ts invalid account ID
+- Fix queries.test.ts invalid Stellar addresses
+- Fix submitInvoice.test.ts jest globals and dueDate unit
+- Update stellarHelpers.test.ts for vitest
+- Add unit tests for getReferralStats hex parsing and contract calls
+- Add tests for #487 reputation decay, #488 min invoice amount, #489 token-aware update, #490 cancel partial-funding refunds
+- Prune 28 stale test_snapshot directories for deleted modules
+- Add fund_invoice property fuzz test (#495)
+- Add dispute_invoice property fuzz test (#497)
+- Add insurance pool claim/reentrancy fuzz tests (#500)
+- Add replay, gap recovery, and error handling coverage
+- Update execute_proposal/initialize call sites for total_supply storage (#622)
+- Align governance_lifecycle_test.rs with new execute_proposal signature (#622)
+- Align governance_main_integration_test.rs with new execute_proposal signature (#622)
+- Add mark_paid settlement tests for fee-driven edge cases (#619)
+- Add add_volume attribution and no-double-counting tests (#620)
+- Add coverage-boost tests for uncovered production branches
+- Verify delegation cycle detection correctness and cost at longer chain lengths
+- Audit quadratic voting whale-dominance reduction under realistic token distribution
+- Verify governance-mediated reputation_bonus parameter updates end-to-end
+- Add comprehensive full-protocol lifecycle test spanning all five contracts
+- Verify and complete full ProposalStatus transition coverage in integration tests; add fuzz snapshot review script and checklist report
+- Consolidate economic security regression tests into dedicated module
+- Add comprehensive insurance pool timelock and stress tests
+- Verify insurance_pool graceful degradation under simultaneous default stress
+- Reputation consistency audit, multi-year decay, NFT events, NFT transfer consistency
+- Add fuzz coverage for reputation score updates under adversarial settlement sequences
+- Verify high_rep_threshold bound keeps the high-reputation bonus path reachable
+- Add CLI tests for dry-run output correctness
 
-<!-- next-url -->
-[Unreleased]: https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/commits/main
+[Unreleased]: https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/compare/HEAD...HEAD
+
+---

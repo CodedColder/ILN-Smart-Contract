@@ -88,4 +88,11 @@ pub enum ContractError {
     /// Issue #817: requested TWAP window is outside the governance-bounded
     /// `[MIN_TWAP_WINDOW_LEDGERS, MAX_TWAP_WINDOW_LEDGERS]` range.
     InvalidTwapWindow = 46,
+    /// Issues #1019/#1022: the fund queue for this invoice already holds
+    /// `MAX_FUND_QUEUE_LEN` LPs; further joins are rejected so queue storage
+    /// and the O(n) join/resolve loops stay bounded.
+    QueueFull = 47,
+    /// Issue #1020: `recover_fund_queue` was called but there is nothing to
+    /// recover yet (no stalled resolution, or the grace period has not elapsed).
+    QueueNotStalled = 48,
 }

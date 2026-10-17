@@ -1,5 +1,7 @@
 # SDK Integration Guide
 
+> External protocol partners: see also [`integration-partner-onboarding.md`](integration-partner-onboarding.md) for stable surfaces, upgrade expectations, and the mainnet go-live checklist.
+
 A single, end-to-end integration guide for third-party builders working with the
 Invoice Liquidity Network (ILN) on Stellar/Soroban. Every flow below uses the
 official [`@iln/sdk`](../sdk/README.md) package and is exercised against the
@@ -636,3 +638,9 @@ The repository also ships runnable references you can copy from:
 - [`sdk/tests`](../sdk/tests) — unit and integration tests for every method.
 
 See the [SDK package README](../sdk/README.md) for the full method reference.
+
+## Examples
+See `sdk/examples/` for runnable integration scripts covering:
+- [Invoice Lifecycle](../sdk/examples/invoice_lifecycle.ts)
+- [Insurance Claims](../sdk/examples/insurance_claim.ts)
+- [Governance Lifecycle](../sdk/examples/governance_lifecycle.ts)

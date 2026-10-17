@@ -25,9 +25,15 @@ pub enum ConfigError {
     Unauthorized,
     InvalidBonusBps,
     InvalidMinDiscountRate,
+    InvalidDecayRate,
+    InvalidRepThreshold,
 }
 
 const MAX_BONUS_BPS: u32 = 500;
+const MAX_DECAY_RATE_BPS: u32 = 500;
+const MIN_REP_THRESHOLD: u32 = 0;
+const MAX_REP_THRESHOLD: u32 = 100;
+const MAX_MIN_DISCOUNT_RATE_BPS: u32 = 10_000;
 
 #[allow(clippy::too_many_arguments)]
 pub fn update_config(
@@ -53,8 +59,14 @@ pub fn update_config(
     if bonus_bps > MAX_BONUS_BPS {
         return Err(ConfigError::InvalidBonusBps);
     }
-    if min_discount_rate_bps == 0 {
+    if min_discount_rate_bps == 0 || min_discount_rate_bps >= MAX_MIN_DISCOUNT_RATE_BPS {
         return Err(ConfigError::InvalidMinDiscountRate);
+    }
+    if decay_rate_bps > MAX_DECAY_RATE_BPS {
+        return Err(ConfigError::InvalidDecayRate);
+    }
+    if high_rep_threshold > MAX_REP_THRESHOLD {
+        return Err(ConfigError::InvalidRepThreshold);
     }
 
     let new_config = Config {

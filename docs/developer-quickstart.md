@@ -263,3 +263,6 @@ Re-add the network configuration (see step 7.1).
 - **Storage layout** — [`docs/storage-layout.md`](storage-layout.md)
 - **Threat model** — [`docs/threat-model.md`](threat-model.md)
 - **Contributing guide** — [`CONTRIBUTING.md`](../CONTRIBUTING.md)
+
+## SDK Examples
+Check out the runnable examples in the `sdk/examples/` directory for full invoice, governance, and insurance workflows.

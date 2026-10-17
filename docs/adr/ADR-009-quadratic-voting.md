@@ -91,6 +91,19 @@ subject to a governance vote, not a unilateral admin switch.
   effectively raises the practical minimum meaningful stake for a
   distinguishable vote weight.
 
+## Sybil-plus-flash-loan addendum (Issue #809, Update)
+
+Splitting a balance `B` across `N` addresses yields a combined quadratic
+weight of `N·isqrt(B/N) ≈ sqrt(B)·sqrt(N)` — a `sqrt(N)` multiplier over
+voting from one address. This is inherent to concave weight functions, not a
+bug in `isqrt`. Post–Issue #805, every Sybil needs its own balance checkpoint
+predating the proposal by `MIN_VOTE_HOLD_LEDGERS` and only carries
+`min(checkpoint, current)`, so a flash-funded swarm cannot materialise inside
+one transaction; the slow (pre-funded, aged) variant pays linear per-address
+costs for a sublinear gain. No additional per-transaction/per-block cap was
+added — the checkpoint-aging rule is the rate limit. Full cost model:
+[`governance-security-summary.md` §6](../governance-security-summary.md#6-quadratic-sybil-plus-flash-loan-cost-model-issue-809).
+
 ## Mainnet Launch Recommendation (Update)
 
 After modelling outcomes with a synthetic realistic token distribution (a power-law resembling typical early-protocol holder concentration), we confirmed that quadratic voting effectively reduces whale dominance (e.g., compressing a 50% dominance down to ~13%) without disenfranchising them entirely.

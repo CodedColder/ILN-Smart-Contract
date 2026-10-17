@@ -26,6 +26,7 @@ for dir in "${CONTRACT_DIRS[@]}"; do
     --include='*.rs' \
     | grep -v 'test\.rs' \
     | grep -v '_test\.rs' \
+    | grep -v 'tests_' \
     | grep -v 'tests/' \
     | grep -v '#\[allow(' \
     || true)

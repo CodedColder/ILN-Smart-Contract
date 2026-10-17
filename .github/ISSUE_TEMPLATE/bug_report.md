@@ -24,3 +24,7 @@ labels: bug
 ### Error code (if applicable)
 
 ### Additional context
+
+---
+
+<!-- Support: see docs/support-channels.md for live help paths. Do not use public issues for security reports — see SECURITY.md. -->

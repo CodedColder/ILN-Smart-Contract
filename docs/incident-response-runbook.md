@@ -211,3 +211,7 @@ This runbook is the coordinator. Each of the following is a **sub-procedure** in
 | [upgrade-guide.md](upgrade-guide.md) | [§6](#6-response-by-incident-class), [§10](#10-recovery-and-re-opening) | Contract upgrade / in-place rollback mechanics for the non-emergency fix path. |
 | [deployment-secrets.md](deployment-secrets.md) | [§6](#6-response-by-incident-class) | Secret custody and the rotation procedure on exposure. |
 | [postmortem-template.md](postmortem-template.md) | [§11](#11-post-incident-review) | The blameless post-incident review structure. |
+
+
+## Audit Findings
+If responding to a newly disclosed audit finding, consult the [Contract Pause Authority Policy](audit-finding-pause-policy.md) to determine if a full pause is warranted.

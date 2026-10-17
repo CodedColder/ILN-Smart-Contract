@@ -9,6 +9,8 @@
 //! - `mint(to, amount)` — fund a wallet without any authorization check.
 //! - `fail_next_transfer()` — arm a one-shot flag that causes the very next
 //!   `transfer()` call to panic, simulating a token transfer failure.
+//! - `authorized(id)` / `set_authorized(id, flag)` — SAC-style trustline
+//!   authorization (Issues #1072/#1073). Everyone is authorized by default.
 
 #![allow(dead_code)]
 
@@ -22,6 +24,8 @@ enum MockTokenKey {
     Balance(Address),
     /// One-shot flag: next transfer() call will panic.
     FailNext,
+    /// Present when `id` has been deauthorized (frozen).
+    Frozen(Address),
 }
 
 // ── Contract struct ───────────────────────────────────────────────────────────
@@ -157,6 +161,22 @@ impl MockToken {
     /// Returns the token symbol.
     pub fn symbol(env: Env) -> soroban_sdk::String {
         soroban_sdk::String::from_str(&env, "MCK")
+    }
+
+    /// SAC-compatible authorization flag; `true` unless frozen.
+    pub fn authorized(env: Env, id: Address) -> bool {
+        !env.storage().persistent().has(&MockTokenKey::Frozen(id))
+    }
+
+    /// SAC-compatible freeze/unfreeze (no admin check in this mock).
+    pub fn set_authorized(env: Env, id: Address, authorize: bool) {
+        if authorize {
+            env.storage().persistent().remove(&MockTokenKey::Frozen(id));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&MockTokenKey::Frozen(id), &true);
+        }
     }
 
     // ── Mock-specific helpers ─────────────────────────────────────────────────

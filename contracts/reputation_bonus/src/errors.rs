@@ -12,4 +12,5 @@ pub enum ContractError {
     ConfigErrorInvalidMinDiscountRate = 6,
     RateErrorArithmeticUnderflow = 7,
     RateErrorArithmeticOverflow = 8,
+    ConfigErrorInvalidHighRepThreshold = 9,
 }

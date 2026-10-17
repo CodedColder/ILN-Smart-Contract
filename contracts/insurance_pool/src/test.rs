@@ -953,7 +953,10 @@ fn coverage_change_cancel_resubmit_restarts_timelock() {
     // The new eta MUST be fresh from current time, not influenced by the first
     let current_time = s.env.ledger().timestamp();
     assert_eq!(eta2, current_time + TIMELOCK_DELAY_SECONDS);
-    assert_eq!(eta1, eta2, "timelock restart should produce the same eta when ledger time hasn't advanced");
+    assert_eq!(
+        eta1, eta2,
+        "timelock restart should produce the same eta when ledger time hasn't advanced"
+    );
 }
 
 #[test]
@@ -968,7 +971,8 @@ fn coverage_change_rapid_cancel_cycles_cannot_bypass_timelock() {
 
         assert_eq!(
             eta, expected_eta,
-            "cycle {} must have fresh timelock delay", cycle
+            "cycle {} must have fresh timelock delay",
+            cycle
         );
 
         // Always cancel before resubmitting
@@ -1017,7 +1021,10 @@ fn admin_transfer_cancel_resubmit_restarts_timelock() {
     // The new eta must be fresh
     let current_time = s.env.ledger().timestamp();
     assert_eq!(eta2, current_time + TIMELOCK_DELAY_SECONDS);
-    assert_eq!(eta1, eta2, "admin transfer timelock restart should produce the same eta");
+    assert_eq!(
+        eta1, eta2,
+        "admin transfer timelock restart should produce the same eta"
+    );
 }
 
 #[test]
@@ -1032,7 +1039,8 @@ fn admin_transfer_rapid_cancel_cycles_cannot_bypass_timelock() {
 
         assert_eq!(
             eta, expected_eta,
-            "admin transfer cycle {} must have fresh timelock delay", cycle
+            "admin transfer cycle {} must have fresh timelock delay",
+            cycle
         );
 
         // Always cancel before proposing the next admin
@@ -1066,11 +1074,17 @@ fn mixed_coverage_and_admin_cancel_cycles_are_independent() {
 
     // Re-propose coverage change — should get a fresh ETA
     let coverage_eta_new = s.client.propose_coverage_change(&new_coverage);
-    assert_eq!(coverage_eta_new, s.env.ledger().timestamp() + TIMELOCK_DELAY_SECONDS);
+    assert_eq!(
+        coverage_eta_new,
+        s.env.ledger().timestamp() + TIMELOCK_DELAY_SECONDS
+    );
 
     // The admin transfer ETA remains unchanged (it wasn't cancelled)
     let (pending_admin, stored_eta) = s.client.get_pending_admin().unwrap();
-    assert_eq!(stored_eta, admin_eta, "uncancelled admin transfer ETA must not change");
+    assert_eq!(
+        stored_eta, admin_eta,
+        "uncancelled admin transfer ETA must not change"
+    );
     assert_eq!(pending_admin, new_admin);
 
     // Advance to just before the original admin transfer ETA and verify
@@ -1150,7 +1164,8 @@ fn stress_test_insurance_pool_adverse_selection_scenario() {
     let balance_after_claims = s.client.get_pool_balance();
     assert!(
         balance_after_claims >= 0,
-        "pool balance must never go negative; got {}", balance_after_claims
+        "pool balance must never go negative; got {}",
+        balance_after_claims
     );
 
     // Verify pool degradation is bounded by the pro-rata capping
@@ -1209,7 +1224,10 @@ fn insurance_pool_handles_sequential_mass_enrollment_and_claims() {
 
     // After all enrollments, verify pool health is still positive
     let health_before_claims = s.client.get_pool_health();
-    assert!(health_before_claims.balance > 0, "pool should be funded after enrollments");
+    assert!(
+        health_before_claims.balance > 0,
+        "pool should be funded after enrollments"
+    );
     assert!(
         health_before_claims.enrolled_lp_count > 0,
         "should have enrolled LPs"
@@ -1271,7 +1289,9 @@ fn solvency_circuit_trips_and_blocks_claim_but_not_premiums() {
     let res2 = s.client.try_claim(&2, &s.lp);
     assert_eq!(
         res2,
-        Err(Ok(soroban_sdk::Error::from(InsuranceError::SolvencyCircuitOpen)))
+        Err(Ok(soroban_sdk::Error::from(
+            InsuranceError::SolvencyCircuitOpen
+        )))
     );
 }
 
@@ -1414,7 +1434,9 @@ fn review_window_requires_evidence_before_payout() {
     let res = s.client.try_claim(&1, &s.lp);
     assert_eq!(
         res,
-        Err(Ok(soroban_sdk::Error::from(InsuranceError::EvidenceRequired)))
+        Err(Ok(soroban_sdk::Error::from(
+            InsuranceError::EvidenceRequired
+        )))
     );
 
     // Submit evidence; window starts ticking from submission.
@@ -1426,7 +1448,9 @@ fn review_window_requires_evidence_before_payout() {
     let res = s.client.try_claim(&1, &s.lp);
     assert_eq!(
         res,
-        Err(Ok(soroban_sdk::Error::from(InsuranceError::ReviewWindowNotElapsed)))
+        Err(Ok(soroban_sdk::Error::from(
+            InsuranceError::ReviewWindowNotElapsed
+        )))
     );
 
     // After the window elapses -> payout proceeds.

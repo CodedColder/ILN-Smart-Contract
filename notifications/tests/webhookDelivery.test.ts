@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { WebhookDeliveryService, type HttpClient } from '../src/delivery/webhookDelivery';
 import { DeliveryHistoryStore } from '../src/delivery/deliveryHistory';
+import { stubDnsResolver } from './helpers/dns';
 
 function makeService(http: HttpClient, now?: () => number) {
-  return new WebhookDeliveryService({ http, now });
+  return new WebhookDeliveryService({ http, now, dnsResolver: stubDnsResolver });
 }
 
 describe('WebhookDeliveryService', () => {
@@ -50,6 +51,7 @@ describe('WebhookDeliveryService', () => {
       http,
       now: () => t,
       limiterOptions: { maxRequests: 2, windowMs: 1000 },
+      dnsResolver: stubDnsResolver,
     });
     const noisy = { id: 'noisy', url: 'https://hook.example/noisy', secret: 's' };
     const quiet = { id: 'quiet', url: 'https://hook.example/quiet', secret: 's' };

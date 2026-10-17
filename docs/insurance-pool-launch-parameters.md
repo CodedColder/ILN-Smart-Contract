@@ -178,7 +178,7 @@ Approve this proposal to enable insurance pool operations on mainnet."
 
 2. **Payout Priority:** If multiple LPs default simultaneously and pool balance is insufficient, clarify the claim priority (FIFO, pro-rata, or risk-weighted).
 
-3. **LP Reputation Integration:** Clarify whether an LP's payer reputation score influences their premium rate or coverage tier.
+3. ~~**LP Reputation Integration:** Clarify whether an LP's payer reputation score influences their premium rate or coverage tier.~~ **Resolved by ADR-015:** Higher reputation scores reduce the effective default count used for premium pricing. See `docs/adr/ADR-015-reputation-premium-integration.md`.
 
 4. **Governance Parameter Updates:** Confirm the process for governance to adjust `base_premium_rate_bps`, `risk_multiplier`, or `coverage_cap` without requiring a re-deployment.
 

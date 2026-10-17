@@ -85,6 +85,7 @@ source .contracts-local.env
 | `SOROBAN_RPC_URL` | `scripts/smoke-test.ts`, migration scripts | `https://soroban-testnet.stellar.org` | RPC endpoint for smoke tests or migration helpers. Use `http://localhost:8000` for local quickstart. |
 | `NETWORK_PASSPHRASE` | `scripts/smoke-test.ts`, migration scripts | Stellar testnet passphrase | Network passphrase for the target chain. Local standalone passphrase is `Standalone Network ; February 2021`. |
 | `CONTRACT_ID` | `scripts/smoke-test.ts` | none | Contract ID to smoke test. Usually set to `$INVOICE_LIQUIDITY_ID`. |
+| `DISTRIBUTION_CONTRACT_ID` | `scripts/smoke-test.ts` | none | Optional. Set to `$ILN_DISTRIBUTION_ID` to also run the governance-token SAC-admin check (`verify_mint_authority()`, Issue #861); the check is skipped when unset. |
 | `ADMIN_SECRET` | `scripts/migrate-v1-v2.ts` | none | Secret key for the admin account authorized to migrate contracts. Do not commit this value. |
 | `V1_WASM` | `scripts/migrate-v1-v2.ts` | none | Path to the previous WASM when testing migrations. |
 | `V2_WASM` | `scripts/migrate-v1-v2.ts` | none | Path to the new WASM when testing migrations. |

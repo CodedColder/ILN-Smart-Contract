@@ -3,10 +3,7 @@
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    contract, contractimpl,
-    testutils::Address as _,
-    token::Client as TokenClient,
-    Address, Env,
+    contract, contractimpl, testutils::Address as _, token::Client as TokenClient, Address, Env,
 };
 
 #[contract]
@@ -25,20 +22,24 @@ impl MockIln {
         payer: Address,
         on_time: bool,
     ) {
-        IlnDistributionClient::new(&env, &dist).accrue_settlement(
-            &freelancer,
-            &payer,
-            &on_time,
-        );
+        IlnDistributionClient::new(&env, &dist).accrue_settlement(&freelancer, &payer, &on_time);
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum DistEvent {
-    AccrueLp { amount: i128 },
-    AccrueSettlement { on_time: bool },
+    AccrueLp {
+        amount: i128,
+    },
+    AccrueSettlement {
+        on_time: bool,
+    },
     ClaimTokens,
-    UpdateRates { lp_rate: i128, freelancer_rate: i128, payer_rate: i128 },
+    UpdateRates {
+        lp_rate: i128,
+        freelancer_rate: i128,
+        payer_rate: i128,
+    },
 }
 
 fn dist_event_strategy() -> impl Strategy<Value = DistEvent> {
@@ -46,9 +47,18 @@ fn dist_event_strategy() -> impl Strategy<Value = DistEvent> {
         (0i128..=2_000_000_000_000i128).prop_map(|amount| DistEvent::AccrueLp { amount }),
         any::<bool>().prop_map(|on_time| DistEvent::AccrueSettlement { on_time }),
         Just(DistEvent::ClaimTokens),
-        (0i128..=100_000_000i128, 0i128..=100_000_000i128, 0i128..=100_000_000i128).prop_map(
-            |(lp_rate, freelancer_rate, payer_rate)| DistEvent::UpdateRates { lp_rate, freelancer_rate, payer_rate }
-        ),
+        (
+            0i128..=100_000_000i128,
+            0i128..=100_000_000i128,
+            0i128..=100_000_000i128
+        )
+            .prop_map(
+                |(lp_rate, freelancer_rate, payer_rate)| DistEvent::UpdateRates {
+                    lp_rate,
+                    freelancer_rate,
+                    payer_rate
+                }
+            ),
     ]
 }
 

@@ -3,10 +3,7 @@
 use proptest::prelude::*;
 use reputation_bonus::config::Config;
 use reputation_bonus::{ReputationBonusContract, ReputationBonusContractClient};
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, Env,
-};
+use soroban_sdk::{testutils::Address as _, Address, Env};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepBonusEvent {
@@ -23,7 +20,9 @@ fn rep_bonus_event_strategy() -> impl Strategy<Value = RepBonusEvent> {
     ]
 }
 
-fn setup_reputation_bonus_env(env: &Env) -> (ReputationBonusContractClient<'static>, Address, Address) {
+fn setup_reputation_bonus_env(
+    env: &Env,
+) -> (ReputationBonusContractClient<'static>, Address, Address) {
     env.mock_all_auths();
     let admin = Address::generate(env);
     let contract_id = env.register_contract(None, ReputationBonusContract);
@@ -65,9 +64,7 @@ proptest! {
                         &1800000000,
                         &500,
                     );
-                    if let Ok(invoice) = inv {
-                        pending_invoices.push(invoice.id);
-                    }
+                    pending_invoices.push(inv.id);
                 }
                 RepBonusEvent::Pay => {
                     let id = if let Some(invoice_id) = pending_invoices.pop() {
@@ -79,7 +76,7 @@ proptest! {
                             &1000,
                             &1800000000,
                             &500,
-                        ).unwrap();
+                        );
                         inv.id
                     };
                     let _ = client.mark_paid(&id);
@@ -94,7 +91,7 @@ proptest! {
                             &1000,
                             &1800000000,
                             &500,
-                        ).unwrap();
+                        );
                         inv.id
                     };
                     let _ = client.handle_default(&id);
@@ -105,7 +102,7 @@ proptest! {
             for addr in &[&freelancer, &payer] {
                 let rep = client.get_reputation(addr);
                 prop_assert!(rep.score <= 100, "Reputation score exceeded 100: {}", rep.score);
-                prop_assert!(rep.score >= 0, "Reputation score went negative: {}", rep.score);
+                // score: u32 — cannot go negative; no >= 0 assertion needed (clippy absurd_extreme_comparisons)
 
                 // Detailed sanity check on score calculation
                 let expected_score = if rep.invoices_submitted > 0 {
