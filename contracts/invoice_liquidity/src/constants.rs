@@ -95,6 +95,24 @@ pub const TTL_MIN_LEDGERS_BEFORE_UPGRADE: u32 = 500_000;
 /// well above any realistic quorum.
 pub const MAX_PRICE_SOURCES_PER_FEED: u32 = 20;
 
+/// Issue #1047: maximum number of Identity oracles that may be registered for
+/// a single `OracleFeedType`'s multi-oracle quorum list.
+///
+/// `add_identity_oracle` appends to a per-feed `Vec` and `fund_invoice`'s
+/// oracle-gated path iterates that whole vector on every funding call,
+/// querying each registered oracle cross-contract. An unbounded list would
+/// make the per-invocation cost of the funding gate — and the number of
+/// `OracleFeederDisagreement` events a single call can emit — unbounded, so
+/// governance (or a compromised admin key) could grow a feed until funding
+/// exceeds Soroban's per-transaction resource limits and the payer-verified
+/// path fails for every token on that feed.
+///
+/// Capping the list bounds the worst-case loop cost and event fan-out to a
+/// fixed, measurable maximum. An N-of-M quorum needs only a handful of
+/// independent feeders to establish agreement, so the cap mirrors
+/// [`MAX_PRICE_SOURCES_PER_FEED`] and sits well above any realistic quorum.
+pub const MAX_IDENTITY_ORACLES_PER_FEED: u32 = 20;
+
 /// Issue #1082: number of the most-recent invoice IDs to sample during the
 /// pre-upgrade TTL check.  Bounded to cap the resource cost of the check;
 /// the most-recently-written invoices are the most likely to still be

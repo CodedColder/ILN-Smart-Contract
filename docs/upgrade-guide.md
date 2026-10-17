@@ -902,6 +902,157 @@ This is fail-closed and needs no funds recovery. See
 [token-safety.md](token-safety.md#upgrade-and-migration) for the pending-payout
 escrow introduced in the same release, and its rollback caveat.
 
+## Oracle Contracts: Feeder Authorization (Issue #1046)
+
+This change is scoped to the **external payer-verification oracle contract**,
+not `invoice_liquidity`. The ILN never calls the oracle's `update_verification`
+write path, so:
+
+- **invoice_liquidity**: no Wasm behavior change, no storage key/encoding change,
+  no new error code — **no migration required**. A plain `upgrade()` (or no
+  action at all) suffices.
+- **Oracle contracts**: if you operate a payer-verification oracle, its
+  `update_verification` must be authorization-gated on a persisted **feeder**
+  (operator) address (see
+  [oracle-integration.md](oracle-integration.md#authorizing-the-feeder-issue-1046)).
+
+Operator rollout steps:
+
+1. Deploy the updated oracle contract that persists a feeder and requires
+   `feeder.require_auth()` on `update_verification` (rejecting when unset).
+2. Configure the feeder address once at deployment (`set_feeder` in the
+   reference implementation) using the operator key — a dedicated key, not the
+   ILN admin key.
+3. Confirm `update_verification` rejects an unsigned/unauthorized call and a
+   call made before the feeder is configured.
+4. If the oracle was already registered with ILN, no re-registration is needed
+   — the interface version is unchanged; only the write path's authorization is
+   tightened.
+
+**Rollback caveat.** Reverting a conforming oracle back to an **unrestricted**
+`update_verification` re-opens the "anyone can mint funding eligibility" hole
+(Issue #1046). Do not roll back to an unauthorized oracle build while
+`require_oracle_verification = true`.
+
+## Oracle Feeder Disagreement: Multi-Oracle Quorum (Issue #1047)
+
+This change **is** in `invoice_liquidity` (unlike #1046, which was confined to
+the external oracle contract). It adds two `instance` storage keys
+(`IdentityOracles(feed_type)` and `IdentityQuorum`), five entry points, two error
+codes (79/80), and the `oracle_feeder_disagreement` event — but it is
+**opt-in and fail-safe**:
+
+- **Default behavior is unchanged.** An **empty** Identity-feeder list returns
+  `NotConfigured`, so `fund_invoice` runs the exact prior single-oracle path
+  (regression #1052 / duplicate #1053 / freshness #1050 / circuit-breaker checks
+  intact). `oracle_interface.rs` / `OracleInterface` v1 is untouched, so **no
+  re-registration of existing oracles** is needed. The default quorum is 1, so a
+  list without an explicit `set_identity_quorum` still only needs one agreement.
+- **No data-encoding migration.** The two new keys are absent on an upgraded
+  contract and read as "empty list" / "default quorum (1)" — a plain `upgrade()`
+  suffices; the storage version is unchanged. `IdentityOracles` is bounded by
+  `MAX_IDENTITY_ORACLES_PER_FEED` (20) and declared in `storage.rs`'s
+  `RESOURCE_ENVELOPE` (`identity_oracles_per_feed`).
+
+Operator rollout steps (optional — only to enable disagreement safety):
+
+1. Deploy an oracle contract that implements the **existing**
+   `get_payer_data` interface for each additional feeder (each feeder is an
+   independent deployment; no new method is required).
+2. Register each feeder with `add_identity_oracle(feed_type, oracle)` (admin,
+   rate-limited). Re-adding an existing feeder is a no-op; adding a genuinely
+   new one past 20 fails with `TooManyIdentityOracles`.
+3. Set the agreement threshold with `set_identity_quorum(quorum)` (admin,
+   rate-limited, valid range `[1, 20]`). Pick a quorum that tolerates one feeder
+   being offline (e.g. `2-of-3`), since a **quiet** feeder also withholds its
+   agreement.
+4. Verify reads with `get_identity_oracles` / `get_identity_quorum`, and monitor
+   the `oracle_feeder_disagreement` event — a burst means a feeder is stale,
+   misconfigured, or compromised and funding is failing closed.
+
+**Rollback caveat.** Removing feeders (`remove_identity_oracle`) or lowering
+`set_identity_quorum` back to 1 reverts the gate to the single-oracle trust
+model — reintroducing the single-point-of-failure #1047 addressed. Emptying the
+list entirely also re-enables the legacy single-oracle resolution chain.
+
+## Oracle Circuit-Breaker Auto-Recovery (Issue #1048)
+
+This change **is** in `invoice_liquidity`. It adds one persistent storage key
+(`OracleCircuitRecovery(feed_type, token)` → `CircuitRecoveryState`), two public
+read/entry points (`get_circuit_recovery_state`; `check_oracle_health` now also
+drives recovery), and the `oracle_circuit_recovered` event — but it is
+**fail-safe and needs no coordinated rollout**:
+
+- **No data-encoding migration.** `OracleCircuitRecovery` is absent on an
+  upgraded contract and reads as `None`; the recovery helper treats a missing
+  record as **fail-safe** (no auto-recovery). A plain `upgrade()` suffices; the
+  storage version is unchanged. An already-tripped breaker therefore still needs
+  the admin `reset_oracle_circuit` until it re-trips under the new code.
+- **Behavior change is confined to a tripped breaker.** While the breaker is
+  closed, `record_oracle_health` does no extra work (the recovery helper returns
+  immediately), so the funding happy path is unchanged. While it is tripped,
+  `check_oracle_health` (keeper path) can now clear it; `fund_invoice` still
+  rejects until then and `reset_oracle_circuit` still force-clears it.
+- **Anti-flapping preserved.** A single fresh query never recovers; recovery
+  needs `CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS` (3) consecutive fresh,
+  timestamp-advancing observations from the tripping oracle spanning at least
+  `CIRCUIT_RECOVERY_MIN_LEDGERS` (120) ledgers.
+
+Operator rollout steps:
+
+1. Deploy the upgraded `invoice_liquidity` WASM (`upgrade()`); no state
+   migration call is required.
+2. Ensure a **keeper** is calling `check_oracle_health(feed_type, token, payer)`
+   on a regular cadence — this is the permissionless path that drives
+   auto-recovery, so an outage nobody observes cannot auto-heal.
+3. Add `oracle_circuit_recovered` to your alerting (breaker cleared
+   automatically) and poll `get_circuit_recovery_state` to detect a **stuck**
+   recovery (e.g. keepers not running, or the tripping oracle replaced) that
+   still needs the admin `reset_oracle_circuit`.
+
+**Rollback caveat.** Rolling back the WASM restores the fully sticky breaker
+(admin reset only). No data migration is needed for the rollback either — the
+`OracleCircuitRecovery` key is simply ignored by the older code and removed the
+next time a breaker trips and recovers under the new code.
+
+## Oracle Gate-Failure Events (Issue #1049)
+
+This change **is** in `invoice_liquidity`. It adds one public entry point
+(`check_oracle_verification`) and one new event type
+(`OracleDataStaleRejected` / `oracle_stale_data_rejected`), and it extracts the
+existing identity gate into a shared helper — but it is **additive and
+behaviour-preserving**:
+
+- **No data-encoding migration and no new storage key.** The shared helper uses
+  the same `OracleHealth` / circuit-breaker state and the same checks in the same
+  order; no key, value encoding, error code, or TTL constant changed. A plain
+  `upgrade()` suffices; the storage version is unchanged.
+- **`fund_invoice` behavior is unchanged.** The gate still returns exactly the
+  errors it did before (`OracleDataStale`, `PayerUnverified`,
+  `OracleTimestampRegression`, `OracleDuplicateUpdate`, `OracleCircuitOpen`) with
+  the same precedence, and still rolls its own events back. The new entry point
+  is the only path whose failure events commit.
+- **New entry point is authorization-free.** `check_oracle_verification(feed_type,
+  token, payer)` is callable by anyone (mirroring `check_oracle_health`), and
+  grants no privilege: it runs the read-only gate and records the oracle health
+  snapshot.
+
+Operator rollout steps:
+
+1. Deploy the upgraded `invoice_liquidity` WASM (`upgrade()`); no state
+   migration call is required.
+2. Add `check_oracle_verification(feed_type, token, payer)` to your monitoring
+   cadence to observe *why* oracle-gated funding is failing — it returns an
+   `IdentityVerificationOutcome` (`Verified` / `Stale` / `QuorumDisagreement` /
+   `TimestampRegression` / `DuplicateUpdate` / `CircuitOpen` / `Unverified`).
+3. Add `oracle_stale_data_rejected` and `oracle_feeder_disagreement` to your
+   alerting; a burst means a feeder is stale, misconfigured, or compromised and
+   funding is failing closed.
+
+**Rollback caveat.** Rolling back the WASM removes the diagnostic entry point and
+the `oracle_stale_data_rejected` event; no data migration is needed (nothing new
+is persisted). Funding behavior is identical on both builds.
+
 ---
 
 **Document Prepared By:** DevOps & Security Team  

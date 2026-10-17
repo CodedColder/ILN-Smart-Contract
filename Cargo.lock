@@ -985,6 +985,7 @@ dependencies = [
  "rand 0.10.1",
  "reputation_bonus",
  "serde_json",
+ "soroban-env-host",
  "soroban-sdk",
 ]
 

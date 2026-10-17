@@ -64,6 +64,9 @@ Semantics:
 | `set_max_price_deviation_bps` | 120 (~10 min) | Oracle registry — **added by this audit** |
 | `set_twap_enabled` | 120 (~10 min) | Oracle registry — **added by this audit** |
 | `set_twap_window_ledgers` | 120 (~10 min) | Oracle registry — **added by this audit** |
+| `add_identity_oracle` | 120 (~10 min) | Oracle registry (Issue #1047) |
+| `remove_identity_oracle` | 120 (~10 min) | Oracle registry (Issue #1047) |
+| `set_identity_quorum` | 120 (~10 min) | Oracle registry (Issue #1047) |
 
 The cooldown constant for each function mirrors its category siblings
 (e.g. all oracle-registry config setters share the `set_price_oracle`
@@ -80,7 +83,8 @@ faster configuration surface through one setter than another.
 | `record_twap_sample` | High-frequency keeper operation: the TWAP accumulator only produces a meaningful windowed average if samples land regularly across the window. Clamping it to one call per cooldown would leave the window sparsely sampled and easily skewed by a single manipulated sample — gating it weakens, not strengthens, the TWAP path. |
 | `execute_proposal` (multisig) | Replaces per-function rate limits with stronger controls: N-of-M threshold signatures plus the `MULTISIG_WINDOW_LEDGERS` proposal expiry. A rate limit would additionally block legitimate rapid multi-step emergency responses already vetted by threshold. |
 | `initialize`, `initialize_multisig_admin` | One-shot bootstraps; a repeat call fails on the already-initialized guard. |
-| `check_oracle_health` | Keeper/verification path — it *records* the health data the circuit breaker consumes; limiting it would starve the breaker. Its mutation emits `oracle_health_recorded`/`oracle_circuit_tripped`. |
+| `check_oracle_health` | Keeper/verification path — it *records* the health data the circuit breaker consumes; limiting it would starve the breaker. Its mutation emits `oracle_health_recorded`/`oracle_circuit_tripped`. Since Issue #1048 it is also the permissionless path that drives half-open breaker **auto-recovery** (emitting `oracle_circuit_recovered`), so a rate limit would additionally delay recovery after a feeder outage. |
+| `check_oracle_verification` | Permissionless, never-erroring diagnostic (Issue #1049) that runs the full Identity gate and commits its failure events (`oracle_stale_data_rejected`, `oracle_feeder_disagreement`). Being a keeper/monitoring path like `check_oracle_health`, it is intentionally **not** rate-limited — a limit would blind monitors to a gate that is failing closed, and it mutates only the same health/breaker state the funding path already writes. |
 | User flows (`submit_invoice`, `fund_invoice`, `mark_paid`, `cancel_invoice`, `join_fund_queue`, `transfer_lp_position`, `pay_*`, `claim_*`, …) | Permissionless or role-gated by design (funder/payer/LP balances and invoice state machine provide the economic limits); they are not admin functions. |
 | All read-only views | No state mutation to protect. |
 

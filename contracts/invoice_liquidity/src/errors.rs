@@ -187,4 +187,15 @@ pub enum ContractError {
     /// duplicate (unchanged) updates cannot keep a stalled oracle looking live
     /// — and standing in for real verification — indefinitely.
     OracleDuplicateUpdate = 78,
+    /// Issue #1047: `add_identity_oracle` rejected because the feed already has
+    /// `MAX_IDENTITY_ORACLES_PER_FEED` Identity oracles registered in its
+    /// multi-oracle quorum list. Bounding the list bounds the per-invocation
+    /// cost of `fund_invoice`'s oracle-gated path and the number of
+    /// `OracleFeederDisagreement` events a single call can emit.
+    TooManyIdentityOracles = 79,
+    /// Issue #1047: `set_identity_quorum` rejected because the requested
+    /// threshold is `0` (which can never be meaningfully satisfied) or exceeds
+    /// `MAX_IDENTITY_ORACLES_PER_FEED` (more agreement than the list can ever
+    /// hold). A valid quorum is in `[1, MAX_IDENTITY_ORACLES_PER_FEED]`.
+    InvalidIdentityQuorum = 80,
 }

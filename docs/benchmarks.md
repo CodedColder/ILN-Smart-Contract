@@ -447,6 +447,155 @@ command below and add the printed `BENCHMARK` values to
 `contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
 entries.
 
+## Oracle feeder-update authorization cost (Issue #1046)
+
+Unlike the #1050/#1052/#1053 gates above — which live on `fund_invoice`'s read
+path — this issue's control lives on the **oracle contract's write path**:
+`update_verification`, the single entry point that can flip a payer to verified
+and thereby open `fund_invoice`'s oracle gate. The ILN never calls it, so the
+benchmark measures the oracle write path directly rather than a funding flow
+(see
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#13-authorize-oracle-feeder-updates-issue-1046)).
+
+**Before:** `update_verification` had no authorization — a bare storage write.
+Any caller could set any payer's verification status.
+
+**After:** the write reads the persisted feeder address, calls
+`feeder.require_auth()`, then writes. `benchmark_oracle_feeder_update_authorization`
+measures both shapes side by side in one run (the two-entry oracle fixture
+exposes the pre-#1046 unrestricted write and the #1046 authorized write), each
+asserted against the same absolute ceilings as the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | Path measured |
+| ---------------------------- | ------------- |
+| `oracle_feeder_update_unrestricted` | pre-#1046: bare write, no auth (baseline) |
+| `oracle_feeder_update_authorized` | post-#1046: feeder read + `require_auth()` + same write |
+
+The delta between the two rows is the cost of closing the "anyone can mint
+funding eligibility" hole; the absolute figure shows the authorized path still
+fits easily inside the per-invocation budget. Authorization correctness itself is
+covered under **real auth** (no `mock_all_auths`) by `oracle_integration_test.rs`
+(configured-feeder success, no-feeder rejection, unauthorized-signer rejection,
+feeder rotation) and on the funding path by the `test_1046_*` tests in
+`tests_oracle_freshness.rs`.
+
+**Migration note:** measurement-only addition — no `invoice_liquidity` behavior,
+storage layout, or baseline format changed (the change is confined to the
+external oracle contract). To record this as a tracked baseline, run the command
+below and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Multi-oracle Identity quorum cost (Issue #1047)
+
+Unlike #1046 (which lives on the oracle contract's write path), this issue's
+control lives on `fund_invoice`'s **read** path: instead of resolving one
+Identity oracle, the gate queries every registered Identity feeder and requires
+a configured quorum to agree. The cost of interest is therefore *per-feeder
+cross-contract calls* on the funding flow.
+
+**Before:** a single resolved Identity oracle — one cross-contract
+`get_payer_data` call per funded invoice.
+
+**After:** every registered feeder is queried via `try_invoke_contract`; the
+`N`-of-`M` decision adds one call per feeder. With an **empty** list nothing
+changes (the gate falls back to the single-oracle path, measured above).
+
+`benchmark_identity_quorum_verification_cost` measures both shapes side by side
+in one run (baseline single-oracle funding vs a three-feeder quorum of 3, all
+agreeing), each asserted against the same absolute ceilings as the rest of the
+file:
+
+| Benchmark (`BENCHMARK` name) | Path measured |
+| ---------------------------- | ------------- |
+| `identity_single_oracle` | pre-#1047: one resolved Identity oracle |
+| `identity_quorum_of_three` | post-#1047: three registered feeders, quorum 3 |
+
+The delta is the price of no longer trusting a single feeder, and the absolute
+figure shows even the three-feeder quorum fits comfortably inside the
+per-invocation budget. Quorum correctness itself (agreement met / disagreement
+fails closed / reverting feeder cannot force verification / ledger-boundary
+staleness / disagreement event / auth) is covered by the `test_identity_quorum_*`,
+`test_set_identity_quorum_*` and `test_add_identity_oracle_*` tests in
+`tests_oracle_registry.rs`.
+
+**Migration note:** the multi-oracle list is bounded by
+`MAX_IDENTITY_ORACLES_PER_FEED` (20), so the worst-case funding cost is bounded
+at 20 cross-contract calls. To record this as a tracked baseline, run the
+command below and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Circuit-breaker auto-recovery cost on the keeper path (Issue #1048)
+
+The oracle circuit breaker trips after `MAX_CONSECUTIVE_STALE_QUERIES` (3)
+consecutive stale responses and, before #1048, was **sticky** — cleared only by
+the governance-gated `reset_oracle_circuit`, so a transient feeder outage jammed
+oracle-gated funding even after the feeder recovered. Issue #1048 makes the
+breaker **half-open**: the permissionless `check_oracle_health` keeper path
+auto-clears it once the *tripping* oracle serves
+`CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS` (3) consecutive healthy (fresh +
+timestamp-advancing) observations spanning `CIRCUIT_RECOVERY_MIN_LEDGERS`
+(120) — see
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#15-recover-after-feeder-outage-issue-1048).
+
+**Before:** a keeper `check_oracle_health` observation did no recovery work —
+the breaker, once tripped, could not be affected by the keeper path at all.
+
+**After:** while a breaker is tripped, each observation from the tripping oracle
+costs one extra read + write of `CircuitRecoveryState`; the completing
+observation removes the recovery record and the tripped flag and emits
+`oracle_circuit_recovered`. `benchmark_oracle_circuit_auto_recovery` measures
+three points in one run, each asserted against the same absolute ceilings as the
+rest of the file:
+
+| Benchmark (`BENCHMARK` name) | Path measured |
+| ---------------------------- | ------------- |
+| `oracle_check_health_closed` | breaker **closed** — pre-#1048 baseline, no recovery work |
+| `oracle_circuit_recovery_streak` | breaker tripped, streak advances (extra recovery read + write) |
+| `oracle_circuit_recovery_complete` | breaker tripped, completion observation clears it (two removes + recovery event) |
+
+The small delta between the closed-breaker baseline and the tripped observations
+is the price of un-jamming a recovered feeder without waiting on a governance
+action; every figure sits far inside the per-invocation budget. Recovery
+correctness itself (sustained-health success, insufficient window, insufficient
+observation count, frozen oracle, mid-streak stale reset, different-oracle
+isolation, view tracking, recovery event, re-trip, reset clearing progress) is
+covered by the `test_circuit_auto_recovery_*` / `test_circuit_auto_recovers_*`
+tests in `tests_oracle_registry.rs`.
+
+## Verification diagnostic events cost (Issue #1049)
+
+`fund_invoice`'s Identity gate reports stale data / feeder disagreement by
+returning `Err`, and Soroban rolls every event of an `Err`-returning invocation
+back — so those failure signals never reached a ledger. Issue #1049 exposes the
+*same* gate through the permissionless, never-erroring
+`check_oracle_verification`, whose `oracle_stale_data_rejected` (new) and
+`oracle_feeder_disagreement` events commit — see
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#16-emit-stale-and-quorum-failure-events-issue-1049).
+
+**Before:** a rejected `fund_invoice` cost the same but left no observable
+failure signal (its events rolled back).
+
+**After:** the diagnostic adds the cost of running the gate plus the emitted
+failure event. `benchmark_oracle_verification_diagnostic_events` measures three
+points in one run, each asserted against the same absolute ceilings as the rest
+of the file:
+
+| Benchmark (`BENCHMARK` name) | Path measured |
+| ---------------------------- | ------------- |
+| `oracle_verification_verified` | passing verification — **no** failure event (pre-#1049 silent-success equivalent) |
+| `oracle_verification_stale_event` | stale data → emits `oracle_stale_data_rejected` |
+| `oracle_verification_quorum_disagreement_event` | quorum disagreement → emits `oracle_feeder_disagreement` |
+
+The delta between the verified baseline and the two failure figures is the price
+of making a rejected gate diagnosable. Correctness (success, stale event, quorum
+event, the funding-path rollback vs. diagnostic commit, ledger boundary,
+permissionless access, breaker interop) is covered by the
+`test_check_oracle_verification_*` /
+`test_fund_invoice_stale_rejection_events_roll_back_but_diagnostic_commits` tests
+in `tests_oracle_registry.rs`.
+
 ## Updating Baselines
 
 After an intentional optimisation or contract change:

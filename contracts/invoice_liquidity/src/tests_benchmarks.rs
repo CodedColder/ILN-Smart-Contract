@@ -61,7 +61,7 @@
 
 use super::*;
 use soroban_sdk::{
-    contract, contractimpl,
+    contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,
     Address, Env,
@@ -1369,4 +1369,430 @@ fn benchmark_fund_invoice_oracle_duplicate_frequency_gate() {
         MAX_CPU_INSTRUCTIONS,
         MAX_MEMORY_BYTES,
     );
+}
+
+// -----------------------------------------------------------------------
+// Issue #1046: oracle feeder-update authorization cost
+// -----------------------------------------------------------------------
+
+/// Oracle fixture for the feeder-update benchmark. Exposes both the pre-#1046
+/// unrestricted write (baseline) and the #1046 feeder-authorized write, so the
+/// cost the authorization adds is directly measurable.
+#[contract]
+struct BenchFeederOracle;
+
+#[contracttype]
+enum BenchFeederKey {
+    /// Authorized feeder (oracle operator) address.
+    Feeder,
+    /// Per-payer verification flag.
+    Verified(Address),
+}
+
+#[contractimpl]
+impl BenchFeederOracle {
+    /// Configure the authorized feeder address.
+    pub fn set_feeder(env: Env, feeder: Address) {
+        env.storage()
+            .persistent()
+            .set(&BenchFeederKey::Feeder, &feeder);
+    }
+
+    /// Pre-#1046 behaviour: unrestricted write, no authorization.
+    pub fn update_verification_unrestricted(env: Env, payer: Address, verified: bool) {
+        env.storage()
+            .persistent()
+            .set(&BenchFeederKey::Verified(payer), &verified);
+    }
+
+    /// Post-#1046 behaviour: feeder-authorized write.
+    pub fn update_verification(env: Env, payer: Address, verified: bool) {
+        let feeder: Address = match env
+            .storage()
+            .persistent()
+            .get(&BenchFeederKey::Feeder)
+        {
+            Some(f) => f,
+            None => panic!("feeder not configured"),
+        };
+        feeder.require_auth();
+        env.storage()
+            .persistent()
+            .set(&BenchFeederKey::Verified(payer), &verified);
+    }
+}
+
+/// Issue #1046 before/after. The ILN funding path is unchanged — the gate lives
+/// on the oracle's `update_verification` write path, which the ILN never calls.
+/// This benchmark measures that path directly: the unrestricted write that
+/// shipped before #1046 versus the feeder-authorized write that ships now (one
+/// feeder read + `require_auth()` + the same write). The delta is the cost of
+/// closing the "anyone can mint funding eligibility" hole; the absolute figure
+/// proves the authorized path still fits easily inside the per-invocation
+/// budget.
+#[test]
+fn benchmark_oracle_feeder_update_authorization() {
+    let bench = setup_benchmark_env();
+
+    let feeder = Address::generate(&bench.env);
+    let payer = Address::generate(&bench.env);
+
+    let oracle_id = bench.env.register_contract(None, BenchFeederOracle);
+    let client = BenchFeederOracleClient::new(&bench.env, &oracle_id);
+    client.set_feeder(&feeder);
+
+    // Pre-#1046 baseline: unrestricted write.
+    let (before_cpu, before_mem) = measure(&bench.env, "oracle_feeder_update_unrestricted", || {
+        client.update_verification_unrestricted(&payer, &true);
+    });
+
+    // Post-#1046: feeder-authorized write.
+    let (after_cpu, after_mem) = measure(&bench.env, "oracle_feeder_update_authorized", || {
+        client.update_verification(&payer, &true);
+    });
+
+    std::println!("\n| Feeder update path | CPU Instructions | Memory (bytes) |");
+    std::println!("| ------------------ | ---------------- | -------------- |");
+    std::println!("| unrestricted (before #1046) | {before_cpu} | {before_mem} |");
+    std::println!("| feeder-authorized (after #1046) | {after_cpu} | {after_mem} |");
+
+    assert_within_resource_budget(
+        "oracle_feeder_update_unrestricted",
+        before_cpu,
+        before_mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+    assert_within_resource_budget(
+        "oracle_feeder_update_authorized",
+        after_cpu,
+        after_mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+// -----------------------------------------------------------------------
+// Issue #1047: multi-oracle Identity quorum cost
+// -----------------------------------------------------------------------
+
+/// Identity feeder fixture: answers `get_payer_data` with a configurable
+/// verified flag and the current ledger as its data timestamp.
+#[contract]
+struct BenchQuorumOracle;
+
+#[contractimpl]
+impl BenchQuorumOracle {
+    pub fn interface_version(_env: Env) -> u32 {
+        crate::oracle_interface::ORACLE_INTERFACE_VERSION
+    }
+
+    pub fn set_verified(env: Env, verified: bool) {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("verified"), &verified);
+    }
+
+    pub fn get_payer_data(env: Env, _payer: Address) -> OracleVerificationResponse {
+        let is_verified: bool = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("verified"))
+            .unwrap_or(true);
+        OracleVerificationResponse {
+            is_verified,
+            timestamp: env.ledger().sequence(),
+        }
+    }
+}
+
+/// Advance the benchmark ledger past the registry admin-fn rate-limit cooldown
+/// so back-to-back `add_identity_oracle` registrations don't trip `RateLimited`.
+fn advance_benchmark_ledger(env: &Env) {
+    let mut info = env.ledger().get();
+    info.sequence_number += DEFAULT_RATE_LIMIT_LEDGERS + 30;
+    info.timestamp += (DEFAULT_RATE_LIMIT_LEDGERS + 30) as u64 * 5;
+    env.ledger().set(info);
+}
+
+/// Issue #1047 before/after. Records the cost of `fund_invoice`'s
+/// oracle-gated payer-verification path in the prior single-oracle mode
+/// (baseline) versus the new multi-oracle quorum mode (three feeders, quorum
+/// of 3). Both must fit comfortably inside the per-invocation budget; the
+/// delta is the price of no longer trusting a single feeder.
+#[test]
+fn benchmark_identity_quorum_verification_cost() {
+    let bench = setup_benchmark_env();
+
+    // Baseline (pre-#1047 single-oracle path): one registered Identity oracle.
+    let single = bench.env.register_contract(None, BenchQuorumOracle);
+    BenchQuorumOracleClient::new(&bench.env, &single).set_verified(&true);
+    bench
+        .contract
+        .register_oracle(&OracleFeedType::Identity, &single);
+    let baseline_invoice = submit_invoice_bench(&bench);
+
+    let (before_cpu, before_mem) = measure(&bench.env, "identity_single_oracle", || {
+        bench
+            .contract
+            .fund_invoice(&bench.lp, &baseline_invoice, &BENCH_INVOICE_AMOUNT, &true);
+    });
+
+    // Multi-oracle quorum (#1047): three Identity feeders, all agreeing.
+    let mut oracles = [Address::generate(&bench.env); 3];
+    for (i, oracle) in oracles.iter_mut().enumerate() {
+        if i > 0 {
+            advance_benchmark_ledger(&bench.env);
+        }
+        let id = bench.env.register_contract(None, BenchQuorumOracle);
+        BenchQuorumOracleClient::new(&bench.env, &id).set_verified(&true);
+        bench
+            .contract
+            .add_identity_oracle(&OracleFeedType::Identity, &id);
+        *oracle = id;
+    }
+    bench.contract.set_identity_quorum(&3);
+    let quorum_invoice = submit_invoice_bench(&bench);
+
+    let (after_cpu, after_mem) = measure(&bench.env, "identity_quorum_of_three", || {
+        bench
+            .contract
+            .fund_invoice(&bench.lp, &quorum_invoice, &BENCH_INVOICE_AMOUNT, &true);
+    });
+
+    std::println!("\n| Identity verification path | CPU Instructions | Memory (bytes) |");
+    std::println!("| -------------------------- | ---------------- | -------------- |");
+    std::println!("| single oracle (before #1047) | {before_cpu} | {before_mem} |");
+    std::println!("| 3-of-3 quorum (after #1047) | {after_cpu} | {after_mem} |");
+
+    assert_within_resource_budget(
+        "identity_single_oracle",
+        before_cpu,
+        before_mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+    assert_within_resource_budget(
+        "identity_quorum_of_three",
+        after_cpu,
+        after_mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+}
+
+// -----------------------------------------------------------------------
+// Issue #1048: circuit-breaker auto-recovery cost on the keeper path
+// -----------------------------------------------------------------------
+
+/// Issue #1048 before/after. **Before**, a tripped oracle circuit breaker was
+/// sticky: a transient feeder outage jammed oracle-gated `fund_invoice` until a
+/// (slow) governance `reset_oracle_circuit`, even after the feeder recovered.
+/// **After**, the breaker is half-open — the permissionless `check_oracle_health`
+/// keeper path auto-clears it once the *tripping* oracle serves
+/// `CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS` consecutive healthy (fresh +
+/// timestamp-advancing) observations spanning `CIRCUIT_RECOVERY_MIN_LEDGERS`.
+///
+/// This benchmark isolates the marginal cost that recovery bookkeeping adds to
+/// the keeper path. The baseline is a `check_oracle_health` observation taken
+/// with the breaker **closed** (no recovery work — the pre-#1048 shape). The
+/// two subsequent figures are the same call while the breaker is **tripped**:
+/// a steady-state streak observation (one extra read + write of
+/// `CircuitRecoveryState`) and the completion observation that clears the
+/// breaker (two removes + the `oracle_circuit_recovered` event). The small
+/// delta is the price of un-jamming a recovered feeder without waiting on
+/// governance; every figure must stay inside the per-invocation budget.
+#[test]
+fn benchmark_oracle_circuit_auto_recovery() {
+    let bench = setup_benchmark_env();
+
+    // Small explicit window so the boundary ages are easy to reason about.
+    let max_age: u64 = 10;
+    bench.contract.set_max_oracle_age(&max_age).unwrap();
+
+    let oracle_id = bench.env.register_contract(None, BenchTimestampedOracle);
+    let oracle_client = BenchTimestampedOracleClient::new(&bench.env, &oracle_id);
+    bench.contract.set_price_oracle(&oracle_id).unwrap();
+
+    // Baseline: a keeper observation with the breaker *closed* — no recovery
+    // bookkeeping runs, matching the pre-#1048 path exactly.
+    oracle_client.set_timestamp(&bench.env.ledger().sequence());
+    let (closed_cpu, closed_mem) = measure(&bench.env, "oracle_check_health_closed", || {
+        bench.contract.check_oracle_health(
+            &OracleFeedType::Identity,
+            &bench.token,
+            &bench.payer,
+        );
+    });
+
+    // Trip the breaker: three stale observations (timestamp 0, far outside the
+    // window) through the same permissionless keeper path.
+    oracle_client.set_timestamp(&0);
+    for _ in 0..crate::oracle_registry::MAX_CONSECUTIVE_STALE_QUERIES {
+        bench
+            .contract
+            .check_oracle_health(&OracleFeedType::Identity, &bench.token, &bench.payer);
+    }
+    assert!(
+        bench
+            .contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &bench.token),
+        "setup must leave the Identity breaker tripped"
+    );
+
+    let needed = crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS;
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+
+    // First healthy observation while tripped starts the recovery streak; then
+    // a spaced observation gives the steady-state streak cost (extra read +
+    // write of the recovery record, breaker still open because the ledger
+    // window is only satisfied once).
+    oracle_client.set_timestamp(&bench.env.ledger().sequence());
+    bench
+        .contract
+        .check_oracle_health(&OracleFeedType::Identity, &bench.token, &bench.payer);
+    advance_ledgers(&bench.env, window);
+    oracle_client.set_timestamp(&bench.env.ledger().sequence());
+    let (streak_cpu, streak_mem) = measure(&bench.env, "oracle_circuit_recovery_streak", || {
+        bench
+            .contract
+            .check_oracle_health(&OracleFeedType::Identity, &bench.token, &bench.payer);
+    });
+
+    // Remaining in-between observations (unmeasured) bring the streak up to
+    // `needed - 1` without completing — the final observation below is the one
+    // that clears the breaker.
+    for _ in 2..(needed - 1) {
+        advance_ledgers(&bench.env, window);
+        oracle_client.set_timestamp(&bench.env.ledger().sequence());
+        bench
+            .contract
+            .check_oracle_health(&OracleFeedType::Identity, &bench.token, &bench.payer);
+    }
+
+    // Final healthy observation after another full window completes the streak
+    // (`needed` observations AND >= `window` ledgers elapsed): the breaker is
+    // cleared (two removes + `oracle_circuit_recovered`).
+    advance_ledgers(&bench.env, window);
+    oracle_client.set_timestamp(&bench.env.ledger().sequence());
+    let (done_cpu, done_mem) = measure(&bench.env, "oracle_circuit_recovery_complete", || {
+        bench
+            .contract
+            .check_oracle_health(&OracleFeedType::Identity, &bench.token, &bench.payer);
+    });
+    assert!(
+        !bench
+            .contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &bench.token),
+        "the completion observation must auto-recover the breaker"
+    );
+
+    std::println!("\n| Circuit recovery path (per keeper observation) | CPU Instructions | Memory (bytes) |");
+    std::println!("| --------------------------------------------- | ---------------- | -------------- |");
+    std::println!("| breaker closed (before #1048 baseline) | {closed_cpu} | {closed_mem} |");
+    std::println!("| tripped, streak advances (after #1048) | {streak_cpu} | {streak_mem} |");
+    std::println!("| tripped, completion clears breaker (after #1048) | {done_cpu} | {done_mem} |");
+
+    for (name, cpu, mem) in [
+        ("oracle_check_health_closed", closed_cpu, closed_mem),
+        ("oracle_circuit_recovery_streak", streak_cpu, streak_mem),
+        ("oracle_circuit_recovery_complete", done_cpu, done_mem),
+    ] {
+        assert_within_resource_budget(
+            name,
+            cpu,
+            mem,
+            MAX_CPU_INSTRUCTIONS,
+            MAX_MEMORY_BYTES,
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
+// Issue #1049: cost of the stale + quorum failure events
+// -----------------------------------------------------------------------
+
+/// Issue #1049 before/after. **Before**, a rejected `fund_invoice` detected
+/// stale data or feeder disagreement but reported it by returning `Err`, and
+/// Soroban rolls every event of an `Err`-returning invocation back — so the
+/// failure left no on-chain trace. **After**, the shared gate is also exposed
+/// as the permissionless `check_oracle_verification` diagnostic, whose
+/// `oracle_stale_data_rejected` and `oracle_feeder_disagreement` events commit.
+///
+/// This measures the diagnostic's cost in three states: a *passing*
+/// verification (no failure event — the pre-#1049 equivalent of a silent
+/// success), a *stale* rejection that emits `OracleDataStaleRejected`, and a
+/// *quorum disagreement* that emits `OracleFeederDisagreement`. The delta is
+/// the price of making those failures observable; each figure must stay inside
+/// the per-invocation budget.
+#[test]
+fn benchmark_oracle_verification_diagnostic_events() {
+    let bench = setup_benchmark_env();
+    let max_age: u64 = 10;
+    bench.contract.set_max_oracle_age(&max_age).unwrap();
+
+    // Baseline: fresh, verified single oracle → Verified, no failure event.
+    let oracle = bench.env.register_contract(None, BenchTimestampedOracle);
+    let oracle_client = BenchTimestampedOracleClient::new(&bench.env, &oracle);
+    oracle_client.set_timestamp(&bench.env.ledger().sequence());
+    bench
+        .contract
+        .register_oracle(&OracleFeedType::Identity, &oracle);
+    let (ok_cpu, ok_mem) = measure(&bench.env, "oracle_verification_verified", || {
+        bench
+            .contract
+            .check_oracle_verification(&OracleFeedType::Identity, &bench.token, &bench.payer);
+    });
+
+    // Stale rejection → emits `oracle_stale_data_rejected`. A single observation
+    // stays below MAX_CONSECUTIVE_STALE_QUERIES, so the breaker is still closed.
+    advance_ledgers(&bench.env, (max_age as u32) + 10);
+    let (stale_cpu, stale_mem) = measure(&bench.env, "oracle_verification_stale_event", || {
+        bench
+            .contract
+            .check_oracle_verification(&OracleFeedType::Identity, &bench.token, &bench.payer);
+    });
+
+    // Quorum disagreement → emits `oracle_feeder_disagreement`: three feeders,
+    // two agreeing, quorum of three. Fresh timestamps, so only the disagreement
+    // is at issue.
+    for i in 0..3u32 {
+        if i > 0 {
+            advance_benchmark_ledger(&bench.env);
+        }
+        let id = bench.env.register_contract(None, BenchQuorumOracle);
+        BenchQuorumOracleClient::new(&bench.env, &id).set_verified(&(i < 2));
+        bench
+            .contract
+            .add_identity_oracle(&OracleFeedType::Identity, &id);
+    }
+    bench.contract.set_identity_quorum(&3);
+    let (disagree_cpu, disagree_mem) =
+        measure(&bench.env, "oracle_verification_quorum_disagreement_event", || {
+            bench
+                .contract
+                .check_oracle_verification(&OracleFeedType::Identity, &bench.token, &bench.payer);
+        });
+
+    std::println!(
+        "\n| Verification diagnostic path (Issue #1049) | CPU Instructions | Memory (bytes) |"
+    );
+    std::println!("| ------------------------------------------ | ---------------- | -------------- |");
+    std::println!("| verified, no failure event (baseline) | {ok_cpu} | {ok_mem} |");
+    std::println!("| stale → OracleDataStaleRejected | {stale_cpu} | {stale_mem} |");
+    std::println!(
+        "| quorum disagreement → OracleFeederDisagreement | {disagree_cpu} | {disagree_mem} |"
+    );
+
+    for (name, cpu, mem) in [
+        ("oracle_verification_verified", ok_cpu, ok_mem),
+        ("oracle_verification_stale_event", stale_cpu, stale_mem),
+        (
+            "oracle_verification_quorum_disagreement_event",
+            disagree_cpu,
+            disagree_mem,
+        ),
+    ] {
+        assert_within_resource_budget(name, cpu, mem, MAX_CPU_INSTRUCTIONS, MAX_MEMORY_BYTES);
+    }
 }

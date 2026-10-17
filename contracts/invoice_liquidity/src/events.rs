@@ -89,6 +89,23 @@ pub struct OracleCircuitReset {
     pub token: Address,
 }
 
+/// Issue #1048: emitted when a tripped oracle circuit breaker auto-recovers
+/// (half-open → closed) after the oracle that caused the trip served a
+/// *sustained* run of fresh, timestamp-advancing responses — see
+/// `oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS` /
+/// `CIRCUIT_RECOVERY_MIN_LEDGERS`. Distinct from `OracleCircuitReset`, which is
+/// the governance fast-path clear. `healthy_observations` is the length of the
+/// qualifying streak and `elapsed_ledgers` the number of ledgers it spanned.
+/// The message is `symbol!("oracle_circuit_recovered")`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleCircuitRecovered {
+    pub feed_type: OracleFeedType,
+    pub token: Address,
+    pub healthy_observations: u32,
+    pub elapsed_ledgers: u64,
+}
+
 /// Emitted when a price source is added to a feed type's multi-source list
 /// (Issue #price-deviation).
 #[contracttype]
@@ -104,6 +121,70 @@ pub struct PriceSourceAdded {
 pub struct PriceSourceRemoved {
     pub feed_type: OracleFeedType,
     pub oracle: Address,
+}
+
+/// Issue #1047: emitted when an Identity oracle is added to a feed type's
+/// multi-oracle quorum list, so `fund_invoice` will consult it (alongside the
+/// others) and require N-of-M agreement on payer verification.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdentityOracleAdded {
+    pub feed_type: OracleFeedType,
+    pub oracle: Address,
+}
+
+/// Issue #1047: emitted when an Identity oracle is removed from a feed type's
+/// multi-oracle quorum list.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdentityOracleRemoved {
+    pub feed_type: OracleFeedType,
+    pub oracle: Address,
+}
+
+/// Issue #1047: emitted when the registered Identity oracles fail to reach the
+/// configured quorum on a payer's verification during oracle-gated funding —
+/// feeders disagreed (or too few responded fresh + verified), so the call fails
+/// closed. `verified_count` is how many agreed the payer was verified (with
+/// fresh data); `required_quorum` is the configured `N`; `total_oracles` is the
+/// size of the registered list. The message is
+/// `symbol!("oracle_feeder_disagreement")`, and the token identifies which
+/// resolution channel disagreed.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleFeederDisagreement {
+    pub feed_type: OracleFeedType,
+    pub token: Address,
+    pub verified_count: u32,
+    pub required_quorum: u32,
+    pub total_oracles: u32,
+}
+
+/// Issue #1049: emitted when oracle-gated payer verification is rejected
+/// because the oracle's data is **stale** — its `timestamp` is older than
+/// `max_age_ledgers` (or future-dated, which the shared freshness rule treats
+/// as stale). This is the *failure* signal, distinct from `OracleHealthRecorded`
+/// (a raw observation): it records the rejection reason and the exact bound
+/// that was exceeded.
+///
+/// `age_ledgers` is the saturating ledger distance (`current - data_timestamp`)
+/// — `0` when the data is future-dated. Compare `data_timestamp` against the
+/// ledger the event was emitted at to distinguish the two.
+///
+/// Because `fund_invoice` returns `Err(OracleDataStale)` and Soroban rolls back
+/// every write/event of a call that returns `Err`, this event only *survives*
+/// when emitted from a committed path — the permissionless
+/// `check_oracle_verification` diagnostic entrypoint. The message is
+/// `symbol!("oracle_stale_data_rejected")`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleDataStaleRejected {
+    pub feed_type: OracleFeedType,
+    pub token: Address,
+    pub oracle: Address,
+    pub data_timestamp: u32,
+    pub age_ledgers: u64,
+    pub max_age_ledgers: u64,
 }
 
 #[contracttype]

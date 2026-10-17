@@ -23,12 +23,15 @@
 use soroban_sdk::{contracttype, vec, Address, Env, IntoVal, Symbol};
 
 use crate::access::{check_rate_limit, require_admin};
-use crate::constants::{DEFAULT_RATE_LIMIT_LEDGERS, MAX_PRICE_SOURCES_PER_FEED};
+use crate::constants::{
+    DEFAULT_RATE_LIMIT_LEDGERS, MAX_IDENTITY_ORACLES_PER_FEED, MAX_PRICE_SOURCES_PER_FEED,
+};
 use crate::errors::ContractError;
 use crate::events::{
-    OracleCircuitReset, OracleCircuitTripped, OracleHealthRecorded, OracleRegistered,
-    OracleUnregistered, PriceOutlierRejected, PriceSourceAdded, PriceSourceRemoved,
-    TwapEnabledForFeed, TwapWindowUpdated, TwapInsufficientData,
+    IdentityOracleAdded, IdentityOracleRemoved, OracleCircuitRecovered, OracleCircuitReset,
+    OracleCircuitTripped, OracleDataStaleRejected, OracleFeederDisagreement, OracleHealthRecorded,
+    OracleRegistered, OracleUnregistered, PriceOutlierRejected, PriceSourceAdded,
+    PriceSourceRemoved, TwapEnabledForFeed, TwapInsufficientData, TwapWindowUpdated,
 };
 use crate::oracle_interface::{OracleClient, ORACLE_INTERFACE_VERSION};
 use crate::storage::DataKey;
@@ -52,6 +55,39 @@ pub const MAX_CONSECUTIVE_STALE_QUERIES: u32 = 3;
 /// stale streak, so the circuit breaker never trips and funding stays open on
 /// data that is no longer live. Mirrors [`MAX_CONSECUTIVE_STALE_QUERIES`].
 pub const MAX_CONSECUTIVE_DUPLICATE_UPDATES: u32 = 3;
+
+/// Issue #1048 — number of consecutive *healthy* (fresh, timestamp-advancing)
+/// observations the oracle that tripped the circuit breaker must serve before
+/// the breaker auto-recovers (half-open → closed). Mirrors
+/// [`MAX_CONSECUTIVE_STALE_QUERIES`]: recovery takes at least as many healthy
+/// observations as the trip took stale ones. A single fresh query is never
+/// enough (see [`maybe_recover_oracle_circuit`]).
+pub const CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS: u32 = 3;
+
+/// Issue #1048 — minimum number of ledgers that must elapse between the first
+/// healthy observation of a recovery streak and the auto-close. Together with
+/// [`CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS`] this makes recovery a *sustained*
+/// property (a proven-stable oracle over a real time window) rather than a
+/// single lucky poll, so a flapping oracle can't recover within one tick.
+pub const CIRCUIT_RECOVERY_MIN_LEDGERS: u64 = 120;
+
+/// Issue #1048: half-open recovery bookkeeping for a tripped circuit breaker.
+/// Records which oracle tripped the breaker (only *that* oracle may auto-recover
+/// it) and the progress of the current healthy-observation streak.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitRecoveryState {
+    /// The oracle whose staleness tripped the breaker. A *different* (even
+    /// healthy) oracle cannot auto-recover this breaker — see
+    /// [`maybe_recover_oracle_circuit`].
+    pub tripped_oracle: Address,
+    /// Consecutive healthy observations served by `tripped_oracle` since the
+    /// streak began. Reset to 0 by any unhealthy observation.
+    pub consecutive_healthy: u32,
+    /// Ledger of the first healthy observation of the current streak
+    /// (`0` = no streak in progress).
+    pub first_healthy_ledger: u64,
+}
 
 /// The kind of off-chain data an oracle provides.
 #[contracttype]
@@ -449,6 +485,17 @@ pub fn record_oracle_health(
     if is_stale && consecutive_stale_count >= MAX_CONSECUTIVE_STALE_QUERIES && !already_tripped {
         let circuit_key = DataKey::OracleCircuitTripped(feed_type, token.clone());
         env.storage().persistent().set(&circuit_key, &true);
+        // Issue #1048: start half-open recovery bookkeeping, pinning the
+        // breaker to the oracle that just tripped it so that only *that*
+        // oracle's later sustained health can auto-recover it.
+        env.storage().persistent().set(
+            &DataKey::OracleCircuitRecovery(feed_type, token.clone()),
+            &CircuitRecoveryState {
+                tripped_oracle: oracle.clone(),
+                consecutive_healthy: 0,
+                first_healthy_ledger: 0,
+            },
+        );
         env.events().publish(
             (
                 soroban_sdk::Symbol::new(env, "oracle_circuit_tripped"),
@@ -461,11 +508,126 @@ pub fn record_oracle_health(
             },
         );
     }
+
+    // Issue #1048: if the breaker is currently tripped, let a sustained run of
+    // healthy observations from the tripping oracle auto-recover it. No-op
+    // (and no storage cost) when the breaker is closed.
+    maybe_recover_oracle_circuit(
+        env,
+        feed_type,
+        token,
+        oracle,
+        is_stale,
+        data_timestamp,
+        &previous,
+        current_ledger,
+    );
+}
+
+/// Issue #1048 — half-open auto-recovery for a tripped circuit breaker.
+///
+/// Called from [`record_oracle_health`] after each observation. When the
+/// breaker for `feed_type` + `token` is tripped, this advances a recovery
+/// streak whenever the *tripping* oracle serves a **healthy** response —
+/// defined as fresh (`!is_stale`) **and** timestamp-advancing since that
+/// oracle's previous observation (so a frozen/replayed value never counts).
+/// Any unhealthy observation resets the streak to 0. Once the streak reaches
+/// [`CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS`] and spans at least
+/// [`CIRCUIT_RECOVERY_MIN_LEDGERS`] ledgers, the breaker is cleared and
+/// `oracle_circuit_recovered` is emitted.
+///
+/// Safety properties (preserving the anti-flapping design):
+///   * A **single** fresh query can never recover — the streak and the ledger
+///     window both have to be satisfied.
+///   * Only the oracle that *caused* the trip can recover it; a different
+///     (even healthy) oracle observed in the meantime does not clear this
+///     breaker, so the previously-tripped oracle isn't silently re-trusted.
+///   * A missing recovery record (e.g. a breaker tripped before this feature
+///     existed) fails safe: no auto-recovery, the admin `reset_oracle_circuit`
+///     is still required.
+///
+/// Deliberately does **not** run from `fund_invoice`'s gated path: while the
+/// breaker is open that path rejects before querying the oracle, so recovery
+/// is driven by the permissionless, never-erroring `check_oracle_health`
+/// (keepers/monitors), whose writes commit.
+#[allow(clippy::too_many_arguments)]
+fn maybe_recover_oracle_circuit(
+    env: &Env,
+    feed_type: OracleFeedType,
+    token: &Address,
+    oracle: &Address,
+    is_stale: bool,
+    data_timestamp: u32,
+    previous: &Option<OracleHealthStatus>,
+    current_ledger: u32,
+) {
+    if !is_oracle_circuit_tripped(env, feed_type, token.clone()) {
+        return;
+    }
+    let recovery_key = DataKey::OracleCircuitRecovery(feed_type, token.clone());
+    let mut state: CircuitRecoveryState = match env.storage().persistent().get(&recovery_key) {
+        Some(s) => s,
+        // Fail safe: no record of who tripped → no auto-recovery.
+        None => return,
+    };
+    // Only the oracle that tripped the breaker can recover it.
+    if state.tripped_oracle != *oracle {
+        return;
+    }
+
+    // Healthy = fresh AND the oracle actually advanced its timestamp since its
+    // own previous observation (a re-served value is not evidence of recovery).
+    let advanced = match previous {
+        Some(prev) if prev.oracle == *oracle => data_timestamp > prev.last_data_timestamp,
+        _ => true,
+    };
+    let healthy = !is_stale && advanced;
+
+    if !healthy {
+        if state.consecutive_healthy != 0 || state.first_healthy_ledger != 0 {
+            state.consecutive_healthy = 0;
+            state.first_healthy_ledger = 0;
+            env.storage().persistent().set(&recovery_key, &state);
+        }
+        return;
+    }
+
+    if state.consecutive_healthy == 0 {
+        state.first_healthy_ledger = current_ledger as u64;
+    }
+    state.consecutive_healthy = state.consecutive_healthy.saturating_add(1);
+    let elapsed = (current_ledger as u64).saturating_sub(state.first_healthy_ledger);
+
+    if state.consecutive_healthy >= CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS
+        && elapsed >= CIRCUIT_RECOVERY_MIN_LEDGERS
+    {
+        env.storage().persistent().remove(&recovery_key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::OracleCircuitTripped(feed_type, token.clone()));
+        env.events().publish(
+            (
+                soroban_sdk::Symbol::new(env, "oracle_circuit_recovered"),
+                feed_type,
+            ),
+            OracleCircuitRecovered {
+                feed_type,
+                token: token.clone(),
+                healthy_observations: state.consecutive_healthy,
+                elapsed_ledgers: elapsed,
+            },
+        );
+        return;
+    }
+
+    env.storage().persistent().set(&recovery_key, &state);
 }
 
 /// Whether the oracle circuit breaker for `feed_type` + `token` is
-/// currently tripped. Sticky — sees only `reset_oracle_circuit`, never a
-/// fresh query, per Issue requirement to avoid flapping.
+/// currently tripped. Cleared either by the governance-gated
+/// `reset_oracle_circuit` fast path or by the Issue #1048 half-open
+/// auto-recovery (a sustained run of healthy observations from the tripping
+/// oracle) — never by a single fresh query, per the anti-flapping requirement.
 pub fn is_oracle_circuit_tripped(env: &Env, feed_type: OracleFeedType, token: &Address) -> bool {
     env.storage()
         .persistent()
@@ -473,12 +635,27 @@ pub fn is_oracle_circuit_tripped(env: &Env, feed_type: OracleFeedType, token: &A
         .unwrap_or(false)
 }
 
+/// Issue #1048: the current half-open recovery progress for a tripped circuit
+/// breaker at `feed_type` + `token`, or `None` when nothing is recovering
+/// (breaker closed, or an already-tripped breaker with no recovery record).
+/// Read-only view for operations/monitoring so a stuck recovery is observable.
+pub fn get_circuit_recovery_state(
+    env: Env,
+    feed_type: OracleFeedType,
+    token: Address,
+) -> Option<CircuitRecoveryState> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::OracleCircuitRecovery(feed_type, token))
+}
+
 /// Governance-gated reset of a tripped oracle circuit breaker. Requires an
-/// explicit call — there is no automatic recovery on a single fresh query,
-/// so a flapping oracle can't quietly resume being trusted without someone
-/// (governance, in production, via the admin=governance-contract
-/// convention used throughout this registry) affirmatively deciding it's
-/// safe again.
+/// explicit call and is the fast path; since Issue #1048 a breaker also
+/// auto-recovers after the tripping oracle demonstrates a sustained run of
+/// healthy observations (see [`maybe_recover_oracle_circuit`]). This clears
+/// both the tripped flag and any in-progress recovery bookkeeping, so a
+/// flapping oracle can't quietly resume being trusted without either this
+/// affirmative call or a proven recovery window.
 ///
 /// Access: Admin only.
 pub fn reset_oracle_circuit(
@@ -491,6 +668,11 @@ pub fn reset_oracle_circuit(
     env.storage()
         .persistent()
         .remove(&DataKey::OracleCircuitTripped(feed_type, token.clone()));
+    // Issue #1048: drop any half-open recovery progress too, so a later
+    // re-trip starts from a clean streak.
+    env.storage()
+        .persistent()
+        .remove(&DataKey::OracleCircuitRecovery(feed_type, token.clone()));
     env.events().publish(
         (
             soroban_sdk::Symbol::new(env, "oracle_circuit_reset"),
@@ -816,6 +998,423 @@ pub fn get_max_price_deviation_bps(env: Env) -> u32 {
         .instance()
         .get(&DataKey::MaxPriceDeviationBps)
         .unwrap_or(DEFAULT_MAX_PRICE_DEVIATION_BPS)
+}
+
+// ── Issue #1047: multi-oracle Identity quorum ─────────────────────────────
+//
+// Before this, `fund_invoice`'s payer-verification gate resolved a *single*
+// `Identity` oracle through the priority chain and trusted its boolean
+// outright. A single compromised or mistaken feeder could therefore mint
+// funding eligibility on its own, and there was no place for a second feeder
+// to be consulted — or for disagreement between feeders to be observed at all.
+//
+// This adds an opt-in, governance-controlled set of Identity oracles per feed
+// type. When the set is non-empty, `fund_invoice` queries *all* of them and
+// requires at least `get_identity_quorum()` of them to agree the payer is
+// verified (with fresh data) before funding proceeds; if they disagree — fewer
+// than the configured quorum agree, or too few respond fresh — the call fails
+// closed as `PayerUnverified` and an `OracleFeederDisagreement` event is
+// emitted. An empty set preserves the prior single-oracle behavior exactly.
+//
+// The `OracleInterface` contract is deliberately unchanged: each feeder is an
+// independent deployment of the same `get_payer_data` interface, so no ABI or
+// interface-version bump is required.
+
+/// Default number of registered Identity oracles that must agree before
+/// oracle-gated funding proceeds, when governance has not set an explicit
+/// quorum via `set_identity_quorum`.
+///
+/// `1` keeps the multi-oracle list a strict superset of the prior single-oracle
+/// behavior: an operator who registers feeders but never widens the threshold
+/// still only needs one agreement. Operators relying on the list for
+/// disagreement safety should call `set_identity_quorum` with the agreement
+/// level they actually require (e.g. a majority of the registered feeders).
+pub const DEFAULT_IDENTITY_QUORUM: u32 = 1;
+
+/// Add `oracle` to `feed_type`'s Identity-oracle quorum list, consulted by
+/// `fund_invoice`'s oracle-gated path together with the other registered
+/// Identity oracles.
+///
+/// Idempotent: re-adding an already-registered oracle is a no-op (so the
+/// per-feed cap can't be reached by re-registering the same address). The
+/// list is bounded by [`MAX_IDENTITY_ORACLES_PER_FEED`]; a genuinely new oracle
+/// once the list is full is rejected with `TooManyIdentityOracles`.
+///
+/// Unlike `register_oracle`, this performs no interface-version handshake —
+/// feeders are queried dynamically via `try_invoke_contract` at funding time
+/// and a non-responding/incompatible feeder simply fails to contribute an
+/// agreement (it can never *force* verification).
+///
+/// Access: Admin only (governance-controlled via the same
+/// admin=governance-contract convention used throughout this registry).
+pub fn add_identity_oracle(
+    env: &Env,
+    feed_type: OracleFeedType,
+    oracle: Address,
+) -> Result<(), ContractError> {
+    require_admin(env)?;
+    check_rate_limit(env, "add_identity_oracle", DEFAULT_RATE_LIMIT_LEDGERS)?;
+    let key = DataKey::IdentityOracles(feed_type);
+    let mut oracles: soroban_sdk::Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&key)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    if !oracles.iter().any(|existing| existing == oracle) {
+        // Issue #1047: bound the per-feed Identity-oracle list. Only a
+        // genuinely new oracle can push the list past the cap — re-adding an
+        // existing one stays a no-op so idempotency is preserved.
+        if oracles.len() >= MAX_IDENTITY_ORACLES_PER_FEED {
+            return Err(ContractError::TooManyIdentityOracles);
+        }
+        oracles.push_back(oracle.clone());
+        env.storage().instance().set(&key, &oracles);
+    }
+    env.events().publish(
+        (
+            soroban_sdk::Symbol::new(env, "identity_oracle_added"),
+            feed_type,
+        ),
+        IdentityOracleAdded { feed_type, oracle },
+    );
+    Ok(())
+}
+
+/// Remove `oracle` from `feed_type`'s Identity-oracle quorum list. A no-op if
+/// it wasn't registered.
+///
+/// Access: Admin only.
+pub fn remove_identity_oracle(
+    env: &Env,
+    feed_type: OracleFeedType,
+    oracle: Address,
+) -> Result<(), ContractError> {
+    require_admin(env)?;
+    check_rate_limit(env, "remove_identity_oracle", DEFAULT_RATE_LIMIT_LEDGERS)?;
+    let key = DataKey::IdentityOracles(feed_type);
+    let oracles: soroban_sdk::Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&key)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    let mut remaining: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(env);
+    for existing in oracles.iter() {
+        if existing != oracle {
+            remaining.push_back(existing);
+        }
+    }
+    env.storage().instance().set(&key, &remaining);
+    env.events().publish(
+        (
+            soroban_sdk::Symbol::new(env, "identity_oracle_removed"),
+            feed_type,
+        ),
+        IdentityOracleRemoved { feed_type, oracle },
+    );
+    Ok(())
+}
+
+/// The currently registered Identity oracles for `feed_type` (empty if none).
+pub fn get_identity_oracles(env: Env, feed_type: OracleFeedType) -> soroban_sdk::Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::IdentityOracles(feed_type))
+        .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+}
+
+/// Set the number of registered Identity oracles that must agree the payer is
+/// verified before oracle-gated funding proceeds (the `N` in `N`-of-`M`).
+///
+/// Rejects `0` (a threshold no agreement can ever reach meaningfully) and any
+/// value above [`MAX_IDENTITY_ORACLES_PER_FEED`] (more agreement than the list
+/// can ever hold) with `InvalidIdentityQuorum`.
+///
+/// Access: Admin only.
+pub fn set_identity_quorum(env: &Env, quorum: u32) -> Result<(), ContractError> {
+    require_admin(env)?;
+    check_rate_limit(env, "set_identity_quorum", DEFAULT_RATE_LIMIT_LEDGERS)?;
+    if quorum == 0 || quorum > MAX_IDENTITY_ORACLES_PER_FEED {
+        return Err(ContractError::InvalidIdentityQuorum);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::IdentityQuorum, &quorum);
+    Ok(())
+}
+
+/// The currently configured Identity verification quorum. Defaults to
+/// [`DEFAULT_IDENTITY_QUORUM`] until governance sets one.
+pub fn get_identity_quorum(env: Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::IdentityQuorum)
+        .unwrap_or(DEFAULT_IDENTITY_QUORUM)
+}
+
+/// Outcome of [`check_identity_quorum`], used by `fund_invoice`'s
+/// oracle-gated payer-verification path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IdentityQuorumOutcome {
+    /// No Identity oracle is registered in the quorum list — the caller must
+    /// fall back to the pre-#1047 single-oracle resolution chain, preserving
+    /// existing behavior.
+    NotConfigured,
+    /// At least `get_identity_quorum()` registered oracles agreed the payer is
+    /// verified (with fresh data). Funding may proceed.
+    Verified,
+    /// The list is non-empty but fewer than the configured quorum agreed (the
+    /// feeders disagreed, or too few responded fresh + verified). Funding fails
+    /// closed.
+    Disagreement,
+}
+
+/// Query every registered Identity oracle for `feed_type` and require at least
+/// `get_identity_quorum()` of them to agree `payer` is verified before funding
+/// proceeds.
+///
+/// Issue #1047 — the safety property is *disagreement fails closed*: an oracle
+/// that reverts, returns unverified, or returns stale data simply does not
+/// contribute an agreement, so it can never force verification through. Only a
+/// response that is both `is_verified` and fresh (per the shared
+/// [`is_oracle_data_stale`] rule, so this gate and the recorded health snapshot
+/// use the same notion of freshness) counts toward the quorum. If fewer than
+/// the configured threshold agree, `Disagreement` is returned and an
+/// `OracleFeederDisagreement` event is emitted; the caller maps this to
+/// `PayerUnverified`.
+///
+/// Returns [`IdentityQuorumOutcome::NotConfigured`] when no oracle is
+/// registered, so the caller runs the unchanged single-oracle path.
+///
+/// Note: this path deliberately does not write the single-oracle
+/// `OracleHealth` snapshot (that key models one oracle per feed + token and is
+/// owned by the single-oracle path); disagreement is surfaced through the
+/// dedicated event instead.
+pub fn check_identity_quorum(
+    env: &Env,
+    feed_type: OracleFeedType,
+    token: &Address,
+    payer: &Address,
+    max_age_ledgers: u64,
+) -> IdentityQuorumOutcome {
+    let oracles = get_identity_oracles(env.clone(), feed_type);
+    if oracles.is_empty() {
+        return IdentityQuorumOutcome::NotConfigured;
+    }
+
+    let required = get_identity_quorum(env.clone());
+    let current_ledger = env.ledger().sequence();
+    let mut verified_count: u32 = 0;
+
+    for oracle in oracles.iter() {
+        // A feeder that reverts/traps/returns an undecodable payload degrades to
+        // "no opinion" via the non-panicking `try_invoke_contract` (mirroring
+        // `query_price`) rather than aborting the whole funding call — but it
+        // still cannot contribute an agreement.
+        let result = env.try_invoke_contract::<OracleVerificationResponse, soroban_sdk::Error>(
+            &oracle,
+            &Symbol::new(env, "get_payer_data"),
+            vec![env, payer.clone().into_val(env)],
+        );
+        if let Ok(Ok(response)) = result {
+            let fresh =
+                !is_oracle_data_stale(current_ledger, response.timestamp, max_age_ledgers);
+            if response.is_verified && fresh {
+                verified_count += 1;
+            }
+        }
+    }
+
+    if verified_count >= required {
+        IdentityQuorumOutcome::Verified
+    } else {
+        env.events().publish(
+            (
+                soroban_sdk::Symbol::new(env, "oracle_feeder_disagreement"),
+                feed_type,
+            ),
+            OracleFeederDisagreement {
+                feed_type,
+                token: token.clone(),
+                verified_count,
+                required_quorum: required,
+                total_oracles: oracles.len(),
+            },
+        );
+        IdentityQuorumOutcome::Disagreement
+    }
+}
+
+/// Issue #1049: precise outcome of the Identity payer-verification gate.
+///
+/// This is the single source of truth for "would oracle-gated funding accept
+/// this payer?" — computed by [`evaluate_identity_verification`] and consumed
+/// two ways:
+///
+///   * `fund_invoice` maps it onto the exact `ContractError` it already
+///     returned (so funding behavior is unchanged), and
+///   * the permissionless, never-erroring `check_oracle_verification`
+///     entrypoint returns it directly to off-chain monitors, so the *reason* a
+///     gate would reject is observable even though `fund_invoice`'s own
+///     `Err` return rolls its events back.
+///
+/// A `#[contracttype]` enum so the diagnostic entrypoint can return it
+/// on-chain (mirrors `OracleResolution` / `IdentityQuorumOutcome`, which are
+/// internal-only and therefore plain Rust enums).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum IdentityVerificationOutcome {
+    /// The gate passes: the payer is verified with fresh data (single oracle or
+    /// quorum), or nothing is configured — the legacy fail-open path.
+    Verified,
+    /// Data was stale → `oracle_stale_data_rejected` emitted (Issue #1049).
+    /// `fund_invoice` maps this to `ContractError::OracleDataStale`.
+    Stale,
+    /// Registered Identity feeders disagreed (fewer than the quorum agreed) →
+    /// `oracle_feeder_disagreement` emitted (Issue #1047). `fund_invoice` maps
+    /// this to `ContractError::PayerUnverified`.
+    QuorumDisagreement,
+    /// The oracle's data timestamp regressed (Issue #1052).
+    TimestampRegression,
+    /// The oracle re-served an identical timestamp past the duplicate cap
+    /// (Issue #1053).
+    DuplicateUpdate,
+    /// Every candidate oracle is circuit-tripped.
+    CircuitOpen,
+    /// The resolved oracle responded `is_verified = false`.
+    Unverified,
+}
+
+/// Issue #1049: evaluate the Identity payer-verification gate for `token` +
+/// `payer` and report the precise outcome, performing the same side effects the
+/// funding path does (monotonicity/duplicate checks, `record_oracle_health`) and
+/// emitting the **failure events** `oracle_stale_data_rejected` and
+/// `oracle_feeder_disagreement`.
+///
+/// This is the shared implementation behind both `fund_invoice`'s
+/// `require_oracle_verification` block and the permissionless
+/// `check_oracle_verification` diagnostic. Splitting it out is what makes the
+/// failure events *observable*: `fund_invoice` returns `Err` on rejection, and
+/// Soroban discards every event of a call that returns `Err`, so the failures it
+/// detects would otherwise never reach a ledger. The diagnostic calls this same
+/// helper but returns `Ok`, so its events — and its `OracleHealth` write — commit.
+///
+/// Order of checks is preserved exactly from the funding path: quorum first
+/// (a registered list short-circuits the single-oracle chain), then circuit
+/// status, then monotonicity, then duplicate, then record health, then
+/// freshness, then the verification boolean. This keeps the error precedence
+/// (`OracleCircuitOpen` before `OracleTimestampRegression` before
+/// `OracleDuplicateUpdate` before `OracleDataStale` before `PayerUnverified`)
+/// identical for `fund_invoice`.
+///
+/// Never returns `Err`: a feeder/oracle that reverts in the quorum path
+/// degrades to "no agreement" via `try_invoke_contract` (as in
+/// [`check_identity_quorum`]); the single-oracle path's `invoke_contract` is
+/// left to propagate exactly as `fund_invoice` already allowed.
+pub fn evaluate_identity_verification(
+    env: &Env,
+    feed_type: OracleFeedType,
+    token: &Address,
+    payer: &Address,
+    max_age_ledgers: u64,
+) -> IdentityVerificationOutcome {
+    // Multi-oracle quorum path (Issue #1047): a non-empty registered list is
+    // authoritative and short-circuits the single-oracle chain below.
+    match check_identity_quorum(env, feed_type, token, payer, max_age_ledgers) {
+        IdentityQuorumOutcome::Disagreement => return IdentityVerificationOutcome::QuorumDisagreement,
+        IdentityQuorumOutcome::Verified => return IdentityVerificationOutcome::Verified,
+        IdentityQuorumOutcome::NotConfigured => {}
+    }
+
+    let resolution = resolve_oracle_for_verification(env, feed_type, token);
+    if resolution == OracleResolution::CircuitOpen {
+        return IdentityVerificationOutcome::CircuitOpen;
+    }
+    let oracle_addr = match resolution {
+        OracleResolution::Available(addr) => addr,
+        // Unconfigured: legacy fail-open — no oracle to consult.
+        _ => return IdentityVerificationOutcome::Verified,
+    };
+
+    let response: OracleVerificationResponse = env.invoke_contract(
+        &oracle_addr,
+        &Symbol::new(env, "get_payer_data"),
+        vec![env, payer.clone().into_val(env)],
+    );
+
+    // Issue #1052: monotonicity — a data timestamp must never go *backwards*
+    // for the same oracle. Read the previous snapshot *before*
+    // `record_oracle_health` overwrites it below.
+    if is_oracle_data_timestamp_regression(env, feed_type, token, &oracle_addr, response.timestamp) {
+        return IdentityVerificationOutcome::TimestampRegression;
+    }
+
+    // Issue #1053: bound duplicate update frequency (a frozen oracle that keeps
+    // re-serving the same value). Same ordering rationale as above.
+    if is_oracle_data_duplicate_update(env, feed_type, token, &oracle_addr, response.timestamp) {
+        return IdentityVerificationOutcome::DuplicateUpdate;
+    }
+
+    // Issue #532: record health (staleness) regardless of outcome.
+    record_oracle_health(
+        env,
+        feed_type,
+        token,
+        &oracle_addr,
+        response.timestamp,
+        max_age_ledgers,
+    );
+
+    let current_ledger = env.ledger().sequence();
+
+    // Issue #93 / #1050: reject stale data via the shared freshness rule.
+    if is_oracle_data_stale(current_ledger, response.timestamp, max_age_ledgers) {
+        let age_ledgers = (current_ledger as u64).saturating_sub(response.timestamp as u64);
+        env.events().publish(
+            (
+                soroban_sdk::Symbol::new(env, "oracle_stale_data_rejected"),
+                feed_type,
+            ),
+            OracleDataStaleRejected {
+                feed_type,
+                token: token.clone(),
+                oracle: oracle_addr,
+                data_timestamp: response.timestamp,
+                age_ledgers,
+                max_age_ledgers,
+            },
+        );
+        return IdentityVerificationOutcome::Stale;
+    }
+
+    // Issue #92: reject unverified payers.
+    if !response.is_verified {
+        return IdentityVerificationOutcome::Unverified;
+    }
+
+    IdentityVerificationOutcome::Verified
+}
+
+/// Issue #1049: the permissionless, **never-erroring** diagnostic counterpart
+/// to `fund_invoice`'s Identity gate. Evaluates the gate for `token` + `payer`
+/// at the current max-oracle-age and returns the [`IdentityVerificationOutcome`]
+/// — but, crucially, its writes and its failure events commit (it returns `Ok`),
+/// so off-chain monitors/keepers can observe *why* oracle-gated funding would be
+/// rejected (stale data, feeder disagreement, a regressed/duplicate timestamp,
+/// an open circuit, or an unverified payer) even though a rejected
+/// `fund_invoice` leaves no on-chain trace.
+///
+/// Mirrors [`check_oracle_health`]: a read-only observer entrypoint with no
+/// authorization and no successful-path side effect beyond the health snapshot.
+pub fn check_oracle_verification(
+    env: Env,
+    feed_type: OracleFeedType,
+    token: Address,
+    payer: Address,
+) -> IdentityVerificationOutcome {
+    let max_age = crate::storage::get_config(&env)
+        .map(|c| c.max_oracle_age_ledgers)
+        .unwrap_or(crate::DEFAULT_MAX_ORACLE_AGE_LEDGERS);
+    evaluate_identity_verification(&env, feed_type, &token, &payer, max_age)
 }
 
 /// Issue #860: circuit/health gate every price read must pass before it

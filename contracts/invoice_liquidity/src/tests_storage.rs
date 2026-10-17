@@ -5,8 +5,9 @@ use crate::access::ADMIN_ACTION_LOG_CAPACITY;
 use crate::config::Config;
 use crate::constants::{
     DEFAULT_RATE_LIMIT_LEDGERS, FUND_QUEUE_TTL_EXTEND_TO, FUND_QUEUE_TTL_THRESHOLD,
-    MAX_FUND_QUEUE_LEN, MAX_PRICE_SOURCES_PER_FEED, ROLLBACK_SAMPLE_SIZE, TOP_PAYERS_CAPACITY,
-    TTL_MIN_LEDGERS_BEFORE_UPGRADE, TTL_UPGRADE_SAMPLE_SIZE,
+    MAX_FUND_QUEUE_LEN, MAX_IDENTITY_ORACLES_PER_FEED, MAX_PRICE_SOURCES_PER_FEED,
+    ROLLBACK_SAMPLE_SIZE, TOP_PAYERS_CAPACITY, TTL_MIN_LEDGERS_BEFORE_UPGRADE,
+    TTL_UPGRADE_SAMPLE_SIZE,
 };
 use crate::invoice::InvoiceStatus;
 use crate::oracle_registry::OracleFeedType;
@@ -1064,6 +1065,10 @@ fn test_resource_envelope_declares_every_bounded_collection() {
     assert_eq!(
         envelope_cap("price_sources_per_feed"),
         Some(MAX_PRICE_SOURCES_PER_FEED)
+    );
+    assert_eq!(
+        envelope_cap("identity_oracles_per_feed"),
+        Some(MAX_IDENTITY_ORACLES_PER_FEED)
     );
     assert_eq!(
         envelope_cap("admin_action_log_entries"),

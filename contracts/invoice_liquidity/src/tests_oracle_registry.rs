@@ -1259,3 +1259,1005 @@ fn test_oracle_admin_functions_rate_limited() {
         "second add_price_source within cooldown must be RateLimited"
     );
 }
+
+// ── Issue #1047: multi-oracle Identity quorum ────────────────────────────────
+//
+// Before #1047, fund_invoice's payer-verification gate trusted a *single*
+// Identity oracle's boolean outright, so one compromised/mistaken feeder could
+// mint funding eligibility on its own and feeder disagreement was neither
+// consulted nor observable. These tests cover the multi-oracle quorum that now
+// replaces that single point of trust when governance opts in:
+//   1. Success — quorum met (all, or a sufficient subset, of the feeders agree).
+//   2. Failure — disagreement (fewer than N agree) fails closed as PayerUnverified
+//      and emits OracleFeederDisagreement.
+//   3. Robustness — a reverting feeder contributes no agreement and cannot force
+//      verification through.
+//   4. Ledger boundary — a feeder whose data is exactly at the max age does not
+//      count; a fresh one at the boundary does.
+//   5. Authorization — add/remove/set-quorum are admin-gated.
+//   6. Preserved behavior — an empty quorum list falls back to the unchanged
+//      single-oracle path.
+//   7. Bounds — the list is capped and the quorum threshold is range-checked.
+
+/// A feeder that always traps on `get_payer_data` — models an unavailable or
+/// misconfigured oracle. It must degrade to "no opinion", never force
+/// verification through.
+#[contract]
+struct MockRevertingOracle;
+
+#[contractimpl]
+impl MockRevertingOracle {
+    pub fn get_payer_data(_env: Env, _payer: Address) -> OracleVerificationResponse {
+        panic!("feeder unavailable")
+    }
+}
+
+/// Register each of `oracles` into `feed_type`'s Identity quorum list, spacing
+/// the calls past the rate-limit cooldown (the registry admin fns are all
+/// rate-limited with the same `DEFAULT_RATE_LIMIT_LEDGERS` cooldown).
+fn add_identity_oracles(t: &crate::test::TestEnv, oracles: &[Address]) {
+    for (i, oracle) in oracles.iter().enumerate() {
+        if i > 0 {
+            advance_past_rate_limit_cooldown(&t.env);
+        }
+        t.contract
+            .add_identity_oracle(&OracleFeedType::Identity, oracle);
+    }
+}
+
+#[test]
+fn test_identity_quorum_default_is_one() {
+    let t = setup();
+    assert_eq!(t.contract.get_identity_quorum(), 1);
+    assert!(t
+        .contract
+        .get_identity_oracles(&OracleFeedType::Identity)
+        .is_empty());
+}
+
+#[test]
+fn test_identity_quorum_met_funds_invoice() {
+    let t = setup();
+    let seq = t.env.ledger().sequence();
+    let a = deploy_mock_oracle(&t, true, seq);
+    let b = deploy_mock_oracle(&t, true, seq);
+    add_identity_oracles(&t, &[a, b]);
+    t.contract.set_identity_quorum(&2);
+
+    let invoice_id = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+
+    assert_eq!(
+        t.contract.get_invoice(&invoice_id).status,
+        InvoiceStatus::Funded
+    );
+}
+
+#[test]
+fn test_identity_quorum_met_by_subset_of_three() {
+    let t = setup();
+    let seq = t.env.ledger().sequence();
+    let yes_a = deploy_mock_oracle(&t, true, seq);
+    let yes_b = deploy_mock_oracle(&t, true, seq);
+    let no = deploy_mock_oracle(&t, false, seq);
+    add_identity_oracles(&t, &[yes_a, yes_b, no]);
+    // Two of three agree — quorum of 2 is met despite the dissenting feeder.
+    t.contract.set_identity_quorum(&2);
+
+    let invoice_id = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+
+    assert_eq!(
+        t.contract.get_invoice(&invoice_id).status,
+        InvoiceStatus::Funded
+    );
+}
+
+#[test]
+fn test_identity_quorum_disagreement_fails_closed() {
+    let t = setup();
+    let seq = t.env.ledger().sequence();
+    let yes = deploy_mock_oracle(&t, true, seq);
+    let no = deploy_mock_oracle(&t, false, seq);
+    add_identity_oracles(&t, &[yes, no]);
+    t.contract.set_identity_quorum(&2);
+
+    let invoice_id = make_invoice(&t);
+    let res = t
+        .contract
+        .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    assert_eq!(
+        res,
+        Err(Ok(ContractError::PayerUnverified)),
+        "feeders that disagree must fail closed, not fund"
+    );
+}
+
+#[test]
+fn test_identity_quorum_reverting_feeder_cannot_force_verification() {
+    let t = setup();
+    let seq = t.env.ledger().sequence();
+    let yes = deploy_mock_oracle(&t, true, seq);
+    let reverting = t.env.register_contract(None, MockRevertingOracle);
+    add_identity_oracles(&t, &[yes, reverting]);
+    t.contract.set_identity_quorum(&2);
+
+    let invoice_id = make_invoice(&t);
+    let res = t
+        .contract
+        .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    assert_eq!(
+        res,
+        Err(Ok(ContractError::PayerUnverified)),
+        "an unavailable feeder contributes no agreement and must not force verification"
+    );
+}
+
+#[test]
+fn test_identity_quorum_ledger_boundary_excludes_stale_feeder() {
+    let t = setup();
+    advance_past_rate_limit_cooldown(&t.env);
+    t.contract.set_max_oracle_age(&10);
+
+    // Placeholder timestamps; pinned relative to the current ledger below,
+    // after the rate-limit advances that registration performs.
+    let a = deploy_mock_oracle(&t, true, 0);
+    let b = deploy_mock_oracle(&t, true, 0);
+    add_identity_oracles(&t, &[a, b]);
+    t.contract.set_identity_quorum(&2);
+
+    let current = t.env.ledger().sequence();
+    // Fresh side of the boundary: age == max_age - 1 → counts.
+    MockRegistryOracleClient::new(&t.env, &a).set_response(&true, &(current - 9));
+    // Stale side of the boundary: age == max_age → does NOT count.
+    MockRegistryOracleClient::new(&t.env, &b).set_response(&true, &(current - 10));
+
+    let invoice_id = make_invoice(&t);
+    let res = t
+        .contract
+        .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    assert_eq!(
+        res,
+        Err(Ok(ContractError::PayerUnverified)),
+        "a feeder whose data sits exactly at the max age must not count toward quorum"
+    );
+
+    // Refresh the second feeder to the current ledger — both are now fresh and
+    // the quorum is met, so funding proceeds.
+    MockRegistryOracleClient::new(&t.env, &b).set_response(&true, &current);
+    t.contract
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    assert_eq!(
+        t.contract.get_invoice(&invoice_id).status,
+        InvoiceStatus::Funded
+    );
+}
+
+#[test]
+fn test_identity_quorum_disagreement_emits_event() {
+    let t = setup();
+    let seq = t.env.ledger().sequence();
+    let yes = deploy_mock_oracle(&t, true, seq);
+    let no = deploy_mock_oracle(&t, false, seq);
+    add_identity_oracles(&t, &[yes, no]);
+    t.contract.set_identity_quorum(&2);
+
+    // Clear any events from the setup, then invoke the gate directly so the
+    // disagreement event commits (a failed fund_invoice call would roll it back).
+    t.env.events().all();
+    let outcome = t.env.as_contract(&t.contract.address, || {
+        crate::oracle_registry::check_identity_quorum(
+            &t.env,
+            OracleFeedType::Identity,
+            &t.token.address,
+            &t.payer,
+            DEFAULT_MAX_ORACLE_AGE_LEDGERS,
+        )
+    });
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityQuorumOutcome::Disagreement
+    );
+
+    let events = t.env.events().all();
+    let disagreement: std::vec::Vec<_> = events
+        .events()
+        .iter()
+        .filter(|e| std::format!("{:?}", e).contains("oracle_feeder_disagreement"))
+        .collect();
+    assert_eq!(
+        disagreement.len(),
+        1,
+        "a failed quorum must emit exactly one OracleFeederDisagreement event"
+    );
+}
+
+#[test]
+fn test_empty_identity_quorum_list_uses_single_oracle_path() {
+    let t = setup();
+    let oracle = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+    t.contract
+        .register_oracle(&OracleFeedType::Identity, &oracle);
+
+    // Register then remove from the quorum list — an empty list must fall back
+    // to the unchanged single-oracle resolution path.
+    t.contract
+        .add_identity_oracle(&OracleFeedType::Identity, &oracle);
+    advance_past_rate_limit_cooldown(&t.env);
+    t.contract
+        .remove_identity_oracle(&OracleFeedType::Identity, &oracle);
+    assert!(t
+        .contract
+        .get_identity_oracles(&OracleFeedType::Identity)
+        .is_empty());
+
+    let invoice_id = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    assert_eq!(
+        t.contract.get_invoice(&invoice_id).status,
+        InvoiceStatus::Funded
+    );
+}
+
+#[test]
+fn test_set_identity_quorum_rejects_out_of_range() {
+    use crate::constants::MAX_IDENTITY_ORACLES_PER_FEED;
+    let t = setup();
+    assert_eq!(
+        t.contract.try_set_identity_quorum(&0),
+        Err(Ok(ContractError::InvalidIdentityQuorum))
+    );
+    advance_past_rate_limit_cooldown(&t.env);
+    assert_eq!(
+        t.contract
+            .try_set_identity_quorum(&(MAX_IDENTITY_ORACLES_PER_FEED + 1)),
+        Err(Ok(ContractError::InvalidIdentityQuorum))
+    );
+    // Bounds themselves are accepted.
+    advance_past_rate_limit_cooldown(&t.env);
+    t.contract.set_identity_quorum(&MAX_IDENTITY_ORACLES_PER_FEED);
+    assert_eq!(
+        t.contract.get_identity_quorum(),
+        MAX_IDENTITY_ORACLES_PER_FEED
+    );
+}
+
+#[test]
+fn test_add_identity_oracle_bounded_and_idempotent() {
+    use crate::constants::MAX_IDENTITY_ORACLES_PER_FEED;
+    let t = setup();
+
+    // Idempotent: re-adding the same oracle does not grow the list.
+    let first = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+    t.contract
+        .add_identity_oracle(&OracleFeedType::Identity, &first);
+    advance_past_rate_limit_cooldown(&t.env);
+    t.contract
+        .add_identity_oracle(&OracleFeedType::Identity, &first);
+    assert_eq!(
+        t.contract
+            .get_identity_oracles(&OracleFeedType::Identity)
+            .len(),
+        1
+    );
+
+    // Fill to the declared cap (registration performs no invoke, so arbitrary
+    // addresses are fine to use as stand-ins).
+    for _ in 1..MAX_IDENTITY_ORACLES_PER_FEED {
+        advance_past_rate_limit_cooldown(&t.env);
+        t.contract
+            .add_identity_oracle(&OracleFeedType::Identity, &Address::generate(&t.env));
+    }
+    assert_eq!(
+        t.contract
+            .get_identity_oracles(&OracleFeedType::Identity)
+            .len(),
+        MAX_IDENTITY_ORACLES_PER_FEED
+    );
+
+    // One more is rejected — the cap holds even with an authorised admin.
+    advance_past_rate_limit_cooldown(&t.env);
+    let extra = Address::generate(&t.env);
+    assert_eq!(
+        t.contract
+            .try_add_identity_oracle(&OracleFeedType::Identity, &extra),
+        Err(Ok(ContractError::TooManyIdentityOracles))
+    );
+}
+
+#[test]
+fn test_add_identity_oracle_unauthorized_caller() {
+    let (env, _admin, _token, client) = setup_env_no_mock_auths();
+    let imposter = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    env.mock_auths(&[MockAuth {
+        address: &imposter,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "add_identity_oracle",
+            args: (OracleFeedType::Identity, oracle.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(
+        client
+            .try_add_identity_oracle(&OracleFeedType::Identity, &oracle)
+            .is_err(),
+        "add_identity_oracle should fail for a non-admin caller"
+    );
+}
+
+#[test]
+fn test_set_identity_quorum_unauthorized_caller() {
+    let (env, _admin, _token, client) = setup_env_no_mock_auths();
+    let imposter = Address::generate(&env);
+
+    env.mock_auths(&[MockAuth {
+        address: &imposter,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "set_identity_quorum",
+            args: (2u32,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(
+        client.try_set_identity_quorum(&2).is_err(),
+        "set_identity_quorum should fail for a non-admin caller"
+    );
+}
+
+// ── Issue #1048: recover after feeder outage ─────────────────────────────────
+//
+// The circuit breaker above trips after MAX_CONSECUTIVE_STALE_QUERIES stale
+// observations, but before this issue could only be cleared by a governance
+// `reset_oracle_circuit` — so a transient feeder outage jammed oracle-gated
+// funding until a (slow) governance action, and a genuinely recovered feeder
+// had no on-chain path to un-jam it. These tests cover the half-open
+// auto-recovery that lets a *sustained* run of healthy observations from the
+// tripping oracle close the breaker again, while keeping the anti-flapping
+// guarantees:
+//   1. Success — sustained healthy observations auto-recover; funding resumes
+//      with no admin call.
+//   2. Failure — a single fresh query, too few observations, an insufficient
+//      ledger window, a frozen (non-advancing) oracle, or a stale observation
+//      mid-streak all fail to recover.
+//   3. Isolation — a *different* healthy oracle cannot clear the breaker.
+//   4. Ledger boundary — recovery needs N observations AND >= 120 ledgers.
+//   5. Authorization — auto-recovery is driven by the permissionless
+//      check_oracle_health; reset_oracle_circuit stays admin-only and also
+//      clears recovery progress.
+//   6. Bounded flapping — a recovered oracle that goes stale again re-trips.
+
+/// Advance the ledger by `n` sequences (timestamp scaled 5s/ledger, matching
+/// the suite's other helpers).
+fn advance_ledgers(env: &Env, n: u32) {
+    let mut info = env.ledger().get();
+    info.sequence_number += n;
+    info.timestamp += (n as u64) * 5;
+    env.ledger().set(info);
+}
+
+/// Trip the Identity breaker for `t.token` against a single stale feed-type
+/// default, returning the oracle address — the same shape the existing circuit
+/// tests set up.
+fn trip_identity_circuit(t: &crate::test::TestEnv) -> Address {
+    let oracle = setup_stale_default_oracle(t);
+    for _ in 0..crate::oracle_registry::MAX_CONSECUTIVE_STALE_QUERIES {
+        t.contract
+            .check_oracle_health(&OracleFeedType::Identity, &t.token.address, &t.payer);
+    }
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "setup must leave the Identity breaker tripped"
+    );
+    oracle
+}
+
+/// Serve a fresh, timestamp-advancing response from `oracle` at the current
+/// ledger and record one health observation (the keeper path that drives
+/// Issue #1048 recovery).
+fn observe_fresh(t: &crate::test::TestEnv, oracle: &Address) {
+    let client = MockRegistryOracleClient::new(&t.env, oracle);
+    client.set_response(&true, &t.env.ledger().sequence());
+    t.contract
+        .check_oracle_health(&OracleFeedType::Identity, &t.token.address, &t.payer);
+}
+
+#[test]
+fn test_circuit_auto_recovers_after_sustained_health() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+    let needed = crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS;
+
+    // First healthy observation — a single fresh query must not recover.
+    observe_fresh(&t, &oracle);
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "a single fresh query must not auto-recover the breaker"
+    );
+
+    // Build the streak, spacing observations past the minimum ledger window.
+    for _ in 1..needed {
+        advance_ledgers(&t.env, window);
+        observe_fresh(&t, &oracle);
+    }
+    assert!(
+        !t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "a sustained run of healthy observations must auto-recover the breaker"
+    );
+
+    // Funding resumes against the recovered oracle with no governance reset.
+    let invoice_id = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    assert_eq!(
+        t.contract.get_invoice(&invoice_id).status,
+        InvoiceStatus::Funded
+    );
+}
+
+#[test]
+fn test_circuit_auto_recovery_needs_full_ledger_window() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let needed = crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS;
+
+    // Enough healthy observations, but only one ledger apart — below
+    // CIRCUIT_RECOVERY_MIN_LEDGERS, so the breaker must stay tripped.
+    for _ in 0..needed {
+        observe_fresh(&t, &oracle);
+        assert!(
+            t.contract
+                .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+            "recovery must not complete before the ledger window elapses"
+        );
+        advance_ledgers(&t.env, 1);
+    }
+}
+
+#[test]
+fn test_circuit_auto_recovery_needs_full_observation_count() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+    let needed = crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS;
+
+    // Observations spanning well past the ledger window but one short of the
+    // required count — still not recovered.
+    for _ in 0..(needed - 1) {
+        observe_fresh(&t, &oracle);
+        advance_ledgers(&t.env, window);
+    }
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "fewer than CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS must not recover"
+    );
+
+    // The final observation completes the streak.
+    observe_fresh(&t, &oracle);
+    assert!(
+        !t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address)
+    );
+}
+
+#[test]
+fn test_circuit_auto_recovery_rejects_frozen_oracle() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let needed = crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS;
+
+    // Re-serve the same fresh value repeatedly (within the max-age window):
+    // non-advancing data is not evidence of recovery.
+    let frozen = t.env.ledger().sequence();
+    let client = MockRegistryOracleClient::new(&t.env, &oracle);
+    client.set_response(&true, &frozen);
+    for _ in 0..(needed + 1) {
+        t.contract
+            .check_oracle_health(&OracleFeedType::Identity, &t.token.address, &t.payer);
+        advance_ledgers(&t.env, 1);
+    }
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "a frozen (non-advancing) oracle must not recover the breaker"
+    );
+}
+
+#[test]
+fn test_circuit_auto_recovery_resets_on_stale_observation() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+    let client = MockRegistryOracleClient::new(&t.env, &oracle);
+
+    // One healthy observation, then a stale one mid-streak resets progress...
+    observe_fresh(&t, &oracle);
+    advance_ledgers(&t.env, window);
+    client.set_response(&true, &0); // ancient timestamp => stale
+    t.contract
+        .check_oracle_health(&OracleFeedType::Identity, &t.token.address, &t.payer);
+    // ...so a single healthy observation afterwards must not recover.
+    advance_ledgers(&t.env, window);
+    observe_fresh(&t, &oracle);
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "a stale observation must reset the recovery streak"
+    );
+}
+
+#[test]
+fn test_circuit_auto_recovery_ignores_different_oracle() {
+    let t = setup();
+    advance_past_rate_limit_cooldown(&t.env);
+    t.contract.set_max_oracle_age(&10);
+
+    // A stale feed-type default trips the breaker.
+    let stale = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+    t.contract
+        .register_oracle(&OracleFeedType::Identity, &stale);
+    advance_ledgers(&t.env, 20);
+    for _ in 0..crate::oracle_registry::MAX_CONSECUTIVE_STALE_QUERIES {
+        t.contract
+            .check_oracle_health(&OracleFeedType::Identity, &t.token.address, &t.payer);
+    }
+    assert!(t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address));
+
+    // A healthy per-token override (higher priority) is then registered, and
+    // check_oracle_health observes it...
+    advance_past_rate_limit_cooldown(&t.env);
+    let healthy = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+    t.contract
+        .register_token_oracle(&OracleFeedType::Identity, &t.token.address, &healthy);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+    for _ in 0..crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS {
+        observe_fresh(&t, &healthy);
+        advance_ledgers(&t.env, window);
+    }
+
+    // ...but the breaker was tripped by `stale`, so a different oracle's
+    // health must not clear it.
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "only the oracle that tripped the breaker may auto-recover it"
+    );
+}
+
+#[test]
+fn test_circuit_recovery_state_view_tracks_progress() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+
+    // Freshly tripped: pinned to the tripping oracle, streak empty.
+    let state = t
+        .contract
+        .get_circuit_recovery_state(&OracleFeedType::Identity, &t.token.address)
+        .unwrap();
+    assert_eq!(state.tripped_oracle, oracle);
+    assert_eq!(state.consecutive_healthy, 0);
+    assert_eq!(state.first_healthy_ledger, 0);
+
+    // After a healthy observation the streak advances and records its start.
+    let at = t.env.ledger().sequence() as u64;
+    observe_fresh(&t, &oracle);
+    let state = t
+        .contract
+        .get_circuit_recovery_state(&OracleFeedType::Identity, &t.token.address)
+        .unwrap();
+    assert_eq!(state.consecutive_healthy, 1);
+    assert_eq!(state.first_healthy_ledger, at);
+}
+
+#[test]
+fn test_circuit_auto_recovers_without_admin_reset() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+
+    for i in 0..crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS {
+        if i > 0 {
+            advance_ledgers(&t.env, window);
+        }
+        observe_fresh(&t, &oracle);
+    }
+
+    // No admin/governance call was made anywhere in this test — recovery is
+    // driven entirely by the permissionless check_oracle_health keeper path.
+    assert!(!t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address));
+    assert!(t
+        .contract
+        .get_circuit_recovery_state(&OracleFeedType::Identity, &t.token.address)
+        .is_none());
+}
+
+#[test]
+fn test_circuit_auto_recovery_emits_event() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+
+    t.env.events().all(); // clear setup events
+    for i in 0..crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS {
+        if i > 0 {
+            advance_ledgers(&t.env, window);
+        }
+        observe_fresh(&t, &oracle);
+    }
+
+    let events = t.env.events().all();
+    let recovered: std::vec::Vec<_> = events
+        .events()
+        .iter()
+        .filter(|e| std::format!("{:?}", e).contains("oracle_circuit_recovered"))
+        .collect();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "auto-recovery must emit exactly one OracleCircuitRecovered event"
+    );
+}
+
+#[test]
+fn test_circuit_retrips_after_auto_recovery_if_stale_again() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+
+    for i in 0..crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS {
+        if i > 0 {
+            advance_ledgers(&t.env, window);
+        }
+        observe_fresh(&t, &oracle);
+    }
+    assert!(!t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address));
+
+    // The recovered oracle goes stale again → the breaker re-trips, so
+    // auto-recovery cannot be used to keep a flapping oracle trusted.
+    let ancient = t.env.ledger().sequence().saturating_sub(window + 100);
+    let client = MockRegistryOracleClient::new(&t.env, &oracle);
+    client.set_response(&true, &ancient);
+    for _ in 0..crate::oracle_registry::MAX_CONSECUTIVE_STALE_QUERIES {
+        t.contract
+            .check_oracle_health(&OracleFeedType::Identity, &t.token.address, &t.payer);
+    }
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "a recovered oracle that goes stale again must re-trip the breaker"
+    );
+}
+
+#[test]
+fn test_reset_oracle_circuit_clears_recovery_progress() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+
+    observe_fresh(&t, &oracle);
+    assert!(t
+        .contract
+        .get_circuit_recovery_state(&OracleFeedType::Identity, &t.token.address)
+        .is_some());
+
+    t.contract
+        .reset_oracle_circuit(&OracleFeedType::Identity, &t.token.address);
+
+    assert!(!t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address));
+    assert!(
+        t.contract
+            .get_circuit_recovery_state(&OracleFeedType::Identity, &t.token.address)
+            .is_none(),
+        "the governance reset must also clear half-open recovery progress"
+    );
+}
+
+// ── Issue #1049: emit stale and quorum failure events ────────────────────────
+//
+// `fund_invoice`'s Identity gate detects stale data and feeder disagreement, but
+// it reports each failure by returning `Err`. Soroban rolls back every event of
+// an `Err`-returning invocation, so those failures leave no on-chain trace —
+// monitoring cannot tell "payer unverified" from "oracle is stale" from "feeders
+// disagree". These tests cover the fix: a shared `evaluate_identity_verification`
+// helper backs both the funding gate (which keeps returning the same errors) and
+// a new permissionless, never-erroring `check_oracle_verification` diagnostic
+// whose events commit.
+//   1. Success — a fresh, verified payer passes (single-oracle and quorum).
+//   2. Failure — stale data emits `oracle_stale_data_rejected`; feeder
+//      disagreement emits `oracle_feeder_disagreement`; an unverified payer
+//      reports `Unverified`.
+//   3. Before/after — a rejected `fund_invoice` returns `OracleDataStale` but
+//      leaves no event; the diagnostic reaches the same decision and its event
+//      survives.
+//   4. Ledger boundary — `age == max_age - 1` is fresh, `age == max_age` is stale.
+//   5. Authorization — the diagnostic is callable by anyone, with no auth.
+//   6. Interop with #1048 — the diagnostic records health, so repeated stale
+//      queries still trip the breaker and then report `CircuitOpen`.
+
+/// Count events whose debug rendering contains `needle` (matches the existing
+/// event assertions in this suite, which key off the published symbol).
+fn count_events(env: &Env, needle: &str) -> usize {
+    env.events()
+        .all()
+        .events()
+        .iter()
+        .filter(|e| std::format!("{:?}", e).contains(needle))
+        .count()
+}
+
+#[test]
+fn test_check_oracle_verification_single_oracle_verified() {
+    let t = setup();
+    let oracle = deploy_mock_oracle(&t, true, t.env.ledger().sequence());
+    t.contract
+        .register_oracle(&OracleFeedType::Identity, &oracle);
+
+    let outcome = t.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::Verified
+    );
+}
+
+#[test]
+fn test_check_oracle_verification_unverified_payer() {
+    let t = setup();
+    let oracle = deploy_mock_oracle(&t, false, t.env.ledger().sequence());
+    t.contract
+        .register_oracle(&OracleFeedType::Identity, &oracle);
+
+    let outcome = t.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::Unverified
+    );
+}
+
+#[test]
+fn test_check_oracle_verification_stale_emits_event() {
+    let t = setup();
+    setup_stale_default_oracle(&t); // max_age=10, data already 20 ledgers old
+
+    t.env.events().all(); // clear setup events
+    let outcome = t.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::Stale
+    );
+
+    assert_eq!(
+        count_events(&t.env, "oracle_stale_data_rejected"),
+        1,
+        "a stale diagnostic must commit exactly one OracleDataStaleRejected event"
+    );
+}
+
+#[test]
+fn test_check_oracle_verification_ledger_boundary() {
+    let t = setup();
+    advance_past_rate_limit_cooldown(&t.env);
+    t.contract.set_max_oracle_age(&10);
+
+    let oracle = deploy_mock_oracle(&t, true, 0);
+    t.contract
+        .register_oracle(&OracleFeedType::Identity, &oracle);
+
+    // Fresh side of the boundary: age == max_age - 1 (9) → counts as fresh.
+    let current = t.env.ledger().sequence();
+    MockRegistryOracleClient::new(&t.env, &oracle).set_response(&true, &(current - 9));
+    let outcome = t.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::Verified,
+        "age == max_age - 1 must still be accepted"
+    );
+
+    // Advance one ledger: the same data now ages to exactly max_age → stale.
+    advance_ledgers(&t.env, 1);
+    let outcome = t.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::Stale,
+        "age == max_age must be rejected as stale"
+    );
+}
+
+#[test]
+fn test_check_oracle_verification_quorum_verified() {
+    let t = setup();
+    let seq = t.env.ledger().sequence();
+    let a = deploy_mock_oracle(&t, true, seq);
+    let b = deploy_mock_oracle(&t, true, seq);
+    add_identity_oracles(&t, &[a, b]);
+    t.contract.set_identity_quorum(&2);
+
+    let outcome = t.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::Verified
+    );
+}
+
+#[test]
+fn test_check_oracle_verification_quorum_disagreement_emits_event() {
+    let t = setup();
+    let seq = t.env.ledger().sequence();
+    let yes = deploy_mock_oracle(&t, true, seq);
+    let no = deploy_mock_oracle(&t, false, seq);
+    add_identity_oracles(&t, &[yes, no]);
+    t.contract.set_identity_quorum(&2);
+
+    t.env.events().all(); // clear setup events
+    let outcome = t.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::QuorumDisagreement
+    );
+
+    assert_eq!(
+        count_events(&t.env, "oracle_feeder_disagreement"),
+        1,
+        "a failed quorum must commit exactly one OracleFeederDisagreement event"
+    );
+}
+
+#[test]
+fn test_fund_invoice_stale_rejection_events_roll_back_but_diagnostic_commits() {
+    let t = setup();
+    setup_stale_default_oracle(&t); // max_age=10, data 20 ledgers old
+
+    // Baseline (before the fix): the funding gate rejects stale data, but the
+    // `Err` return rolls every emitted event back — nothing is observable.
+    let invoice_id = make_invoice(&t);
+    t.env.events().all(); // clear setup events
+    let res = t.contract.try_fund_invoice(
+        &t.funder,
+        &invoice_id,
+        &INVOICE_AMOUNT,
+        &true,
+    );
+    assert_eq!(
+        res,
+        Err(Ok(ContractError::OracleDataStale)),
+        "the refactor must preserve the exact funding-gate error"
+    );
+    assert_eq!(
+        count_events(&t.env, "oracle_stale_data_rejected"),
+        0,
+        "a rejected fund_invoice must not leave the stale event on chain"
+    );
+
+    // After the fix: the permissionless diagnostic reaches the same decision and
+    // its event — and its health write — commit, so the failure is observable.
+    t.env.events().all(); // clear
+    let outcome = t.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::Stale
+    );
+    assert_eq!(
+        count_events(&t.env, "oracle_stale_data_rejected"),
+        1,
+        "the diagnostic's stale event must survive on chain"
+    );
+}
+
+#[test]
+fn test_check_oracle_verification_is_permissionless() {
+    let (env, _admin, token, client) = setup_env_no_mock_auths();
+
+    // Register an Identity oracle while setup's mock_all_auths is still active.
+    let oracle = env.register_contract(None, MockRegistryOracle);
+    MockRegistryOracleClient::new(&env, &oracle).set_response(&true, &env.ledger().sequence());
+    client.register_oracle(&OracleFeedType::Identity, &oracle);
+
+    // Drop every mocked auth: any require_auth() in the call would now fail.
+    env.mock_auths(&[]);
+
+    // The diagnostic has no authorisation gate — any caller gets an outcome.
+    let outcome = client.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &token,
+        &Address::generate(&env),
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::Verified,
+        "check_oracle_verification must be callable without any authorization"
+    );
+}
+
+#[test]
+fn test_check_oracle_verification_records_health_and_reports_circuit_open() {
+    let t = setup();
+    setup_stale_default_oracle(&t); // max_age=10, data 20 ledgers old
+
+    // The diagnostic shares `record_oracle_health` with the funding gate, so
+    // repeated stale observations advance the same streak and trip the breaker.
+    for _ in 0..crate::oracle_registry::MAX_CONSECUTIVE_STALE_QUERIES {
+        let outcome = t.contract.check_oracle_verification(
+            &OracleFeedType::Identity,
+            &t.token.address,
+            &t.payer,
+        );
+        assert_eq!(
+            outcome,
+            crate::oracle_registry::IdentityVerificationOutcome::Stale
+        );
+    }
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "repeated stale diagnostics must trip the breaker via record_oracle_health"
+    );
+
+    // Once the breaker is open the diagnostic reports it — never a stale event,
+    // since nothing is queried.
+    t.env.events().all();
+    let outcome = t.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+    assert_eq!(
+        outcome,
+        crate::oracle_registry::IdentityVerificationOutcome::CircuitOpen
+    );
+    assert_eq!(
+        count_events(&t.env, "oracle_stale_data_rejected"),
+        0,
+        "an open breaker short-circuits before any oracle is queried"
+    );
+}
