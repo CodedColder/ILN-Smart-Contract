@@ -68,19 +68,10 @@ parameterized by a unique id/address, no collisions occur.
 | `Appeal(u64)` | `AppealRecord` | Evidence hash for a default appeal |
 | `PreDefaultPayerScore(u64)` | `u32` | Snapshot of payer score before a default penalty |
 | `LpScore(Address)` | `u32` | LP reputation score |
-| `FundQueue(u64)` | `Vec<LpFundRequest>` | LPs waiting to fund an invoice. TTL kept alive with the other queue records (see below) |
-| `QueueResolution(u64)` | `Address` | Selected LP from a funding queue. TTL kept alive with the other queue records |
-| `FundQueueOpenedAt(u64)` | `u32` | Ledger the first LP joined; anchors the MEV maturity delay. TTL kept alive with the other queue records |
-
-**Fund-queue TTL (Issues #1009 / #1010).** `FundQueue`, `FundQueueOpenedAt` and
-`QueueResolution` are persistent entries that are read at different times
-(join, resolve, and a deferred `fund_invoice`). Every write *and* every read of
-any of them now calls `extend_fund_queue_ttl`, which bumps all existing sibling
-entries to `QUEUE_TTL_EXTEND_TO_LEDGERS` (2,000,000) whenever their remaining
-TTL is at or below `QUEUE_TTL_THRESHOLD_LEDGERS` (1,000,000) — the same window
-`save_invoice` gives the invoice. No new keys or per-read writes beyond an
-extension that is skipped while TTL is above the threshold; entries for queues
-that are never used are never created.
+| `FundQueue(u64)` | `Vec<LpFundRequest>` | LPs waiting to fund an invoice |
+| `QueueResolution(u64)` | `Address` | Selected LP from a funding queue |
+| `FundQueueOpenedAt(u64)` | `u32` | Ledger the first LP joined the queue (MEV maturity anchor) |
+| `QueueResolvedAt(u64)` | `u32` | Ledger the winner was locked in (stalled-winner recovery anchor, Issue #1020); additive key, no migration |
 | `TotalInvoices` | `u64` | Global protocol stat |
 | `TotalFunded` | `u64` | Global protocol stat |
 | `TotalPaid` | `u64` | Global protocol stat |

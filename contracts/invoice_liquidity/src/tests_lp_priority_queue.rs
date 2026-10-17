@@ -598,148 +598,177 @@ pub(crate) fn test_duplicate_prevention_with_sorted_queue() {
     assert!(winner == t.lp_a || winner == t.lp_b);
 }
 
-// ── Issues #1009 / #1010: queue-entry TTL through resolution ─────────────────
-//
-// Baseline (before): `save_fund_queue`, `save_queue_resolution` and
-// `try_set_fund_queue_opened_at` wrote with no `extend_ttl`, so each entry
-// lived only for the network's default persistent TTL while the invoice it
-// belongs to was extended to 2_000_000 ledgers — a resolution could expire
-// before the deferred `fund_invoice`, silently re-opening funding to any LP.
-// After: all three records are bumped together to QUEUE_TTL_EXTEND_TO_LEDGERS
-// on every write and on every read.
+// ── Issues #1019–#1022: delayed resolution, recovery, bounds ─────────────────
 
-use crate::constants::{
-    QUEUE_DELAY_LEDGERS, QUEUE_TTL_EXTEND_TO_LEDGERS, QUEUE_TTL_THRESHOLD_LEDGERS,
-};
-use crate::storage::DataKey;
-
-fn ttl(t: &QueueTestEnv, key: &DataKey) -> u32 {
+fn set_score(t: &QueueTestEnv, lp: &Address, score: u32) {
     t.env.as_contract(&t.contract.address, || {
-        t.env.storage().persistent().get_ttl(key)
+        crate::storage::set_lp_score(&t.env, lp, score);
+    });
+}
+
+fn queue_len(t: &QueueTestEnv, id: u64) -> u32 {
+    t.env.as_contract(&t.contract.address, || {
+        crate::storage::get_fund_queue(&t.env, id).len()
     })
 }
 
-fn exists(t: &QueueTestEnv, key: &DataKey) -> bool {
-    t.env
-        .as_contract(&t.contract.address, || t.env.storage().persistent().has(key))
-}
-
-fn all_queue_keys(id: u64) -> [DataKey; 3] {
-    [
-        DataKey::FundQueue(id),
-        DataKey::FundQueueOpenedAt(id),
-        DataKey::QueueResolution(id),
-    ]
+fn advance_time(env: &Env, secs: u64) {
+    let mut info = env.ledger().get();
+    info.timestamp += secs;
+    env.ledger().set(info);
 }
 
 #[test]
-fn test_1009_join_extends_queue_and_opened_at_ttl() {
+fn queue_full_rejects_join_and_stays_bounded() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    for _ in 0..crate::constants::MAX_FUND_QUEUE_LEN {
+        t.contract.join_fund_queue(&Address::generate(&t.env), &id);
+    }
+    let r = t.contract.try_join_fund_queue(&t.lp_a, &id);
+    assert_eq!(r, Err(Ok(ContractError::QueueFull)));
+    assert_eq!(queue_len(&t, id), crate::constants::MAX_FUND_QUEUE_LEN);
+}
+
+#[test]
+fn join_rejected_for_pending_invoice_past_due_date() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    advance_time(&t.env, DUE_DATE_OFFSET + 1);
+    let r = t.contract.try_join_fund_queue(&t.lp_a, &id);
+    assert_eq!(r, Err(Ok(ContractError::InvoiceExpired)));
+}
+
+#[test]
+fn resolve_rejected_if_invoice_cancelled_after_join() {
     let t = setup_queue();
     let id = submit_invoice(&t);
     t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.cancel_invoice(&id);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    let r = t.contract.try_resolve_fund_queue(&id);
+    assert_eq!(r, Err(Ok(ContractError::AlreadyCancelled)));
+    assert!(t.contract.try_recover_fund_queue(&id).is_ok());
+}
 
-    assert_eq!(ttl(&t, &DataKey::FundQueue(id)), QUEUE_TTL_EXTEND_TO_LEDGERS);
+#[test]
+fn resolve_rejected_once_invoice_is_past_due() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    advance_time(&t.env, DUE_DATE_OFFSET + 1);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    let r = t.contract.try_resolve_fund_queue(&id);
+    assert_eq!(r, Err(Ok(ContractError::InvoiceExpired)));
+}
+
+#[test]
+fn delayed_resolution_uses_current_score_not_stale_snapshot() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id); // snapshot 50, first in line
+    t.contract.join_fund_queue(&t.lp_b, &id); // snapshot 50
+    set_score(&t, &t.lp_a, 5); // A's reputation collapses before resolution
+    let winner = resolve_queue_mature(&t, &id);
+    assert_eq!(winner, t.lp_b);
+}
+
+#[test]
+fn recover_with_nothing_queued_fails() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    let r = t.contract.try_recover_fund_queue(&id);
+    assert_eq!(r, Err(Ok(ContractError::QueueNotStalled)));
+    let r = t.contract.try_recover_fund_queue(&999);
+    assert_eq!(r, Err(Ok(ContractError::InvoiceNotFound)));
+}
+
+#[test]
+fn recover_before_resolution_fails() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    let r = t.contract.try_recover_fund_queue(&id);
+    assert_eq!(r, Err(Ok(ContractError::QueueNotStalled)));
+    assert_eq!(queue_len(&t, id), 1);
+}
+
+#[test]
+fn recover_stalled_winner_at_ttl_boundary_and_reopen() {
+    let t = setup_queue();
+    let id = submit_invoice(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.join_fund_queue(&t.lp_b, &id);
+    let winner = resolve_queue_mature(&t, &id);
+    let other = if winner == t.lp_a { t.lp_b.clone() } else { t.lp_a.clone() };
+
+    // One ledger short of the TTL: still locked.
+    advance_ledgers(&t.env, crate::constants::QUEUE_RESOLUTION_TTL_LEDGERS - 1);
     assert_eq!(
-        ttl(&t, &DataKey::FundQueueOpenedAt(id)),
-        QUEUE_TTL_EXTEND_TO_LEDGERS
+        t.contract.try_recover_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotStalled))
     );
-}
-
-#[test]
-fn test_1009_resolution_extends_all_queue_records_together() {
-    let t = setup_queue();
-    let id = submit_invoice(&t);
-    t.contract.join_fund_queue(&t.lp_a, &id);
-    resolve_queue_mature(&t, &id);
-
-    // The resolution record is written at resolution time and the queue /
-    // opened-at siblings were last bumped at join, QUEUE_DELAY_LEDGERS ago.
-    // None of them may be left on the network's default TTL.
     assert_eq!(
-        ttl(&t, &DataKey::QueueResolution(id)),
-        QUEUE_TTL_EXTEND_TO_LEDGERS
+        t.contract.try_fund_invoice(&other, &id, &INVOICE_AMOUNT, &false),
+        Err(Ok(ContractError::NotApprovedFunder))
     );
-    for key in all_queue_keys(id) {
-        assert!(ttl(&t, &key) >= QUEUE_TTL_EXTEND_TO_LEDGERS - QUEUE_DELAY_LEDGERS, "{key:?}");
-    }
-}
 
-/// The deferred read in `fund_invoice` keeps the resolution (and its sibling
-/// entries) alive well past the original write's expiry.
-#[test]
-fn test_1010_deferred_fund_read_keeps_resolution_alive_past_original_expiry() {
-    let t = setup_queue();
-    let id = submit_invoice(&t);
-    t.contract.join_fund_queue(&t.lp_a, &id);
-    resolve_queue_mature(&t, &id);
-
-    // Move past the threshold so a read must re-extend, but stay inside TTL.
-    advance_ledgers(&t.env, QUEUE_TTL_EXTEND_TO_LEDGERS - QUEUE_TTL_THRESHOLD_LEDGERS + 1);
-    assert!(ttl(&t, &DataKey::QueueResolution(id)) < QUEUE_TTL_THRESHOLD_LEDGERS);
-
-    // `get_fund_queue_opened_at` / resolution reads are what resolve/join/fund do.
-    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
-    for key in all_queue_keys(id) {
-        assert_eq!(ttl(&t, &key), QUEUE_TTL_EXTEND_TO_LEDGERS, "{key:?}");
-    }
-
-    // Cross the *original* expiry: without the bump the resolution is gone.
-    advance_ledgers(&t.env, QUEUE_TTL_THRESHOLD_LEDGERS);
-    for key in all_queue_keys(id) {
-        assert!(exists(&t, &key), "{key:?} expired despite being read");
-    }
-}
-
-/// Ledger boundary: `extend_ttl` bumps when the remaining TTL is at or below
-/// the threshold. One ledger above it a read is a no-op (no wasted write);
-/// at the threshold the read bumps back to the full window.
-#[test]
-fn test_1009_extension_threshold_boundary() {
-    let t = setup_queue();
-    let id = submit_invoice(&t);
-    t.contract.join_fund_queue(&t.lp_a, &id);
-    resolve_queue_mature(&t, &id);
-    let key = DataKey::QueueResolution(id);
-
-    // remaining TTL == threshold + 1: not extended.
-    advance_ledgers(
-        &t.env,
-        QUEUE_TTL_EXTEND_TO_LEDGERS - QUEUE_TTL_THRESHOLD_LEDGERS - 1,
-    );
-    assert_eq!(ttl(&t, &key), QUEUE_TTL_THRESHOLD_LEDGERS + 1);
-    t.contract.resolve_fund_queue(&id);
-    assert_eq!(ttl(&t, &key), QUEUE_TTL_THRESHOLD_LEDGERS + 1);
-
-    // remaining TTL == threshold: extended back to the full window.
+    // Exactly at the TTL: anyone may evict the stalled winner.
     advance_ledgers(&t.env, 1);
-    assert_eq!(ttl(&t, &key), QUEUE_TTL_THRESHOLD_LEDGERS);
-    t.contract.resolve_fund_queue(&id);
-    assert_eq!(ttl(&t, &key), QUEUE_TTL_EXTEND_TO_LEDGERS);
+    assert_eq!(t.contract.recover_fund_queue(&id), Some(winner.clone()));
+    assert_eq!(queue_len(&t, id), 1);
+
+    // Maturity restarts for the remaining LP.
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotMature))
+    );
+    assert_eq!(resolve_queue_mature(&t, &id), other);
+    t.contract.fund_invoice(&other, &id, &INVOICE_AMOUNT, &false);
 }
 
-/// Adversarial: an unapproved LP probing a resolved queue is rejected and
-/// cannot change who is approved; the approved LP can still fund, and a queue
-/// that was never opened creates no queue records (no state growth).
 #[test]
-fn test_1010_unapproved_probe_rejected_and_approved_lp_still_funds() {
+fn recover_shortens_grace_when_near_expiry() {
     let t = setup_queue();
     let id = submit_invoice(&t);
     t.contract.join_fund_queue(&t.lp_a, &id);
-    resolve_queue_mature(&t, &id);
+    // Move to 1 hour before the due date.
+    advance_time(&t.env, DUE_DATE_OFFSET - 3600);
+    let winner = resolve_queue_mature(&t, &id);
+    assert_eq!(winner, t.lp_a);
+    // Far below the full TTL but past QUEUE_DELAY_LEDGERS.
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(t.contract.recover_fund_queue(&id), Some(t.lp_a.clone()));
+    assert_eq!(queue_len(&t, id), 0);
+}
 
-    advance_ledgers(&t.env, QUEUE_TTL_EXTEND_TO_LEDGERS - QUEUE_TTL_THRESHOLD_LEDGERS + 1);
-    assert_eq!(
-        t.contract.try_fund_invoice(&t.lp_b, &id, &INVOICE_AMOUNT, &false),
-        Err(Ok(ContractError::NotApprovedFunder))
-    );
-    assert_eq!(
-        t.contract.try_join_fund_queue(&t.lp_b, &id),
-        Err(Ok(ContractError::NotApprovedFunder))
-    );
-    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
+#[test]
+fn recover_purges_state_for_cancelled_and_expired_invoices() {
+    let t = setup_queue();
+    let cancelled = submit_invoice(&t);
+    let expiring = submit_invoice(&t);
+    for id in [cancelled, expiring] {
+        t.contract.join_fund_queue(&t.lp_a, &id);
+    }
+    resolve_queue_mature(&t, &cancelled);
+    t.contract.cancel_invoice(&cancelled);
+    assert_eq!(t.contract.recover_fund_queue(&cancelled), None);
 
-    let untouched = submit_invoice(&t);
-    for key in all_queue_keys(untouched) {
-        assert!(!exists(&t, &key), "{key:?} must not exist for an unused queue");
+    advance_time(&t.env, DUE_DATE_OFFSET + 1);
+    t.contract.expire_invoice(&expiring);
+    assert_eq!(t.contract.recover_fund_queue(&expiring), None);
+
+    for id in [cancelled, expiring] {
+        assert_eq!(queue_len(&t, id), 0);
+        t.env.as_contract(&t.contract.address, || {
+            assert!(crate::storage::get_queue_resolution(&t.env, id).is_none());
+            assert!(crate::storage::get_fund_queue_opened_at(&t.env, id).is_none());
+            assert!(crate::storage::get_queue_resolved_at(&t.env, id).is_none());
+        });
+        // Idempotent: a second purge finds nothing to do.
+        assert_eq!(
+            t.contract.try_recover_fund_queue(&id),
+            Err(Ok(ContractError::QueueNotStalled))
+        );
     }
 }

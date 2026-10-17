@@ -42,16 +42,16 @@ pub const MAX_REPUTATION_DECAY_PERIODS: u64 = 1000;
 /// block to lock-out competing LPs (Issue #MEV-1).
 pub const QUEUE_DELAY_LEDGERS: u32 = 120;
 
-// ----------------------------------------------------------------
-// Fund-queue storage TTL (Issues #1009 / #1010)
-// ----------------------------------------------------------------
+/// Issue #1022: hard cap on LPs per invoice fund queue. Bounds the persistent
+/// `FundQueue` entry and the O(n) scans in `join_fund_queue` /
+/// `resolve_fund_queue` regardless of how long the queue sits open.
+pub const MAX_FUND_QUEUE_LEN: u32 = 50;
 
-/// Persistent-entry TTL threshold (ledgers) for the fund queue, its
-/// `FundQueueOpenedAt` marker and the `QueueResolution` record: whenever one
-/// is written or read and its remaining TTL is at or below this value, it is bumped.
-/// Matches the invoice entries (`save_invoice`) so a queue entry can never
-/// expire before the invoice it belongs to.
-pub const QUEUE_TTL_THRESHOLD_LEDGERS: u32 = 1_000_000;
+/// Issue #1020: ledgers an approved LP has, after `resolve_fund_queue`, to
+/// fund before anyone may call `recover_fund_queue` to evict them (~1 hour).
+pub const QUEUE_RESOLUTION_TTL_LEDGERS: u32 = 720;
 
-/// Persistent-entry TTL (ledgers) the queue entries are extended to.
-pub const QUEUE_TTL_EXTEND_TO_LEDGERS: u32 = 2_000_000;
+/// Issue #1020: when the invoice is due within this many seconds, the
+/// recovery grace period shortens from `QUEUE_RESOLUTION_TTL_LEDGERS` to
+/// `QUEUE_DELAY_LEDGERS` so a stalled winner cannot run out the clock.
+pub const NEAR_EXPIRY_WINDOW_SECS: u64 = 60 * 60 * 24;

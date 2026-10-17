@@ -878,7 +878,43 @@ pub fn get_queue_resolution(env: &Env, invoice_id: u64) -> Option<Address> {
 
 /// Store the approved funder chosen by the priority queue and extend its TTL (Issue #1025, #1091)
 pub fn save_queue_resolution(env: &Env, invoice_id: u64, approved_lp: &Address) {
-    crate::storage::save_queue_resolution(env, invoice_id, approved_lp)
+    env.storage()
+        .persistent()
+        .set(&StorageKey::QueueResolution(invoice_id), approved_lp);
+    env.storage()
+        .persistent()
+        .set(&StorageKey::QueueResolvedAt(invoice_id), &env.ledger().sequence());
+}
+
+/// Ledger sequence at which the queue winner was locked in, if resolved.
+pub fn get_queue_resolved_at(env: &Env, invoice_id: u64) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::QueueResolvedAt(invoice_id))
+}
+
+/// Remove every queue-related entry for `invoice_id`. Idempotent.
+pub fn clear_fund_queue_state(env: &Env, invoice_id: u64) {
+    let p = env.storage().persistent();
+    p.remove(&StorageKey::FundQueue(invoice_id));
+    p.remove(&StorageKey::QueueResolution(invoice_id));
+    p.remove(&StorageKey::QueueResolvedAt(invoice_id));
+    p.remove(&StorageKey::FundQueueOpenedAt(invoice_id));
+}
+
+/// Reopen the queue after evicting a stalled winner: drop the resolution and
+/// restart the maturity window for the remaining LPs (or clear it if empty).
+pub fn reopen_fund_queue(env: &Env, invoice_id: u64, remaining: &soroban_sdk::Vec<LpFundRequest>) {
+    let p = env.storage().persistent();
+    p.remove(&StorageKey::QueueResolution(invoice_id));
+    p.remove(&StorageKey::QueueResolvedAt(invoice_id));
+    if remaining.is_empty() {
+        p.remove(&StorageKey::FundQueue(invoice_id));
+        p.remove(&StorageKey::FundQueueOpenedAt(invoice_id));
+    } else {
+        p.set(&StorageKey::FundQueue(invoice_id), remaining);
+        p.set(&StorageKey::FundQueueOpenedAt(invoice_id), &env.ledger().sequence());
+    }
 }
 
 /// Record the ledger sequence when the first LP joined the fund queue.
