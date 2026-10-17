@@ -62,7 +62,8 @@ pub fn twap_average(
         if seg_end > seg_start {
             let duration = seg_end - seg_start;
             let avg_price = (s1.price + s2.price) / 2;
-            total_weighted = total_weighted.saturating_add(avg_price.saturating_mul(duration as i128));
+            total_weighted =
+                total_weighted.saturating_add(avg_price.saturating_mul(duration as i128));
             total_weight = total_weight.saturating_add(duration);
         }
     }
@@ -157,7 +158,10 @@ mod tests {
         // Honest $10.00 for an hour, one manipulated $20.00 sample for 5s,
         // then back to $10.00: the TWAP stays near $10.00 while spot would
         // report $20.00 during the spike.
-        let samples = vec_of(&env, &[(0, 10_000), (3600, 10_000), (3605, 20_000), (3610, 10_000)]);
+        let samples = vec_of(
+            &env,
+            &[(0, 10_000), (3600, 10_000), (3605, 20_000), (3610, 10_000)],
+        );
         let avg = twap_average(&samples, 0, 3610).unwrap();
         assert!(
             avg < 11_000,

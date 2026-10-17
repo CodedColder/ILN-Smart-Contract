@@ -208,6 +208,7 @@ start at the [Documentation Index](docs/index.md), or jump to:
 | End-to-end test suite | [`tests/e2e/README.md`](tests/e2e/README.md) |
 | Design decisions | [Architecture Decision Records](docs/adr/README.md) |
 | Terminology | [Glossary](docs/glossary.md) |
+| Public protocol status (solvency health, oracle uptime) | [Public Status Page](docs/public-status-page.md) |
 
 ---
 
@@ -217,7 +218,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, changesets, PR si
 code style, and the review process.
 
 For bug reports, integration questions, and feature requests, see
-[Support Channels](docs/support-channels.md).
+[Support Channels](docs/support-channels.md) (GitHub Issues and private security
+reporting are live; Discussions/Discord are deferred pre-launch).
 
 ---
 

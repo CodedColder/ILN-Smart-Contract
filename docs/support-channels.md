@@ -1,6 +1,22 @@
 # Public Support Channels
 
-This document describes where to get help with the Invoice Liquidity Network protocol.
+This document describes where to get help with the Invoice Liquidity Network protocol
+**and which channels are actually live** ahead of mainnet.
+
+Last audited: 2026-09-24.
+
+---
+
+## Channel status (pre-mainnet)
+
+| Channel | Status | Use for |
+|---------|--------|---------|
+| **GitHub Issues** (bug / feature / component templates) | **Live** | Bugs, feature requests, tracked work |
+| **GitHub Security Advisories** + `security@invoice-liquidity-network.local` | **Live** (private) | Vulnerabilities only — see [SECURITY.md](../SECURITY.md) |
+| **GitHub Discussions** | **Not enabled yet** on this repository | Planned for open-ended integration Q&A after launch readiness; until then use Issues |
+| Discord / other chat | **Out of scope pre-launch** | Not stood up; do not treat as an official channel |
+
+**Scoped decision:** For mainnet launch readiness we treat **GitHub Issues + private security reporting** as the complete public support surface. Standing up Discord (or enabling Discussions) is optional post-launch community work, not a launch blocker once Issues templates and this doc are accurate.
 
 ---
 
@@ -20,12 +36,14 @@ steps to reproduce, expected behaviour, and actual behaviour.
 
 ## Integration Questions
 
-If you are building on the ILN SDK or integrating with the contracts and need help:
+GitHub Discussions are **not enabled** on this repository yet. Until they are:
 
-- **GitHub Discussions** — ask questions and share ideas in the
-  [Discussions forum](https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/discussions)
-- **GitHub Issues** — file a feature request if you need new functionality:
-  [Feature request template](https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/issues/new?template=feature_request.md)
+- Open a **GitHub Issue** using the
+  [feature request template](https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/issues/new?template=feature_request.md)
+  for new functionality, or a bug template if something is broken
+- Tag maintainers via CODEOWNERS on a draft PR if you are proposing an integration change
+
+When Discussions are enabled, this section will be updated and the checklist row will stay in sync.
 
 ---
 
@@ -36,13 +54,22 @@ Suggest new features or improvements via the
 
 ---
 
+## Incidents & status
+
+Protocol incidents are handled under
+[`incident-response-runbook.md`](incident-response-runbook.md). There is no separate
+public status Discord; user-facing notices go through GitHub (issues/advisories)
+and release notes.
+
+---
+
 ## Response Times
 
 | Channel | Expected Response |
 |---------|-------------------|
 | Bug reports (GitHub Issues) | Acknowledged within 3 business days |
-| Integration questions (Discussions) | Best-effort, typically within 1 week |
-| Feature requests | Reviewed during the next planning cycle |
+| Integration / feature Issues | Best-effort, typically within 1 week |
+| Security (private) | Per [SECURITY.md](../SECURITY.md) (ack within 48 hours) |
 
 These are targets, not guarantees. Response times may vary based on maintainer
 availability and issue complexity.
@@ -51,7 +78,6 @@ availability and issue complexity.
 
 ## Security Vulnerabilities
 
-**Do not** report security vulnerabilities through public GitHub issues or
-Discussions. See [SECURITY.md](../SECURITY.md) for responsible disclosure
-instructions, including the private reporting email and GitHub Security Advisory
-process.
+**Do not** report security vulnerabilities through public GitHub issues.
+See [SECURITY.md](../SECURITY.md) for responsible disclosure instructions,
+including the private reporting email and GitHub Security Advisory process.

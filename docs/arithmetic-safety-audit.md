@@ -60,7 +60,7 @@ construction (`payout = min(coverage, balance)`) and was left as-is.
 | `cast_vote`: `own_balance + delegated`, `votes_for/against +=` | Raw `+` on vote-weight tallies | `saturating_add` |
 | `execute_proposal`: `votes_for + votes_against`, `eta_ledger = sequence() + delay` | Raw `+`; `delay` is admin-configured and unbounded | `saturating_add` |
 | `adjust_delegated_to_me`: `current + delta` | Raw `+` on delegation tally (delta may be negative) | `saturating_add` |
-| `list_proposals`: `page * actual_page_size` | Same caller-controlled pagination overflow as `invoice_liquidity` | `saturating_mul` |
+| `list_proposals`: `(c - 1).min(count)` | Stable cursor keyed by proposal ID; uses saturating math for boundary checks | `saturating_sub` |
 
 `resolve_terminal`/`delegate_votes` cycle-detection loops increment `depth`
 bounded by `MAX_DELEGATION_DEPTH = 10` before any arithmetic is reachable —

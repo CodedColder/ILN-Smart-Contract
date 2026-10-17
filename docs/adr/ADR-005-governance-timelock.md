@@ -37,16 +37,18 @@ Competing concerns:
 
 ## Decision
 
-**No timelock delay in v1.** `execute_proposal` is callable by anyone
-immediately after the 3-day voting window closes, provided quorum and majority
-criteria are met. The admin veto power serves as the emergency brake during the
-early phase.
+**Phase 3 Timelock Implementation and Hardening (Issues #985, #987, #989, #990).**
 
-The `TimelockNotExpired` error code is reserved in the error enum for a future
-timelock implementation.
+While v1 initially launched without an execution delay, ADR-012 Phase 3 established a governance execution timelock with the following critical security controls:
 
-A timelock **must be introduced before the admin veto power is disabled**
-(which must happen before mainnet launch per the governance documentation).
+1. **Minimum Production Delay Bounds (Issue #985):**
+   `set_execution_delay(delay)` enforces bounds to prevent governance deadlocks (`MAX_EXECUTION_DELAY_LEDGERS = 518_400` ~ 30 days) and guarantees that once admin veto power is disabled (`!is_veto_power_enabled()`), execution delay cannot be reduced below `MIN_PRODUCTION_EXECUTION_DELAY_LEDGERS` (17,280 ledgers ~ 24 hours), resolving the decentralized transition risk.
+2. **Rollover-Safe Eta Comparisons (Issue #987):**
+   Proposal scheduling and execution timelock checks utilize RFC 1982 serial number arithmetic (`is_eta_reached`) and wrapping addition (`wrapping_add`), preventing execution stalls or bypasses across ledger sequence boundaries or rollover at `u32::MAX`.
+3. **Veto Transition State Machine (Issue #989):**
+   The multisig veto mechanism implements an explicit finite state machine (`VetoStatus`: `Uninitiated -> Pending -> Executed`), emitting `VetoStateTransition` events and exposing `get_veto_state(proposal_id)` for transparent on-chain auditing.
+4. **Veto-Disable Authorization and Reason Recording (Issue #990):**
+   Permanent disablement of admin veto power (`disable_veto_power` / `disable_veto_power_with_reason`) records caller authorization, ledger sequence, and reason hash in `VetoDisableRecord`, prevents redundant disable calls (`VetoPowerAlreadyDisabled`), and emits structured `VetoDisableRecorded` events.
 
 ## Alternatives Considered
 
@@ -55,18 +57,16 @@ A timelock **must be introduced before the admin veto power is disabled**
 | **24-hour timelock** | Adds friction without meaningful security benefit while the admin veto exists; a 24-hour window is too short for large token holders to coordinate a response anyway. |
 | **48-hour timelock** | Same reasoning as 24-hour; the admin veto already covers the early phase. |
 | **7-day timelock (Compound-style)** | Appropriate for a mature, decentralised protocol, but excessive for a protocol in active parameter tuning. Would slow down legitimate fee adjustments. |
-| **Configurable timelock (governance sets the delay)** | Correct long-term design, but adds implementation complexity at v1. Deferred to a future upgrade. |
+| **Configurable timelock (governance sets the delay)** | Implemented in Phase 3 with strict production delay bounds and bounds enforcement upon veto retirement (Issue #985). |
 | **Optimistic execution with challenge period** | Complex to implement correctly; requires a separate challenge mechanism and bond. Out of scope for v1. |
 
 ## Consequences
 
 **Positive:**
-- Proposals can be executed immediately after voting closes, enabling rapid
-  response to protocol conditions.
-- Implementation is simpler — no timelock storage, no expiry checks on
-  execution.
-- The admin veto provides equivalent protection during the early phase when
-  token distribution is concentrated.
+- Proposals are safely timelocked with bounded delays (`17_280..=518_400` ledgers), ensuring community reaction windows.
+- Eta comparisons remain sound and verified even across ledger rollover boundaries.
+- Veto approvals follow a deterministic finite state machine with queryable state and event traces.
+- Veto retirement permanently audits the authorization and justification on-chain.
 
 **Negative / Trade-offs:**
 - Without a timelock, a proposal that passes cannot be stopped by the community
@@ -79,3 +79,35 @@ A timelock **must be introduced before the admin veto power is disabled**
   so leaves the protocol without any execution delay after full decentralisation.
 - The `TimelockNotExpired` error is reserved but unimplemented; contributors
   must not assume it is enforced.
+
+## Addendum (Issues #1007 / #1008): observable rejected transitions
+
+The "no timelock, veto as brake" decision above is unchanged. Two audit
+findings on the execution path were fixed without changing that decision:
+
+1. **Rejected transitions were not observable.** `execute_proposal` wrote
+   `Rejected`, forfeited the deposit and then returned
+   `Err(QuorumNotReached | ProposalRejected)`; on Soroban an `Err` rolls back
+   the whole call, so on-chain the proposal stayed `Active`, the deposit was
+   never forfeited and no event existed. (The old unit tests hid this by
+   calling the function through `as_contract`, which does not roll back.) It
+   now returns `Ok`, commits `Rejected`, and emits `proposal_rejected` with a
+   `RejectionReason`. The same applies to a failed cross-contract execution:
+   `proposal_execution_failed` is now committed and the proposal stays
+   `Passed` (retryable).
+2. **Cross-contract authorization is now tested against the real ILN
+   contract** (`contracts/tests/governance_cross_contract_auth_test.rs`) with
+   mocked auths dropped: governance only controls ILN when ILN's `Admin` *is*
+   the governance contract address; if it is not, execution is rejected by
+   ILN's `require_auth`, ILN is untouched and the failure event is emitted.
+
+Guards that reject without any state change (`NotVetoSigner`, `NotVetoable`,
+`VetoAlreadyApproved`, `VetoPowerDisabled`, `AlreadyResolved`, ...) still
+return `Err`: there is nothing to persist, and emitting events from a reverting
+call is impossible on Soroban. Callers see them as transaction errors.
+
+**Migration.** Integrators that treated `Err(QuorumNotReached)` /
+`Err(ProposalRejected)` / `Err(ExecutionFailed)` from `execute_proposal` as the
+rejection signal must switch to the `proposal_rejected` /
+`proposal_execution_failed` events (or read `get_proposal(id).status`). The
+error variants remain in the enum so error codes do not shift.

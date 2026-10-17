@@ -22,6 +22,9 @@
 //! **Invariant P3: Deterministic Order**
 //! Given a fixed set of claims and a prioritization strategy, payout order is deterministic.
 
+extern crate alloc;
+
+use alloc::{vec, vec::Vec};
 use soroban_sdk::{contracttype, Address, Env};
 
 /// Payout prioritization strategy for claims exceeding pool balance.
@@ -92,11 +95,7 @@ pub fn calculate_payout(
 /// Pro-rata payout proportional to LP's accumulated premiums.
 ///
 /// payout = base_payout * (lp_premiums / total_premiums)
-fn calculate_pro_rata(
-    claim: &PendingClaim,
-    base_payout: i128,
-    total_lp_premiums: i128,
-) -> i128 {
+fn calculate_pro_rata(claim: &PendingClaim, base_payout: i128, total_lp_premiums: i128) -> i128 {
     if total_lp_premiums <= 0 {
         return 0;
     }
@@ -205,8 +204,7 @@ mod tests {
     #[test]
     fn test_invariant_p1_non_negative_payout() {
         let claim = make_claim(100, 0);
-        let payout =
-            calculate_payout(&claim, PayoutStrategy::ProRata, 1_000, 0, 1000).unwrap();
+        let payout = calculate_payout(&claim, PayoutStrategy::ProRata, 1_000, 0, 1000).unwrap();
         assert!(payout >= 0);
     }
 
@@ -309,11 +307,9 @@ mod tests {
         };
 
         let payout_clean =
-            calculate_payout(&claim_clean, PayoutStrategy::RiskWeighted, 1000, 0, 2000)
-                .unwrap();
+            calculate_payout(&claim_clean, PayoutStrategy::RiskWeighted, 1000, 0, 2000).unwrap();
         let payout_risky =
-            calculate_payout(&claim_risky, PayoutStrategy::RiskWeighted, 1000, 0, 2000)
-                .unwrap();
+            calculate_payout(&claim_risky, PayoutStrategy::RiskWeighted, 1000, 0, 2000).unwrap();
 
         // Clean LP should get higher payout than risky LP
         assert!(payout_clean > payout_risky);
@@ -326,7 +322,7 @@ mod tests {
         let lp2 = Address::generate(&env);
 
         let claim1 = PendingClaim {
-            lp: lp1,
+            lp: lp1.clone(),
             invoice_id: 1,
             claim_timestamp: 1000,
             lp_total_premiums: 500,
@@ -343,8 +339,7 @@ mod tests {
             coverage_cap: 1000,
         };
 
-        let allocations = allocate_payouts(&[claim1, claim2], PayoutStrategy::FIFO, 1200)
-            .unwrap();
+        let allocations = allocate_payouts(&[claim1, claim2], PayoutStrategy::FIFO, 1200).unwrap();
 
         // LP1 (earlier) should be satisfied first
         assert_eq!(allocations[0].0, lp1);

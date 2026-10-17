@@ -40,19 +40,38 @@ governance vote before mainnet launch (see [Section 8](#8-admin-veto-power)).
 
 ## 2. Governance token and voting power
 
-Voting power is read from per-proposal checkpoints, not the live balance at vote
-call time. When a proposal is created, the proposer's current governance-token
-balance is recorded as the initial checkpoint. The contract also maintains a
-proposal-scoped checkpoint for each voter; if no checkpoint exists yet, the
-first vote records that voter's current balance and reuses it for the duration
-of the proposal.
+Voting power is read from checkpoints, not the live balance at vote call time.
+Because Soroban cannot enumerate token holders on-chain, there is no global
+snapshot at proposal creation. Instead each voter maintains a
+`BalanceCheckpoint { balance, ledger }`:
+
+- Record one with `checkpoint_balance(voter)` (or automatically as proposer
+  via `create_proposal`). Query it with `get_voter_checkpoint(voter)`.
+- A vote on a proposal created at ledger `C` may only draw on a checkpoint
+  with `ledger + 10 <= C` (`MIN_VOTE_HOLD_LEDGERS = 10`, ~50 s), carrying
+  `min(checkpoint.balance, current_balance)`. A first vote with no such
+  checkpoint fails with `GovernanceError::InsufficientHoldingPeriod`.
+- The proposer's balance is additionally snapshotted at `create_proposal`
+  (where real funds must clear the proposer-balance gate and escrow) and
+  reused for the proposer's own vote; the proposal's creation ledger is
+  stored per proposal (`get_proposal_created_ledger`).
+- Once recorded, a voter's per-proposal `VoteWeightSnapshot` is reused for
+  that proposal's duration, and the applied weight (linear or quadratic) is
+  kept in the `AppliedVoteWeight` receipt.
+
+This closes the same-transaction flash-loan window (Issue #805): a loan that
+is borrowed, voted with, and repaid atomically can never age a checkpoint
+past the holding period, so the inflated balance is worthless. The cost is
+UX: a newly funded address must checkpoint once and wait ~10 ledgers before
+its first vote counts (it stays eligible on all later proposals).
 
 | Property | Value |
 |----------|-------|
 | Token | Address supplied to `initialize(gov_token)` |
 | Unit of power | 1 token = 1 vote (raw balance in stroops) |
-| Snapshot | Per-proposal voter checkpoint stored in contract storage |
-| Minimum power | Must be > 0 (0-balance callers are rejected with `GovernanceError::NoVotingPower`) |
+| Snapshot | Per-voter balance checkpoint + per-proposal vote-weight snapshot |
+| Holding period | Checkpoint must predate proposal creation by ≥ 10 ledgers |
+| Minimum power | Must be > 0 (0-weight callers are rejected with `GovernanceError::NoVotingPower`) |
 
 ---
 
@@ -140,10 +159,17 @@ Suppose the community wants to raise the protocol fee from 0 to 50 bps (0.5%).
 ```
 Step 1 — Create the proposal
 ────────────────────────────
-Caller: any address (no minimum token balance required to propose)
+Caller: any address holding at least `MinProposalBalance` (default 1 000
+stroops; plus the forfeitable `MinProposalDeposit` escrow when enabled)
 Function: GovContract::create_proposal(creator, ProposalAction::UpdateFeeRate(50), hash, 50)
 Result: proposal_id = 1
         voting_end  = now + 259_200
+
+Step 1b — Checkpoint (new holders only)
+────────────────────────────────────────
+A voter whose balance was never checkpointed calls once, well before voting:
+  GovContract::checkpoint_balance(voter_addr)
+(Aged ≥ 10 ledgers before the proposal below is created.)
 
 Step 2 — Vote
 ─────────────
@@ -151,22 +177,25 @@ During the 3-day window, token holders call:
   GovContract::cast_vote(voter_addr, proposal_id=1, support=true)   // For
   GovContract::cast_vote(voter_addr, proposal_id=1, support=false)  // Against
 
-Each call uses the stored checkpoint weight for that proposal/voter pair and
-adds it to votes_for or votes_against.
+Each call uses the stored checkpoint-backed weight for that proposal/voter
+pair and adds it to votes_for or votes_against.
 
 Step 3 — Execute (after voting_end)
 ────────────────────────────────────
-Anyone calls: GovContract::execute_proposal(proposal_id=1, total_supply)
+Anyone calls: GovContract::execute_proposal(proposal_id=1)
 
 The contract checks:
   total_votes = votes_for + votes_against
-  quorum      = total_supply * min_quorum_bps / 10_000  (default 10%)
+  quorum      = stored_total_supply * min_quorum_bps / 10_000  (default 10%)
 
-  If total_votes < quorum      → status = Rejected, error QuorumNotReached
+  If total_votes < quorum      → status = Rejected, deposit forfeited,
+                                 ProposalRejected{reason: QuorumNotReached} emitted, call returns Ok
   If votes_for > votes_against → status = Passed, then:
     invoke_contract(iln_contract, "update_fee_rate", [50])
-    status = Executed
-  Else                         → status = Rejected, error ProposalRejected
+    status = Executed (if the call fails: ProposalExecutionFailed emitted,
+                       call returns Ok, status stays Passed and is retryable)
+  Else                         → status = Rejected, deposit forfeited,
+                                 ProposalRejected{reason: MajorityAgainst} emitted, call returns Ok
 
 Emergency path — Admin veto before execution
 ─────────────────────────────────────────────
@@ -186,9 +215,15 @@ Active or Passed they can call:
 | Majority rule | Simple majority (`votes_for > votes_against`) | Strict `>` |
 | Abstain option | Not supported; every vote is For or Against | — |
 
-> **Note:** `total_supply` is a caller-supplied argument to `execute_proposal`,
-> not read from the token contract.  An incorrect value will distort the quorum
-> check.  Future governance iterations should read supply on-chain.
+> **Note:** `total_supply` is **not** a caller-supplied argument.
+> `execute_proposal(proposal_id)` reads the contract-stored
+> `GovTokenTotalSupply` (seeded by `initialize`, readable via
+> `get_gov_token_total_supply`, updatable only by the ILN contract via
+> `set_gov_token_total_supply`). A live SAC `total_supply()` query does not
+> exist in `soroban-sdk` 21.x's SEP-41 token interface, so the tracked counter
+> is the on-chain source of truth; an indexer/keeper must keep it in sync
+> with real mints and burns (residual staleness risk — see
+> [Governance Security Summary §3.3](governance-security-summary.md)).
 
 ---
 
@@ -265,18 +300,31 @@ An attacker with > 10% of supply can reach quorum alone.  Mitigations:
 
 ### Flash-loan / balance manipulation
 
-Voting power is pinned to proposal-scoped checkpoints, so later balance changes
-cannot inflate a voter's weight during an active proposal.
+Voting power is pinned to checkpoints that must predate the proposal
+(Issue #805): a first vote with no checkpoint aged ≥ 10 ledgers before the
+proposal's creation fails with `InsufficientHoldingPeriod`, and an aged
+checkpoint only carries `min(checkpoint, current)`. Same-transaction
+borrow-vote-repay (and splitting the loan across fresh Sybil addresses, see
+the quadratic Sybil analysis in the
+[Governance Security Summary](governance-security-summary.md)) cannot mint
+voting power. Delegation entries are gated the same way; un-delegation
+always succeeds so no tally can get stuck. Residual: the proposer's own
+creation-time snapshot uses the live balance (real funds must still clear
+the proposer gate and deposit escrow), and a multi-ledger (non-flash) borrow
+held past the holding period is indistinguishable from owned tokens.
 
 ### Delegation
 
 Transitive vote delegation is implemented (Issue #64).  Cycle detection and a
-maximum depth of 10 hops prevent infinite loops.
+maximum depth of 10 hops prevent infinite loops.  Delegating moves the
+delegator's proven (checkpoint-aged, `min`-capped) balance (Issue #805);
+un-delegating always succeeds so tallies cannot get stuck.
 
 ### Double-proposal spam
 
-There is no minimum token balance or deposit required to create a proposal.
-A future `min_proposal_deposit` guard is recommended.
+Proposal creation requires holding `MinProposalBalance` plus the forfeitable
+`MinProposalDeposit` escrow when enabled (Issue #814); forfeits go to the
+treasury sink (or stay locked when no sink is set).
 
 ---
 

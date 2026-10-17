@@ -34,9 +34,21 @@ name = "governance_main_integration_test"
 path = "../tests/governance_main_integration_test.rs"
 
 [[test]]
+name = "governance_cross_contract_auth_test"
+path = "../tests/governance_cross_contract_auth_test.rs"
+
+[[test]]
 name = "oracle_integration_test"
 path = "../tests/oracle_integration_test.rs"
 
 [[test]]
 name = "full_protocol_lifecycle_test"
 path = "../tests/full_protocol_lifecycle_test.rs"
+
+[[test]]
+name = "cross_contract_invariants_test"
+path = "../tests/cross_contract_invariants_test.rs"
+
+[[test]]
+name = "audit_regression_test"
+path = "../tests/audit_regression_test.rs"

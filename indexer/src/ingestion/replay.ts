@@ -19,7 +19,11 @@ import type {
   HorizonTransactionRecord,
 } from './eventListener.js';
 
-export interface ReplayOptions extends Omit<EventListenerOptions, 'initialBackoffMs' | 'maxBackoffMs'> {
+export interface ReplayOptions
+  extends Omit<
+    EventListenerOptions,
+    'initialBackoffMs' | 'maxBackoffMs' | 'onReorgDetected'
+  > {
   /** Ledger sequence to replay from (inclusive). */
   fromLedger: number;
   /** Optional exclusive upper bound; omit to replay up to the chain tip. */
@@ -63,6 +67,22 @@ export async function runReplay(options: ReplayOptions): Promise<ReplayResult> {
       reputationIngested += 1;
       options.repository.insertReputationUpdate(update);
     },
+    // Every write must forward: a method missing here would throw at replay
+    // time and silently drop the row the live path would have persisted
+    // (reorg recovery runs through this same runner).
+    insertInsuranceEnrollment: (enrollment) =>
+      options.repository.insertInsuranceEnrollment(enrollment),
+    insertInsurancePremium: (premium) => options.repository.insertInsurancePremium(premium),
+    insertInsuranceClaim: (claim) => options.repository.insertInsuranceClaim(claim),
+    getInsurancePoolStats: (contractId) => options.repository.getInsurancePoolStats(contractId),
+    upsertInsurancePoolStats: (contractId, balance, premiums, claims, enrolledCount) =>
+      options.repository.upsertInsurancePoolStats(
+        contractId,
+        balance,
+        premiums,
+        claims,
+        enrolledCount
+      ),
   };
 
   const fetchImpl = options.fetchImpl ?? fetch;

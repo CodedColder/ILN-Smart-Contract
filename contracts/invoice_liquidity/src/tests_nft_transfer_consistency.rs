@@ -9,7 +9,7 @@
 use super::*;
 use crate::nft::{get_invoice_nft_metadata, get_invoice_nft_owner, invoice_nft_exists};
 use crate::test::setup;
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger};
 
 const INVOICE_AMOUNT: i128 = 1_000_000_000;
 const DISCOUNT_RATE: u32 = 300;
@@ -96,7 +96,7 @@ fn test_nft_owner_follows_lead_lp_after_queue_resolution() {
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token.address);
     token_admin.mint(&funder2, &(INVOICE_AMOUNT * 10));
 
-    t.contract.join_fund_queue(&funder2, &id, &(third * 2));
+    t.contract.join_fund_queue(&funder2, &id);
 
     // Advance past queue delay
     let mut ledger_info = t.env.ledger().get();

@@ -65,6 +65,14 @@ fn setup_benchmark_env() -> BaseBenchEnv {
         &10_000,
     );
 
+    // Issue #805: checkpoint + age both actors so benchmarked votes and
+    // delegations exercise the eligible path.
+    contract.checkpoint_balance(&proposer);
+    contract.checkpoint_balance(&voter);
+    let mut ledger = env.ledger().get();
+    ledger.sequence_number += MIN_VOTE_HOLD_LEDGERS + 1;
+    env.ledger().set(ledger);
+
     BaseBenchEnv {
         env,
         contract,

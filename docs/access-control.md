@@ -2,6 +2,19 @@
 
 ## 1. Overview
 
+> **Machine-checked matrix:** the authoritative Instruction → gate table for all
+> five contracts is generated from `#[contractimpl]` source by
+> [`scripts/generate-access-control-matrix.py`](../scripts/generate-access-control-matrix.py)
+> into [`access-control-matrix.generated.md`](access-control-matrix.generated.md).
+> CI fails on drift. The tables below remain as narrative/role documentation;
+> if they disagree with the generated file on a function's gate, update the
+> narrative.
+
+> **Parameter safety:** For safe ranges of all adjustable parameters (fee rates,
+> discount rates, reputation thresholds, oracle windows, etc.), see
+> [Governance Operations Playbook § Adjustable Parameter Safe Ranges](governance-operations-playbook.md#adjustable-parameter-safe-ranges).
+
+
 The ILN-Smart-Contract implements a centralized access-control architecture to guarantee that all protocol operations are properly authorized. By centralizing permissions into shared guards, we achieve:
 - **Consistency**: All similar checks behave exactly the same way across different endpoints.
 - **Audibility**: Clear, easily reviewable access annotations on every public instruction.
@@ -95,7 +108,8 @@ Publicly accessible read or state-transition functions that do not require speci
 | `upgrade` | Admin | Emits upgrade event for WASM hash change (rate-limited: ~2h) |
 | `get_version` | Anyone | Reads contract version string |
 | `get_storage_version` | Anyone | Reads storage schema version for migrations |
-| `migrate` | Admin | Executes storage migration logic for upgrades |
+| `migrate` | Admin | Executes storage migration logic for upgrades (not rate-limited: one-shot version-gated op — see docs/rate-limiting.md) |
+| `update_config` | Admin | Updates core economic config in one call (rate-limited: ~30min, Issue #859) |
 | `max_invoice_amount` | Anyone | Reads the per-invoice size cap for the staged mainnet rollout (Issue #655; 0 = uncapped) |
 | `set_max_invoice_amount` | Admin (routed through governance once `admin` = the governance contract) | Sets the per-invoice size cap; raised over time as rollout confidence grows (rate-limited: ~30min) |
 | `token_volume_cap` | Anyone | Reads the cumulative funded-volume cap for a token (Issue #655; 0 = uncapped) |
@@ -109,19 +123,22 @@ Publicly accessible read or state-transition functions that do not require speci
 | `get_price_oracle` | Anyone | Reads the current price oracle address |
 | `set_max_oracle_age` | Admin | Updates the maximum acceptable oracle data age in ledgers (rate-limited: ~10min) |
 | `get_max_oracle_age` | Anyone | Reads the current max oracle age setting |
-| `register_oracle` | Admin | Registers an oracle for a specific feed type (not rate-limited; governance-critical) |
-| `remove_oracle` | Admin | Removes oracle registration for a feed type (not rate-limited; governance-critical) |
-| `register_token_oracle` | Admin | Registers an oracle for a specific token (not rate-limited; governance-critical) |
-| `remove_token_oracle` | Admin | Removes oracle registration for a token (not rate-limited; governance-critical) |
+| `register_oracle` | Admin | Registers an oracle for a specific feed type (rate-limited: ~10min, Issue #859) |
+| `remove_oracle` | Admin | Removes oracle registration for a feed type (rate-limited: ~10min, Issue #859) |
+| `register_token_oracle` | Admin | Registers an oracle for a specific token (rate-limited: ~10min, Issue #859) |
+| `remove_token_oracle` | Admin | Removes oracle registration for a token (rate-limited: ~10min, Issue #859) |
 | `get_oracle_for_token` | Anyone | Reads the registered oracle address for a given token |
 | `get_oracle_health` | Anyone | Reads cached oracle health status (accessible while contract is paused) |
 | `check_oracle_health` | Anyone | Performs live oracle health check and caches result (accessible while paused) |
 | `is_oracle_circuit_tripped` | Anyone | Checks if an oracle's circuit breaker is activated |
-| `reset_oracle_circuit` | Admin | Resets a circuit-tripped oracle's status |
-| `add_price_source` | Admin | Adds a price feed source for an oracle feed type |
-| `remove_price_source` | Admin | Removes a price feed source |
+| `reset_oracle_circuit` | Admin | Resets a circuit-tripped oracle's status (rate-limited: ~10min, Issue #859) |
+| `add_price_source` | Admin | Adds a price feed source for an oracle feed type (rate-limited: ~10min, Issue #859) |
+| `remove_price_source` | Admin | Removes a price feed source (rate-limited: ~10min, Issue #859) |
 | `get_price_sources` | Anyone | Reads all registered price sources for a feed type |
-| `set_max_price_deviation_bps` | Admin | Sets maximum acceptable price deviation in basis points |
+| `set_max_price_deviation_bps` | Admin | Sets maximum acceptable price deviation in basis points (rate-limited: ~10min, Issue #859)
+| `set_twap_enabled` | Admin | Opts a feed into TWAP-windowed price reads (rate-limited: ~10min, Issue #859) |
+| `set_twap_window_ledgers` | Admin | Sets the TWAP averaging window in ledgers (rate-limited: ~10min, Issue #859) |
+| `record_twap_sample` | Admin/keeper | Pushes one TWAP price sample (not rate-limited: high-frequency keeper op — see docs/rate-limiting.md) | |
 | `get_max_price_deviation_bps` | Anyone | Reads the max price deviation setting |
 | `get_verified_price` | Anyone | Queries and verifies price data from oracle (with deviation checks) |
 
@@ -129,7 +146,7 @@ Publicly accessible read or state-transition functions that do not require speci
 
 | Instruction | Allowed Role(s) | Description |
 | ----------- | --------------- | ----------- |
-| `set_insurance_pool` | Admin | Updates the insurance pool contract address |
+| `set_insurance_pool` | Admin | Updates the insurance pool contract address (rate-limited: ~10min) |
 | `get_insurance_pool` | Anyone | Reads the current insurance pool contract address |
 
 ### Insurance Pool Contract
@@ -278,6 +295,18 @@ Certain admin operations are sensitive to high-frequency invocation — an attac
 | `set_max_oracle_age` | 120 ledgers (~10min) | Infrastructure change |
 | `add_token` | 120 ledgers (~10min) | Token allowlist change |
 | `remove_token` | 120 ledgers (~10min) | Token allowlist change |
+| `update_config` | 360 ledgers (~30min) | Economic parameter manipulation (Issue #859) |
+| `update_fee_tiers` | 360 ledgers (~30min) | Economic parameter manipulation |
+| `register_oracle` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
+| `remove_oracle` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
+| `register_token_oracle` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
+| `remove_token_oracle` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
+| `reset_oracle_circuit` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
+| `add_price_source` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
+| `remove_price_source` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
+| `set_max_price_deviation_bps` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
+| `set_twap_enabled` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
+| `set_twap_window_ledgers` | 120 ledgers (~10min) | Oracle registry configuration (Issue #859) |
 
 ### Exempt Functions
 
@@ -287,11 +316,19 @@ Emergency functions are not rate-limited so they can be used immediately when a 
 - `resolve_appeal`
 - `resolve_dispute`
 
+Other documented exemptions (full matrix and rationale: [docs/rate-limiting.md](./rate-limiting.md)):
+- `migrate` — one-shot, version-gated; blocking it behind the upgrade cooldown would delay post-upgrade repairs
+- `record_twap_sample` — high-frequency keeper op; limiting it would starve the TWAP window
+- multisig `execute_proposal` — replaced by N-of-M threshold + proposal-expiry timelock
+- `check_oracle_health` — feeds the circuit breaker itself; limiting it would starve the breaker
+
 ### Implementation
 
 Rate limiting is implemented in `contracts/invoice_liquidity/src/access.rs`:
 
 - `check_rate_limit(env, fn_name, cooldown_ledgers)` checks the last ledger when the function was called. If insufficient ledgers have elapsed, it returns `ContractError::RateLimited`. Otherwise, it records the current ledger as the last call time.
+- A function's first-ever call always passes (no prior record exists to space out from); only *consecutive* calls are spaced. (Issue #859 fixed a cold-start quirk where `unwrap_or(0)` rejected the first call on low-sequence networks.)
+- Cross-contract coverage matrix for all five contracts: [docs/rate-limiting.md](./rate-limiting.md).
 - Storage key: `DataKey::RateLimit(Symbol::new(env, fn_name))` — per-function, instance storage.
 - The cooldown is measured in ledgers (not timestamps) to align with Soroban's deterministic execution model.
 - At ~5 seconds per ledger: 120 ledgers ≈ 10 min, 360 ≈ 30 min, 720 ≈ 1h, 1440 ≈ 2h.

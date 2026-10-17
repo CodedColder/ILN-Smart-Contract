@@ -607,6 +607,39 @@ Emitted when an admin changes a contract configuration parameter.
 
 ---
 
+## TWAP Oracle events
+
+### `TwapEnabledForFeed`
+
+Emitted when TWAP is enabled or disabled for a specific feed type.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `feedType` | `string` | Oracle feed type |
+| `enabled` | `boolean` | True if TWAP is enabled |
+
+### `TwapWindowUpdated`
+
+Emitted when the TWAP window size is updated.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `oldWindow` | `string` | Previous TWAP window in ledgers |
+| `newWindow` | `string` | New TWAP window in ledgers |
+
+### `TwapInsufficientData`
+
+Emitted when a TWAP read fails due to insufficient observations.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `feedType` | `string` | Oracle feed type queried |
+| `token` | `string` | Token queried |
+| `observations` | `number` | Number of observations found |
+| `minRequired` | `number` | Minimum observations required |
+
+---
+
 ## Quick-reference table
 
 | Event | Category | SDK | WS | REST |
@@ -633,3 +666,6 @@ Emitted when an admin changes a contract configuration parameter.
 | `PairDefaultRecorded` | Insurance | ✓ | ✓ | ✓ |
 | `AdminChanged` | Governance | ✓ | ✓ | ✓ |
 | `ParameterUpdated` | Governance | ✓ | ✓ | ✓ |
+| `TwapEnabledForFeed` | Oracle | ✓ | ✓ | ✓ |
+| `TwapWindowUpdated` | Oracle | ✓ | ✓ | ✓ |
+| `TwapInsufficientData` | Oracle | ✓ | ✓ | ✓ |

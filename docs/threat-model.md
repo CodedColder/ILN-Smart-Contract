@@ -686,11 +686,84 @@ Governance token balances determine voting weight in the ILN contract. To preven
 5. The attacker repays the flash loan.
 ```
 
-**Residual Risk:** ⚠️ **HIGH**
-Since Soroban lacks a native historical state-proof or checkpointing mechanism, the lazy-snapshot technique leaves the contract vulnerable to flash-loan manipulation if the token becomes composable in DeFi. Quadratic voting reduces the impact but does not eliminate it.
+**Residual Risk:** ✅ **FIXED (Issue #805)** — was ⚠️ HIGH.
+The lazy first-vote snapshot above is replaced by checkpoint-gated voting:
+a first vote requires a `BalanceCheckpoint` predating the proposal's
+creation ledger by `MIN_VOTE_HOLD_LEDGERS` (10 ledgers) and carries
+`min(checkpoint, current)`; same-transaction borrow-vote-repay is rejected
+with `InsufficientHoldingPeriod`, and `delegate_votes` entries are gated
+identically. The attack scenario above now fails at step 3. Remaining
+residual: multi-ledger (non-flash) borrows held past the holding period, and
+the proposer's live-balance creation snapshot — see
+[Governance Security Summary §3.2](governance-security-summary.md).
 
-**Recommendation:**
-If the governance token becomes widely flash-loanable, the protocol must transition to a staking-based governance model (e.g., locking tokens in an escrow vault for the duration of the proposal) or integrate with an oracle that provides cryptographic proofs of historical ledger balances prior to proposal creation.
+**Recommendation (kept for the residual):**
+If aged-balance manipulation ever becomes practical, transition to a
+staking-based governance model (e.g., locking tokens in an escrow vault for
+the duration of the proposal) or integrate an oracle with cryptographic
+proofs of historical ledger balances prior to proposal creation.
+
+---
+
+#### E4. Upgrade-Time TTL Field Removal (Issue #1082)
+
+**Description:**
+A Soroban contract upgrade replaces the WASM binary while preserving all
+persistent storage entries.  Before this fix, an upgrade could silently
+proceed even when one or more critical persistent entries (`InvoiceCore`,
+`InvoiceMetadata`, `FundQueue`, `FundQueueOpenedAt`, `QueueResolution`) had
+drifted close to their TTL expiry — either through a missing `extend_ttl`
+call in an earlier code path, or through deliberate omission by a compromised
+admin.  The new WASM would then begin executing against storage entries that
+could expire mid-flight, causing silent data loss with no on-chain indication.
+
+**Attack Scenario:**
+```
+1. Admin (or compromised admin key) deliberately stops calling extend_ttl
+   on active invoices over multiple upgrade cycles.
+2. After enough time passes, InvoiceCore/InvoiceMetadata TTLs fall below
+   the safety threshold (e.g., < 500,000 ledgers remaining).
+3. Admin calls upgrade() — previously this would succeed.
+4. New WASM executes against near-expiry storage; within days, live invoice
+   data is archived by the Soroban host.
+5. Users lose access to invoice records; LP positions become irrecoverable.
+```
+
+**Residual Risk Before Fix:** ⚠️ **HIGH** — silent data loss possible via upgrade.
+
+**Fix (Issue #1082):** `upgrade()` now calls
+`storage::validate_ttl_fields_pre_upgrade()` _before_ the WASM swap. The
+guard samples the most-recent 50 invoice IDs and checks all five key
+categories. If any existing entry has remaining TTL <
+`TTL_MIN_LEDGERS_BEFORE_UPGRADE` (500,000 ledgers ≈ 29 days), the call
+returns `Err(ContractError::UpgradeRemovesTtlFields)` (error code 50) and
+the upgrade is **rejected fail-closed** — the WASM is never swapped.
+
+**Residual Risk After Fix:** ✅ **LOW**
+- The guard is bounded to the most-recent 50 invoices (older entries outside
+  the window are not checked — by design, since re-extending expired data
+  would require recovering it from the ledger archive first).
+- A sufficiently patient admin with access to both the admin key and the
+  ability to suppress `save_invoice` calls for > 29 days could exhaust the
+  sample window. Multi-sig admin is the defense against that scenario.
+- The guard does not check non-invoice persistent keys (e.g. `LpScore`,
+  `Reputation`). Those do not carry protocol-critical locked-funds data and
+  can be refreshed independently without blocking an upgrade.
+
+**Mitigation:**
+- ✅ Fail-closed pre-upgrade TTL guard (`validate_ttl_fields_pre_upgrade`)
+- ✅ New `ContractError::UpgradeRemovesTtlFields` (code 50) — distinguishable
+  from all other upgrade failures
+- ✅ `TTL_MIN_LEDGERS_BEFORE_UPGRADE = 500_000` (≈ 29 days) — well above any
+  reasonable upgrade execution window
+- ✅ Remediation path documented: re-invoke `save_invoice` / queue helpers to
+  refresh TTLs before retrying
+- 🔲 Governance should require multi-sig admin to prevent a single compromised
+  key from suppressing TTL renewals over an extended period
+
+**Code Evidence:** `contracts/invoice_liquidity/src/storage.rs` —
+`validate_ttl_fields_pre_upgrade()`; `contracts/invoice_liquidity/src/lib.rs`
+— `upgrade()`.
 
 
 ### F. TOKEN TRANSFER EDGE CASES
@@ -1151,9 +1224,9 @@ This document has been reviewed by a team member independent of the original thr
 **Review Date:** 2026-09-24  
 **Review Findings:**
 - ✅ v2.0 updates accurately reflect implemented components (Multi-Sig, Oracle Registry, Governance, Distribution, Insurance Pool)
-- ✅ Flash-loan risk (E3) properly documented as accepted risk pending governance token composability
+- ✅ Flash-loan risk (E3) fixed via checkpoint-gated voting (Issue #805); residual documented in E3 and governance-security-summary §3.2
 - ✅ No timelock on governance execution (ADR-005) correctly noted as accepted risk with veto as interim mitigation
-- ✅ Quorum consistency (caller-supplied `total_supply`) documented as accepted risk; admin veto is sufficient backstop for v1
+- ✅ Quorum consistency now reads the stored `GovTokenTotalSupply` (Issue #808); tracked-supply staleness residual documented, veto retained until live supply reads exist
 - ✅ All residual risks cross-referenced to primary mitigation sources (ADRs, governance docs, disaster-recovery runbook)
 - ✅ Parameter validation gaps (decay_rate_bps, high_rep_threshold) tracked as separate audit-prep issues (#692-693)
 - ✅ Distribution contract mint authority and event coverage concerns documented (Section H, Issue #691)

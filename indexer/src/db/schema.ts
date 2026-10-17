@@ -85,6 +85,17 @@ export function initializeSchema(db: Database.Database): void {
       state_value TEXT NOT NULL
     );
 
+    -- Canonical ledger headers captured as their ledgers are ingested.
+    -- Reorg detection (Issue #863) compares each newly-ingested ledger's
+    -- hash/parent_hash against this history; the consistency job (Issue
+    -- #866) re-checks it against the chain as a backstop.
+    CREATE TABLE IF NOT EXISTS ledger_headers (
+      sequence INTEGER PRIMARY KEY,
+      hash TEXT NOT NULL,
+      parent_hash TEXT NOT NULL,
+      ingested_at INTEGER NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_events_invoice_id ON events(invoice_id);
     CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
     CREATE INDEX IF NOT EXISTS idx_events_contract_id ON events(contract_id);

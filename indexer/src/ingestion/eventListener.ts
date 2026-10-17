@@ -8,6 +8,7 @@ import type {
   InsurancePoolPremiumRecord,
   InsurancePoolClaimRecord,
 } from '../db/eventRepository.js';
+import type { LedgerReorgDetector, ReorgDivergence } from './reorgDetector.js';
 
 export interface HorizonTransactionRecord {
   hash: string;
@@ -34,12 +35,36 @@ export interface EventListenerOptions {
   logger?: Pick<Console, 'info' | 'warn' | 'error'>;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
+  /**
+   * Ledger continuity verification (Issue #863). When present, every ledger
+   * is checked against stored history *before* its transactions are written;
+   * a mismatch latches the detector's halt and ingestion stops persisting.
+   */
+  reorgDetector?: LedgerReorgDetector;
+  /**
+   * Invoked once per detected divergence so the caller can run the shared
+   * rollback-and-replay recovery (Issue #864). Omit to only flag the
+   * divergence — the halt latch stays set until something clears it.
+   */
+  onReorgDetected?: (divergence: ReorgDivergence) => Promise<void>;
 }
 
 const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
 const DEFAULT_MAX_BACKOFF_MS = 30_000;
 const LAST_CURSOR_STATE_KEY = 'last_processed_cursor';
 const LAST_LEDGER_STATE_KEY = 'last_processed_ledger';
+
+/**
+ * Control-flow signal: reorg recovery rebuilt state and the SSE stream must
+ * be re-opened from the recovered cursor. Thrown from `processTransaction`,
+ * caught by `start()`; never escapes the ingestion loop.
+ */
+class StreamResyncSignal extends Error {
+  constructor() {
+    super('stream resync after reorg recovery');
+    this.name = 'StreamResyncSignal';
+  }
+}
 
 export class EventListener {
   private readonly repository: EventRepository;
@@ -50,7 +75,17 @@ export class EventListener {
   private readonly logger: Pick<Console, 'info' | 'warn' | 'error'>;
   private readonly initialBackoffMs: number;
   private readonly maxBackoffMs: number;
+  private readonly reorgDetector: LedgerReorgDetector | undefined;
+  private readonly onReorgDetected: ((divergence: ReorgDivergence) => Promise<void>) | undefined;
   private stopped = false;
+  /**
+   * Set whenever a record was skipped because ingestion was halted for a
+   * reorg: the records that arrived while halted are dropped (replay
+   * rebuilds them), so the stream must reconnect from the recovered cursor
+   * once ingestion resumes rather than continue on a connection that has
+   * already skipped ahead.
+   */
+  private resyncPending = false;
   private activeAbortController: AbortController | null = null;
 
   constructor(options: EventListenerOptions) {
@@ -62,6 +97,8 @@ export class EventListener {
     this.logger = options.logger ?? console;
     this.initialBackoffMs = options.initialBackoffMs ?? DEFAULT_INITIAL_BACKOFF_MS;
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
+    this.reorgDetector = options.reorgDetector;
+    this.onReorgDetected = options.onReorgDetected;
   }
 
   stop(): void {
@@ -70,6 +107,9 @@ export class EventListener {
   }
 
   async start(): Promise<void> {
+    // Restartable: a lost ingestion lease stops the loop, and the next
+    // leadership grant must resume it from the persisted cursor.
+    this.stopped = false;
     let backoffMs = this.initialBackoffMs;
     let cursor = this.repository.getState(LAST_CURSOR_STATE_KEY) || 'now';
 
@@ -85,6 +125,18 @@ export class EventListener {
       } catch (error) {
         if (this.stopped) {
           break;
+        }
+
+        if (error instanceof StreamResyncSignal) {
+          // Recovery is done and the latch is clear: reconnect immediately
+          // from the recovered cursor so nothing between the last written
+          // record and the chain tip is skipped.
+          backoffMs = this.initialBackoffMs;
+          cursor = this.repository.getState(LAST_CURSOR_STATE_KEY) || cursor;
+          this.logger.info(
+            `indexer ingestion resuming at cursor ${cursor} after reorg recovery`
+          );
+          continue;
         }
 
         const message = error instanceof Error ? error.message : String(error);
@@ -166,8 +218,37 @@ export class EventListener {
    * Decode, persist, and checkpoint a single Horizon transaction record.
    * Public so the replay runner can re-process historical transactions with
    * identical semantics to live ingestion (idempotent upserts).
+   *
+   * When a reorg detector is attached, the record's ledger is verified
+   * against stored history first (Issue #863): a divergence is logged as
+   * `ReorgDetected`, flagged in `indexer_state`, and handed to
+   * `onReorgDetected` for rollback-and-replay (Issue #864) instead of being
+   * written on top of the now-invalid chain.
    */
   async processTransaction(record: HorizonTransactionRecord): Promise<void> {
+    // Fast path: another process/rotation already flagged this divergence.
+    if (this.reorgDetector?.isHalted()) {
+      this.resyncPending = true;
+      return;
+    }
+
+    if (this.reorgDetector) {
+      const divergence = await this.reorgDetector.observe(record.ledger);
+      if (divergence) {
+        // Marked before recovery so the first successfully-written record
+        // after recovery reopens the stream from the rebuilt cursor.
+        this.resyncPending = true;
+        await this.handleReorg(divergence);
+        return;
+      }
+      // The header read above is an await point: recovery may have latched
+      // the halt in the meantime (concurrent consistency-job run).
+      if (this.reorgDetector.isHalted()) {
+        this.resyncPending = true;
+        return;
+      }
+    }
+
     let processedSuccessfully = false;
 
     try {
@@ -221,6 +302,46 @@ export class EventListener {
     if (processedSuccessfully) {
       this.repository.setState(LAST_CURSOR_STATE_KEY, record.paging_token);
       this.repository.setState(LAST_LEDGER_STATE_KEY, String(record.ledger));
+
+      // Records skipped while halted were dropped from this connection;
+      // recovery re-derived them, so reopen the stream from the checkpoint
+      // rather than trusting a connection that skipped ahead. Gated on
+      // owning recovery: replay runs the same code without a recovery hook
+      // and must not be interrupted mid-replay.
+      if (this.resyncPending && this.onReorgDetected) {
+        this.resyncPending = false;
+        throw new StreamResyncSignal();
+      }
+    }
+  }
+
+  /**
+   * Emit the `ReorgDetected` entry for a flagged divergence and hand it to
+   * the recovery callback. The detector has already latched the halt, so the
+   * stream can keep running — nothing further is persisted until recovery
+   * clears the latch (or the callback is deliberately omitted and the
+   * divergence stays flagged for an operator/consistency job to resolve).
+   */
+  private async handleReorg(divergence: ReorgDivergence): Promise<void> {
+    this.logger.error(
+      `ReorgDetected ledger=${divergence.divergenceLedger} reason=${divergence.reason} ` +
+        `fork=${divergence.commonAncestorLedger} detectedBy=${divergence.detectedBy}`
+    );
+    this.logger.error(divergence.message);
+
+    if (!this.onReorgDetected) {
+      return;
+    }
+
+    try {
+      await this.onReorgDetected(divergence);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(
+        `reorg recovery failed at ledger ${divergence.divergenceLedger}: ${message}`
+      );
+      // The halt latch stays set on failure: ingestion remains blocked until
+      // a recovery succeeds rather than resuming on a broken chain.
     }
   }
 }
@@ -709,6 +830,13 @@ function canonicalEventType(rawEventType: string): string {
       return 'InsurancePremiumRateGovernance';
     case 'cap_set':
       return 'InsuranceBalanceCapSet';
+    // TWAP Oracle events
+    case 'twap_enabled':
+      return 'TwapEnabledForFeed';
+    case 'twap_window_updated':
+      return 'TwapWindowUpdated';
+    case 'twap_insufficient_data':
+      return 'TwapInsufficientData';
     default:
       return normalized
         .split('_')
@@ -754,6 +882,9 @@ function inferRawEventType(contractEventType: string): string {
     InsuranceAdminCancelled: 'adm_cncl',
     InsurancePremiumRateGovernance: 'prem_gov',
     InsuranceBalanceCapSet: 'cap_set',
+    TwapEnabledForFeed: 'twap_enabled',
+    TwapWindowUpdated: 'twap_window_updated',
+    TwapInsufficientData: 'twap_insufficient_data',
   };
 
   return mapping[contractEventType] ?? contractEventType.toLowerCase();

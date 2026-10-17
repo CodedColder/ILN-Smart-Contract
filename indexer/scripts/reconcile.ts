@@ -16,7 +16,13 @@
 
 import Database from 'better-sqlite3';
 import { config } from '../src/config.js';
+import { createSqlEventRepository } from '../src/db/eventRepository.js';
+import { createHorizonLedgerHeaderSource } from '../src/ingestion/ledgerHeaders.js';
+import { createIngestionLock } from '../src/ingestion/ingestionLock.js';
+import { recoverFromReorg } from '../src/ingestion/reorgRecovery.js';
+import type { ReorgDivergence } from '../src/ingestion/reorgDetector.js';
 import {
+  buildReorgAlertPayload,
   createWebhookAlertDispatcher,
   startReconciliationSchedule,
 } from '../src/reconciliation/consistencyJob.js';
@@ -47,12 +53,30 @@ if (!alertUrl) {
   console.warn('RECONCILIATION_ALERT_URL not set — drift alerts will be logged only.');
 }
 
+// Reorg backstop (Issue #866): same header source, lock and
+// rollback-and-replay path the running indexer uses.
+const ledgerHeaders = createHorizonLedgerHeaderSource(config.horizonUrl);
+const ingestionLock = createIngestionLock({ db });
+const onReorgDetected = (divergence: ReorgDivergence) =>
+  recoverFromReorg(divergence, {
+    db,
+    repository: createSqlEventRepository(db),
+    horizonUrl: config.horizonUrl,
+    contractAddress: config.contractId,
+    source: ledgerHeaders,
+    lock: ingestionLock,
+  });
+
 if (watch) {
   console.log(
     `Starting reconciliation watch every ${DEFAULT_RECONCILIATION_CONFIG.intervalMs}ms ` +
       `(sample=${DEFAULT_RECONCILIATION_CONFIG.sampleSize}, tolerance=${DEFAULT_RECONCILIATION_CONFIG.tolerancePercent}%).`
   );
-  const scheduler = startReconciliationSchedule(db, chainReader, { alert });
+  const scheduler = startReconciliationSchedule(db, chainReader, {
+    alert,
+    ledgerHeaders,
+    onReorgDetected,
+  });
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
       scheduler.stop();
@@ -62,8 +86,17 @@ if (watch) {
   }
 } else {
   import('../src/reconciliation/consistencyJob.js')
-    .then(({ runReconciliation }) => runReconciliation(db, chainReader))
-    .then((report) => {
+    .then(({ runReconciliation }) => runReconciliation(db, chainReader, undefined, { ledgerHeaders }))
+    .then(async (report) => {
+      if (report.reorgDivergence) {
+        // Halt latch is already set by the run; recover or leave it for the
+        // running indexer — either way the operator sees the divergence.
+        if (alert) {
+          await alert(buildReorgAlertPayload(report));
+        }
+        await onReorgDetected(report.reorgDivergence);
+        return report;
+      }
       if (alert && report.driftDetected) {
         return alert({
           type: 'indexer_drift_detected',

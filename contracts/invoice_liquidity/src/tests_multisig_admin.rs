@@ -17,6 +17,7 @@
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{Address, Env, Vec};
 
     struct TestEnv {
@@ -122,7 +123,10 @@ mod tests {
 
         // Threshold not reached yet
         let result = t.contract.try_execute_proposal(&t.admin1, &proposal_id);
-        assert_eq!(result.unwrap().unwrap_err(), ContractError::ThresholdNotReached);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::ThresholdNotReached
+        );
     }
 
     // ────────────────────────────────────────────────────────────
@@ -160,7 +164,10 @@ mod tests {
 
         // Non-authorized address tries to sign
         let result = t.contract.try_sign_proposal(&t.other, &proposal_id);
-        assert_eq!(result.unwrap().unwrap_err(), ContractError::NotAuthorizedSigner);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::NotAuthorizedSigner
+        );
     }
 
     // ────────────────────────────────────────────────────────────
@@ -179,7 +186,7 @@ mod tests {
 
         // Same address tries to sign again
         let result = t.contract.try_sign_proposal(&t.admin1, &proposal_id);
-        assert_eq!(result.unwrap().unwrap_err(), ContractError::AlreadySigned);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::AlreadySigned);
     }
 
     // ────────────────────────────────────────────────────────────
@@ -192,7 +199,10 @@ mod tests {
 
         // Non-signer tries to propose
         let result = t.contract.try_propose_pause(&t.other);
-        assert_eq!(result.unwrap().unwrap_err(), ContractError::NotAuthorizedSigner);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::NotAuthorizedSigner
+        );
     }
 
     // ────────────────────────────────────────────────────────────
@@ -209,7 +219,10 @@ mod tests {
 
         // Try to execute with only 1 signature (need 2)
         let result = t.contract.try_execute_proposal(&t.admin1, &proposal_id);
-        assert_eq!(result.unwrap().unwrap_err(), ContractError::ThresholdNotReached);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::ThresholdNotReached
+        );
     }
 
     // ────────────────────────────────────────────────────────────
@@ -222,7 +235,10 @@ mod tests {
 
         // Try to execute non-existent proposal
         let result = t.contract.try_execute_proposal(&t.admin1, &999);
-        assert_eq!(result.unwrap().unwrap_err(), ContractError::ProposalNotFound);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::ProposalNotFound
+        );
     }
 
     // ────────────────────────────────────────────────────────────
@@ -242,7 +258,10 @@ mod tests {
 
         // Try to execute again
         let result = t.contract.try_execute_proposal(&t.admin1, &proposal_id);
-        assert_eq!(result.unwrap().unwrap_err(), ContractError::ProposalAlreadyExecuted);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::ProposalAlreadyExecuted
+        );
     }
 
     // ────────────────────────────────────────────────────────────
@@ -258,7 +277,10 @@ mod tests {
 
         // Threshold (3) > signer count (2)
         let result = t.contract.try_initialize_multisig_admin(&signers, &3);
-        assert_eq!(result.unwrap().unwrap_err(), ContractError::InvalidMultisigConfig);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::InvalidMultisigConfig
+        );
     }
 
     // ────────────────────────────────────────────────────────────
@@ -301,7 +323,10 @@ mod tests {
 
         // Should fail with only 2 signatures
         let result = t.contract.try_execute_proposal(&t.admin1, &proposal_id);
-        assert_eq!(result.unwrap().unwrap_err(), ContractError::ThresholdNotReached);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::ThresholdNotReached
+        );
 
         // Third signature makes it succeed
         t.contract.sign_proposal(&t.admin3, &proposal_id);
@@ -351,10 +376,16 @@ mod tests {
 
         // Second signer tries to sign after expiration
         let sign_result = t.contract.try_sign_proposal(&t.admin2, &proposal_id);
-        assert_eq!(sign_result.unwrap().unwrap_err(), ContractError::ProposalExpired);
+        assert_eq!(
+            sign_result.unwrap_err().unwrap(),
+            ContractError::ProposalExpired
+        );
 
         // Execution should also fail with the same error
         let exec_result = t.contract.try_execute_proposal(&t.admin1, &proposal_id);
-        assert_eq!(exec_result.unwrap().unwrap_err(), ContractError::ProposalExpired);
+        assert_eq!(
+            exec_result.unwrap_err().unwrap(),
+            ContractError::ProposalExpired
+        );
     }
 }
