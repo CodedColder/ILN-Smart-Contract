@@ -322,7 +322,7 @@ Unlike the invoice lifecycle (one enum field on a mutable record), a `Governance
 
 **Rationale:** Guarantees `execute_proposal` is safely retriable and that `Executed` status is a reliable signal that the action actually took effect (Issue #531).
 
-**Enforcement:** `invoke_and_check()` (`src/lib.rs:1396-1408`) uses `try_invoke_contract`; the `!succeeded` branch (`src/lib.rs:1186-1198`) returns `ExecutionFailed` without touching persistent proposal storage.
+**Enforcement:** `invoke_and_check()` (`src/lib.rs:1396-1408`) uses `try_invoke_contract`; the `!succeeded` branch emits `proposal_execution_failed` and returns `Ok` (Issue #1007: an `Err` would roll the event back) without touching persistent proposal storage.
 
 ### Invariant V7: Receipts are archival-resilient (fail-closed)
 **Property:** Archival/eviction of a temporary vote or veto receipt by the host cannot resurrect a stale authorization. `has_voted` and `get_applied_vote_weight` fall back to the durable `VoteReceipt` mirror; the veto threshold tally is derived from durable per-signer `VetoApprovalReceipt` flags. Presence in *either* store blocks a repeat action.
@@ -351,7 +351,7 @@ Unlike the invoice lifecycle (one enum field on a mutable record), a `Governance
 | Action | Guard |
 |---|---|
 | `veto_proposal` | Caller must equal stored `Admin`; `VetoPowerEnabled` must be `true` |
-| `set_execution_delay` | Caller must equal stored `Admin` (or become admin on first call if unset) |
+| `set_execution_delay` | Caller must equal stored `Admin`; returns `NotInitialized` if no admin is stored (Issue #997 — no first-caller bootstrap) |
 
 ### Invariant GA4: ILN-Contract-Gated Authorization
 These parameters can only be changed by the configured `IlnContract` address (i.e. routed through a passed governance proposal on the ILN contract itself, or an equivalent trusted caller) — never by an arbitrary account:
@@ -376,13 +376,13 @@ These parameters can only be changed by the configured `IlnContract` address (i.
 
 **GSP1 — State determinism:** Given a proposal's starting status and a sequence of actions, there is exactly one reachable final status. `execute_proposal` is idempotent on already-terminal states (`Rejected`/`Executed`/`Vetoed` always return `AlreadyResolved`).
 
-**GSP2 — No premature execution:** A proposal cannot reach `Executed` before both `now >= voting_end` (voting-window guard) and `current_ledger >= eta_ledger` (timelock guard) have been satisfied in that order.
+**GSP2 — No premature execution (Issue #1087):** A proposal cannot reach `Executed` before both `now >= voting_end` (voting-window guard) and `current_ledger >= eta_ledger` (timelock guard) have been satisfied in that order. At any sequence `current_ledger < eta_ledger`, execution attempts return `TimelockNotExpired` and no cross-contract state mutations occur.
 
 **GSP3 — No double execution:** Once a proposal reaches `Executed`, no further call can change its `action_type` effects — `execute_proposal` on an `Executed` proposal returns `AlreadyResolved` without re-invoking the cross-contract call.
 
-**GSP4 — Veto is a strict override:** `veto_proposal` can transition `Active` or `Passed` directly to `Vetoed`, bypassing quorum/majority checks entirely, but only while `VetoPowerEnabled == true`; once `disable_veto_power` runs, this path is permanently closed (Invariant GA4).
+**GSP4 — Veto is a strict override & transition safety (Issue #1088):** `veto_proposal` can transition `Active` or `Passed` directly to `Vetoed`, bypassing quorum/majority checks entirely, but only while `VetoPowerEnabled == true`; once `disable_veto_power` runs, this path is permanently closed (Invariant GA4). `Vetoed` is a terminal state that permanently disables execution. Non-vetoable states (`Executed`, `Rejected`, `Vetoed`) reject veto attempts with `NotVetoable`.
 
-**GSP5 — Auth enforcement:** Every state-mutating action requires the caller (or a designated authority — admin, the configured ILN contract, or the acting address itself) to pass an explicit `require_auth()` check. No action can be invoked without satisfying its auth predicate.
+**GSP5 — Auth enforcement across proposal lifecycle (Issue #1089):** Every state-mutating action requires the caller (or a designated authority — proposer, voter, admin/veto signer, or the configured ILN contract) to pass an explicit `require_auth()` check. No action can be invoked without satisfying its auth predicate and parameter bounds.
 
 ### 11.2 Liveness Properties
 
@@ -412,11 +412,10 @@ There is no single `check_invariants()` helper analogous to the invoice contract
 |---|---|
 | State machine valid transitions (create → vote → execute) | `contracts/tests/governance_lifecycle_test.rs`, `contracts/tests/governance_main_integration_test.rs` |
 | Quorum / majority rejection paths | `contracts/iln_governance/src/test.rs` |
-| Timelock (`eta_ledger`) enforcement | `contracts/iln_governance/src/test.rs` |
+| Timelock (`eta_ledger`) enforcement & execution-not-before-eta (Issue #1087) | `contracts/iln_governance/src/test.rs`, `contracts/tests/cross_contract_invariants_test.rs::x6_governance_execution_not_before_eta_invariant` |
 | Execution retry on cross-contract failure (Issue #531) | `contracts/iln_governance/src/test.rs` |
-| Veto path and `disable_veto_power` one-way switch (Issue #68) | `contracts/iln_governance/src/test.rs` |
-| Archival-resilient vote/veto receipts (fail-closed mirror, Issue #1099) | `contracts/iln_governance/src/test.rs`, `contracts/iln_governance/src/tests_differential.rs` |
-| Differential (legacy vs remediated) governance behaviour (Issues #68, #531, #622, #805, #1098) | `contracts/iln_governance/src/tests_differential.rs` |
+| Veto transition safety and `disable_veto_power` one-way switch (Issue #68, #1088) | `contracts/iln_governance/src/test.rs`, `contracts/tests/cross_contract_invariants_test.rs::x7_governance_veto_transition_safety` |
+| Proposal lifecycle authorization across all actors (Issue #1089) | `contracts/iln_governance/src/test.rs`, `contracts/tests/cross_contract_invariants_test.rs::x8_governance_proposal_lifecycle_authorization` |
 | Delegation cycle/depth prevention (Issue #64) | `contracts/iln_governance/src/test.rs` |
 | Quadratic voting weight transform (Issue #530) | `contracts/iln_governance/src/test.rs` |
 | Access control (admin / ILN-contract-gated setters) | `contracts/iln_governance/src/test.rs` |

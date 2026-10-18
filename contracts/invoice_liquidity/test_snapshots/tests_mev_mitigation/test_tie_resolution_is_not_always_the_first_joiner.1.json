@@ -1857,7 +1857,7 @@
     []
   ],
   "ledger": {
-    "protocol_version": 27,
+    "protocol_version": 29,
     "sequence_number": 2500,
     "timestamp": 1700012000,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -3375,7 +3375,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4195
+        "live_until": 2000100
       },
       {
         "entry": {
@@ -3443,7 +3443,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4315
+        "live_until": 2000220
       },
       {
         "entry": {
@@ -3511,7 +3511,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4435
+        "live_until": 2000340
       },
       {
         "entry": {
@@ -3579,7 +3579,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4555
+        "live_until": 2000460
       },
       {
         "entry": {
@@ -3647,7 +3647,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4675
+        "live_until": 2000580
       },
       {
         "entry": {
@@ -3715,7 +3715,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4795
+        "live_until": 2000700
       },
       {
         "entry": {
@@ -3783,7 +3783,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4915
+        "live_until": 2000820
       },
       {
         "entry": {
@@ -3851,7 +3851,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5035
+        "live_until": 2000940
       },
       {
         "entry": {
@@ -3919,7 +3919,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5155
+        "live_until": 2001060
       },
       {
         "entry": {
@@ -3987,7 +3987,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5275
+        "live_until": 2001180
       },
       {
         "entry": {
@@ -4055,7 +4055,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5395
+        "live_until": 2001300
       },
       {
         "entry": {
@@ -4123,7 +4123,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5515
+        "live_until": 2001420
       },
       {
         "entry": {
@@ -4191,7 +4191,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5635
+        "live_until": 2001540
       },
       {
         "entry": {
@@ -4259,7 +4259,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5755
+        "live_until": 2001660
       },
       {
         "entry": {
@@ -4327,7 +4327,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5875
+        "live_until": 2001780
       },
       {
         "entry": {
@@ -4395,7 +4395,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5995
+        "live_until": 2001900
       },
       {
         "entry": {
@@ -4463,7 +4463,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6115
+        "live_until": 2002020
       },
       {
         "entry": {
@@ -4531,7 +4531,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6235
+        "live_until": 2002140
       },
       {
         "entry": {
@@ -4599,7 +4599,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6355
+        "live_until": 2002260
       },
       {
         "entry": {
@@ -4667,7 +4667,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6475
+        "live_until": 2002380
       },
       {
         "entry": {
@@ -4694,7 +4694,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4195
+        "live_until": 2000100
       },
       {
         "entry": {
@@ -4721,7 +4721,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4315
+        "live_until": 2000220
       },
       {
         "entry": {
@@ -4748,7 +4748,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4435
+        "live_until": 2000340
       },
       {
         "entry": {
@@ -4775,7 +4775,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4555
+        "live_until": 2000460
       },
       {
         "entry": {
@@ -4802,7 +4802,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4675
+        "live_until": 2000580
       },
       {
         "entry": {
@@ -4829,7 +4829,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4795
+        "live_until": 2000700
       },
       {
         "entry": {
@@ -4856,7 +4856,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4915
+        "live_until": 2000820
       },
       {
         "entry": {
@@ -4883,7 +4883,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5035
+        "live_until": 2000940
       },
       {
         "entry": {
@@ -4910,7 +4910,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5155
+        "live_until": 2001060
       },
       {
         "entry": {
@@ -4937,7 +4937,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5275
+        "live_until": 2001180
       },
       {
         "entry": {
@@ -4964,7 +4964,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5395
+        "live_until": 2001300
       },
       {
         "entry": {
@@ -4991,7 +4991,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5515
+        "live_until": 2001420
       },
       {
         "entry": {
@@ -5018,7 +5018,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5635
+        "live_until": 2001540
       },
       {
         "entry": {
@@ -5045,7 +5045,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5755
+        "live_until": 2001660
       },
       {
         "entry": {
@@ -5072,7 +5072,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5875
+        "live_until": 2001780
       },
       {
         "entry": {
@@ -5099,7 +5099,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5995
+        "live_until": 2001900
       },
       {
         "entry": {
@@ -5126,7 +5126,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6115
+        "live_until": 2002020
       },
       {
         "entry": {
@@ -5153,7 +5153,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6235
+        "live_until": 2002140
       },
       {
         "entry": {
@@ -5180,7 +5180,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6355
+        "live_until": 2002260
       },
       {
         "entry": {
@@ -5207,7 +5207,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6475
+        "live_until": 2002380
       },
       {
         "entry": {
@@ -8114,7 +8114,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4315
+        "live_until": 2000220
       },
       {
         "entry": {
@@ -8141,7 +8141,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4435
+        "live_until": 2000340
       },
       {
         "entry": {
@@ -8168,7 +8168,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4555
+        "live_until": 2000460
       },
       {
         "entry": {
@@ -8195,7 +8195,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4675
+        "live_until": 2000580
       },
       {
         "entry": {
@@ -8222,7 +8222,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4795
+        "live_until": 2000700
       },
       {
         "entry": {
@@ -8249,7 +8249,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4915
+        "live_until": 2000820
       },
       {
         "entry": {
@@ -8276,7 +8276,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5035
+        "live_until": 2000940
       },
       {
         "entry": {
@@ -8303,7 +8303,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5155
+        "live_until": 2001060
       },
       {
         "entry": {
@@ -8330,7 +8330,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5275
+        "live_until": 2001180
       },
       {
         "entry": {
@@ -8357,7 +8357,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5395
+        "live_until": 2001300
       },
       {
         "entry": {
@@ -8384,7 +8384,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5515
+        "live_until": 2001420
       },
       {
         "entry": {
@@ -8411,7 +8411,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5635
+        "live_until": 2001540
       },
       {
         "entry": {
@@ -8438,7 +8438,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5755
+        "live_until": 2001660
       },
       {
         "entry": {
@@ -8465,7 +8465,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5875
+        "live_until": 2001780
       },
       {
         "entry": {
@@ -8492,7 +8492,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 5995
+        "live_until": 2001900
       },
       {
         "entry": {
@@ -8519,7 +8519,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6115
+        "live_until": 2002020
       },
       {
         "entry": {
@@ -8546,7 +8546,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6235
+        "live_until": 2002140
       },
       {
         "entry": {
@@ -8573,7 +8573,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6355
+        "live_until": 2002260
       },
       {
         "entry": {
@@ -8600,7 +8600,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6475
+        "live_until": 2002380
       },
       {
         "entry": {
@@ -8627,7 +8627,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6595
+        "live_until": 2002500
       },
       {
         "entry": {
@@ -8798,6 +8798,33 @@
                     "symbol": "TokenDecimals"
                   },
                   {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 6
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "TokenDecimals"
+                  },
+                  {
                     "address": "CBEPDNVYXQGWB5YUBXKJWYJA7OXTZW5LFLNO5JRRGE6Z6C5OSUZPCCEL"
                   }
                 ]
@@ -8909,7 +8936,7 @@
               "val": {
                 "contract_instance": {
                   "executable": {
-                    "wasm": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    "wasm": "604717fe3f12ac67985d74bf337e8e0fd36a19e068e8315706bf06b8edac4d4a"
                   },
                   "storage": [
                     {
@@ -9488,8 +9515,8 @@
           "data": {
             "contract_code": {
               "ext": "v0",
-              "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-              "code": ""
+              "hash": "604717fe3f12ac67985d74bf337e8e0fd36a19e068e8315706bf06b8edac4d4a",
+              "code": "746573745f636f6e74726163745f666f725f636f6e74726163745f69645f434141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414f4c5a4d"
             }
           },
           "ext": "v0"
@@ -9503,7 +9530,63 @@
       "event": {
         "ext": "v0",
         "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-        "type_": "contract",
+        "type": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fund_queue_tie_broken"
+              },
+              {
+                "u64": "20"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "approved_lp"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "invoice_id"
+                  },
+                  "val": {
+                    "u64": "20"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "tied_count"
+                  },
+                  "val": {
+                    "u32": 2
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "winner_index"
+                  },
+                  "val": {
+                    "u32": 1
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+        "type": "contract",
         "body": {
           "v0": {
             "topics": [
@@ -9559,7 +9642,7 @@
       "event": {
         "ext": "v0",
         "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-        "type_": "contract",
+        "type": "contract",
         "body": {
           "v0": {
             "topics": [

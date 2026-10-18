@@ -14,12 +14,7 @@ exclude = [
 ]
 
 [workspace.dependencies]
-soroban-sdk = "27.0.6"
-# Pinned to the exact version soroban-sdk 27.0.6 resolves internally (see
-# Cargo.lock) so `InvocationResourceLimits` / `NetworkInvocationResourceLimits`
-# (used by tests exercising Issue #1067's resource-limit-enforcement path)
-# reference the identical type the SDK's own `CostEstimate` API uses.
-soroban-env-host = "27.0.1"
+soroban-sdk = "29.0.1"
 proptest = "1"
 rand = "0.10.1"
 

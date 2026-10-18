@@ -281,3 +281,50 @@ fn c3_full_queue_still_resolves_to_highest_score() {
     t.env.ledger().set(info);
     assert_eq!(t.contract.resolve_fund_queue(&id), strong);
 }
+
+// ── C5: max depth extension TTL management & pause guards (#1025) ────────────
+
+#[test]
+fn c5_queue_storage_ttl_extended_at_max_depth() {
+    let t = setup();
+    let id = submit(&t, &t.token.address).unwrap();
+    fill_queue(&t, id);
+
+    let fq_key = DataKey::FundQueue(id);
+    let fqoa_key = DataKey::FundQueueOpenedAt(id);
+
+    let ttl_fq = t.env.as_contract(&t.contract.address, || {
+        t.env.storage().persistent().get_ttl(&fq_key)
+    });
+    let ttl_fqoa = t.env.as_contract(&t.contract.address, || {
+        t.env.storage().persistent().get_ttl(&fqoa_key)
+    });
+
+    assert!(
+        ttl_fq >= invoice_liquidity::constants::FUND_QUEUE_TTL_THRESHOLD,
+        "FundQueue entry must have TTL extended >= threshold"
+    );
+    assert!(
+        ttl_fqoa >= invoice_liquidity::constants::FUND_QUEUE_TTL_THRESHOLD,
+        "FundQueueOpenedAt entry must have TTL extended >= threshold"
+    );
+}
+
+#[test]
+fn c5_queue_operations_fail_closed_when_paused() {
+    let t = setup();
+    let id = submit(&t, &t.token.address).unwrap();
+
+    let lp = Address::generate(&t.env);
+    t.contract.pause();
+
+    assert_eq!(
+        t.contract.try_join_fund_queue(&lp, &id),
+        Err(Ok(ContractError::ContractPaused))
+    );
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::ContractPaused))
+    );
+}
+

@@ -22,14 +22,9 @@
 //! **Invariant P3: Deterministic Order**
 //! Given a fixed set of claims and a prioritization strategy, payout order is deterministic.
 
-// This module works on plain Rust collections rather than `soroban_sdk::Vec`
-// (it is pure computation over in-memory claim lists, with no storage access).
-// `soroban-sdk` registers a bump-pointer `#[global_allocator]`, so `alloc` is
-// available in contract builds even though the crate is `#![no_std]`.
 extern crate alloc;
-use alloc::vec;
-use alloc::vec::Vec;
 
+use alloc::{vec, vec::Vec};
 use soroban_sdk::{contracttype, Address, Env};
 
 /// Payout prioritization strategy for claims exceeding pool balance.

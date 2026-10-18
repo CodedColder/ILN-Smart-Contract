@@ -37,6 +37,10 @@ name = "governance_main_integration_test"
 path = "../tests/governance_main_integration_test.rs"
 
 [[test]]
+name = "governance_cross_contract_auth_test"
+path = "../tests/governance_cross_contract_auth_test.rs"
+
+[[test]]
 name = "oracle_integration_test"
 path = "../tests/oracle_integration_test.rs"
 

@@ -115,6 +115,18 @@ export class GovernanceContractError extends Error {
   static InvalidVetoMultisigConfig = class InvalidVetoMultisigConfig extends GovernanceContractError {
     constructor(msg = "Veto signer list/threshold combination is invalid") { super(msg, 25); }
   };
+  static ExecutionDelayOutOfBounds = class ExecutionDelayOutOfBounds extends GovernanceContractError {
+    constructor(msg = "Execution delay violates production minimum or maximum bounds") { super(msg, 35); }
+  };
+  static InvalidVetoTransition = class InvalidVetoTransition extends GovernanceContractError {
+    constructor(msg = "Invalid transition in veto transition state machine") { super(msg, 36); }
+  };
+  static VetoPowerAlreadyDisabled = class VetoPowerAlreadyDisabled extends GovernanceContractError {
+    constructor(msg = "Admin veto power has already been permanently disabled") { super(msg, 37); }
+  };
+  static ConsentRequired = class ConsentRequired extends GovernanceContractError {
+    constructor(msg = "Consent reason hash is required and cannot be empty") { super(msg, 38); }
+  };
 
   static fromError(error: unknown): Error {
     const match = String(error).match(/Error\(Contract, (\d+)\)/);
@@ -145,6 +157,10 @@ export class GovernanceContractError extends Error {
       case 23: return new GovernanceContractError.NotVetoSigner();
       case 24: return new GovernanceContractError.VetoAlreadyApproved();
       case 25: return new GovernanceContractError.InvalidVetoMultisigConfig();
+      case 35: return new GovernanceContractError.ExecutionDelayOutOfBounds();
+      case 36: return new GovernanceContractError.InvalidVetoTransition();
+      case 37: return new GovernanceContractError.VetoPowerAlreadyDisabled();
+      case 38: return new GovernanceContractError.ConsentRequired();
       default: return new GovernanceContractError(`iln_governance error: ${String(error)}`);
     }
   }
@@ -918,3 +934,180 @@ export async function getAppliedVoteWeight(
   const decoded = scValToNative(sim.result.retval);
   return decoded === null || decoded === undefined ? undefined : BigInt(String(decoded));
 }
+
+/**
+ * Fetch the minimum and maximum execution delay bounds (Issue #985).
+ */
+export async function getProductionDelayBounds(
+  server: SorobanRpc.Server,
+  contractAddress: string,
+  sourceAccount: Account,
+  networkPassphrase: string
+): Promise<[number, number]> {
+  const contract = new Contract(contractAddress);
+  const op = contract.call("get_production_delay_bounds");
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(op)
+    .setTimeout(30)
+    .build();
+
+  const sim = await retry(() => server.simulateTransaction(tx));
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw GovernanceContractError.fromError(sim.error);
+  }
+  const decoded = scValToNative(sim.result.retval) as [number, number];
+  return decoded;
+}
+
+/**
+ * Validate whether a delay meets production requirements (Issue #985).
+ */
+export async function isValidProductionDelay(
+  server: SorobanRpc.Server,
+  contractAddress: string,
+  delay: number,
+  sourceAccount: Account,
+  networkPassphrase: string
+): Promise<boolean> {
+  const contract = new Contract(contractAddress);
+  const op = contract.call("is_valid_production_delay", nativeToScVal(delay, { type: "u32" }));
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(op)
+    .setTimeout(30)
+    .build();
+
+  const sim = await retry(() => server.simulateTransaction(tx));
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw GovernanceContractError.fromError(sim.error);
+  }
+  return Boolean(scValToNative(sim.result.retval));
+}
+
+/**
+ * Verify whether currentLedger has reached etaLedger across rollover (Issue #987).
+ */
+export async function isEtaReached(
+  server: SorobanRpc.Server,
+  contractAddress: string,
+  currentLedger: number,
+  etaLedger: number,
+  sourceAccount: Account,
+  networkPassphrase: string
+): Promise<boolean> {
+  const contract = new Contract(contractAddress);
+  const op = contract.call(
+    "is_eta_reached",
+    nativeToScVal(currentLedger, { type: "u32" }),
+    nativeToScVal(etaLedger, { type: "u32" })
+  );
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(op)
+    .setTimeout(30)
+    .build();
+
+  const sim = await retry(() => server.simulateTransaction(tx));
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw GovernanceContractError.fromError(sim.error);
+  }
+  return Boolean(scValToNative(sim.result.retval));
+}
+
+/**
+ * Get the current state in the veto transition state machine (Issue #989).
+ */
+export async function getVetoState(
+  server: SorobanRpc.Server,
+  contractAddress: string,
+  proposalId: bigint,
+  sourceAccount: Account,
+  networkPassphrase: string
+): Promise<{ status: number; approvals_count: number; threshold: number; reason_hash: Buffer }> {
+  const contract = new Contract(contractAddress);
+  const op = contract.call("get_veto_state", nativeToScVal(proposalId, { type: "u64" }));
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(op)
+    .setTimeout(30)
+    .build();
+
+  const sim = await retry(() => server.simulateTransaction(tx));
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw GovernanceContractError.fromError(sim.error);
+  }
+  return scValToNative(sim.result.retval);
+}
+
+/**
+ * Permanently disable admin veto power with an explicit reason hash (Issue #990).
+ */
+export async function disableVetoPowerWithReason(
+  server: SorobanRpc.Server,
+  contractAddress: string,
+  reasonHash: Buffer,
+  sourceAccount: Account,
+  signTransaction: (tx: Transaction) => Promise<Transaction> | Transaction,
+  networkPassphrase: string
+): Promise<{ txHash: string }> {
+  const contract = new Contract(contractAddress);
+  const op = contract.call(
+    "disable_veto_power_with_reason",
+    nativeToScVal(reasonHash, { type: "bytes" })
+  );
+
+  const { txHash } = await sendGovernanceCall(
+    server,
+    sourceAccount,
+    networkPassphrase,
+    op,
+    signTransaction,
+    GovernanceContractError.fromError
+  );
+  return { txHash };
+}
+
+/**
+ * Fetch the recorded veto-disable authorization details, if disabled (Issue #990).
+ */
+export async function getVetoDisableRecord(
+  server: SorobanRpc.Server,
+  contractAddress: string,
+  sourceAccount: Account,
+  networkPassphrase: string
+): Promise<{ authorized_by: string; disabled_at_ledger: number; reason_hash: Buffer } | undefined> {
+  const contract = new Contract(contractAddress);
+  const op = contract.call("get_veto_disable_record");
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(op)
+    .setTimeout(30)
+    .build();
+
+  const sim = await retry(() => server.simulateTransaction(tx));
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw GovernanceContractError.fromError(sim.error);
+  }
+  if (!sim.result?.retval) {
+    return undefined;
+  }
+  const decoded = scValToNative(sim.result.retval);
+  return decoded ?? undefined;
+}
+

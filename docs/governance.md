@@ -188,11 +188,14 @@ The contract checks:
   total_votes = votes_for + votes_against
   quorum      = stored_total_supply * min_quorum_bps / 10_000  (default 10%)
 
-  If total_votes < quorum      → status = Rejected, error QuorumNotReached
+  If total_votes < quorum      → status = Rejected, deposit forfeited,
+                                 ProposalRejected{reason: QuorumNotReached} emitted, call returns Ok
   If votes_for > votes_against → status = Passed, then:
     invoke_contract(iln_contract, "update_fee_rate", [50])
-    status = Executed
-  Else                         → status = Rejected, error ProposalRejected
+    status = Executed (if the call fails: ProposalExecutionFailed emitted,
+                       call returns Ok, status stays Passed and is retryable)
+  Else                         → status = Rejected, deposit forfeited,
+                                 ProposalRejected{reason: MajorityAgainst} emitted, call returns Ok
 
 Emergency path — Admin veto before execution
 ─────────────────────────────────────────────
@@ -266,6 +269,38 @@ executed on-chain.
 ### Function: `is_veto_power_enabled() → bool`
 
 Read-only getter.  Returns `true` while the veto power is active.
+
+### Function: `get_timelock_status() → TimelockStatus`
+
+Read-only. Returns `{ execution_delay, veto_enabled, veto_signer_count, veto_threshold }`
+in one call. Use it as the pre-/post-handoff check (see below).
+
+### Function: `get_proposal_eta(proposal_id) → u32`
+
+Read-only. Returns `eta_ledger` (`0` until the proposal passes; `ProposalNotFound`
+for unknown ids).
+
+### Timelock after the veto is disabled (Issues #991 / #993 / #996 / #997)
+
+Once `disable_veto_power()` runs, the execution delay is the only brake between
+a passed vote and execution. Behaviour, all covered by `test.rs`:
+
+| Property | Behaviour |
+|---|---|
+| ETA | Stamped as `ledger_sequence + execution_delay` (saturating) when the proposal moves Active → Passed; later `set_execution_delay` calls do **not** move a queued ETA |
+| Boundary | `sequence == eta - 1` → `TimelockNotExpired`; `sequence == eta` → executes |
+| In-flight proposals | A proposal queued while the veto was live keeps its full delay after the veto is disabled; vetoed proposals stay `Vetoed` |
+| `set_execution_delay` | Stored `Admin` only. Before `initialize` it now returns `NotInitialized` (previously the first caller was installed as admin) |
+| `create_proposal` | Requires the proposer's auth and a balance ≥ `MinProposalBalance` (and ≥ the deposit, if set); a rejected call leaves no proposal behind |
+
+**Rollout / recovery.** Before calling `disable_veto_power()`: (1) set a non-zero
+delay with `set_execution_delay`; (2) confirm with `get_timelock_status()`; (3) after the
+call, confirm `veto_enabled == false` and the delay is unchanged. The disable is
+one-way. Recovery from a mistaken delay is `set_execution_delay` by the admin
+(affects only proposals queued afterwards); a delay of `u32::MAX` makes new
+proposals unexecutable and is corrected the same way. No storage layout changes —
+the new methods are read-only and the only behavioural change is the pre-init
+`set_execution_delay` rejection; no migration is required.
 
 ### Initialisation
 
