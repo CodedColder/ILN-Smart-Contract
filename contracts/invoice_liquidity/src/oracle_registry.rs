@@ -1206,21 +1206,13 @@ pub fn check_identity_quorum(
     let mut verified_count: u32 = 0;
 
     for oracle in oracles.iter() {
-        // A feeder that reverts/traps/returns an undecodable payload degrades to
-        // "no opinion" via the non-panicking `try_invoke_contract` (mirroring
-        // `query_price`) rather than aborting the whole funding call — but it
-        // still cannot contribute an agreement.
-        let result = env.try_invoke_contract::<OracleVerificationResponse, soroban_sdk::Error>(
-            &oracle,
-            &Symbol::new(env, "get_payer_data"),
-            vec![env, payer.clone().into_val(env)],
-        );
-        if let Ok(Ok(response)) = result {
-            let fresh =
-                !is_oracle_data_stale(current_ledger, response.timestamp, max_age_ledgers);
-            if response.is_verified && fresh {
-                verified_count += 1;
-            }
+        // Issue #1055: the per-feeder predicate lives in one shared helper so
+        // the gate below and the `check_identity_quorum_health` diagnostic can
+        // never disagree about *why* a feeder did or didn't count.
+        if classify_identity_feeder(env, &oracle, payer, current_ledger, max_age_ledgers)
+            == FeederHealth::Verified
+        {
+            verified_count += 1;
         }
     }
 
@@ -1415,6 +1407,236 @@ pub fn check_oracle_verification(
         .map(|c| c.max_oracle_age_ledgers)
         .unwrap_or(crate::DEFAULT_MAX_ORACLE_AGE_LEDGERS);
     evaluate_identity_verification(&env, feed_type, &token, &payer, max_age)
+}
+
+// ── Issue #1055: exposing oracle health & quorum ────────────────────────────
+//
+// Before: the answer to "is oracle gating for this feed + token healthy?" was
+// spread across five separate read entrypoints — `get_oracle_health`,
+// `is_oracle_circuit_tripped`, `get_circuit_recovery_state`,
+// `get_identity_oracles`, `get_identity_quorum` — so an off-chain `/health`
+// probe (the game-day exercise's action item) had to fan out several calls and
+// know which five to ask for. Worse, the *live* health of a multi-oracle
+// Identity quorum had no reader at all: `check_identity_quorum` deliberately
+// never writes `OracleHealth` (that key models a single oracle per feed +
+// token), so in quorum mode `get_oracle_health` reports `None` forever and a
+// silently degraded quorum was indistinguishable from an unqueried one.
+//
+// After: two additive, permissionless, never-erroring views —
+//   * `get_oracle_status` — one cheap call (no cross-contract calls, no
+//     writes) returning the whole recorded health + configuration state, and
+//   * `check_identity_quorum_health` — the missing live per-feeder health +
+//     quorum outcome, sharing `classify_identity_feeder` with the funding gate
+//     so the two can never disagree.
+//
+// Neither changes any existing entrypoint, storage key, or event, so funding
+// behaviour and every existing integration are untouched.
+
+/// Issue #1055: per-feeder health classification observed by
+/// [`check_identity_quorum_health`].
+///
+/// Mirrors exactly the predicate the funding gate applies — `check_identity_quorum`
+/// counts a feeder only when it classifies as [`FeederHealth::Verified`] — so
+/// the diagnostic can never disagree with the gate about which feeders agreed.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeederHealth {
+    /// Fresh data **and** `is_verified = true` — counts toward the quorum.
+    Verified,
+    /// Fresh data, `is_verified = false` — responded, but disagrees.
+    Unverified,
+    /// Responded, but the data is stale (or future-dated) — cannot agree.
+    Stale,
+    /// Reverted, trapped, or returned an undecodable payload — "no opinion".
+    Unreachable,
+}
+
+/// Issue #1055: live health of the registered Identity quorum for a feed +
+/// token — one entry per registered feeder, plus the resulting quorum verdict.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdentityQuorumHealth {
+    pub feed_type: OracleFeedType,
+    pub token: Address,
+    /// Registered feeders, in registration order. Empty means the multi-oracle
+    /// quorum is **not in use** and the single-oracle resolution chain governs
+    /// (mirroring [`IdentityQuorumOutcome::NotConfigured`]).
+    pub feeders: soroban_sdk::Vec<Address>,
+    /// Per-feeder observation, index-aligned with `feeders`.
+    pub observations: soroban_sdk::Vec<FeederHealth>,
+    /// Feeders that agreed (classified [`FeederHealth::Verified`]).
+    pub verified_count: u32,
+    /// Configured threshold — the `N` of `N`-of-`M`.
+    pub required_quorum: u32,
+    /// `verified_count >= required_quorum`. Always `false` when `feeders` is
+    /// empty (no quorum is in use), so a caller can treat this as "the quorum
+    /// is active *and* currently satisfied".
+    pub quorum_met: bool,
+}
+
+/// Issue #1055: one-call, permissionless snapshot of a feed + token's oracle
+/// configuration **and** its recorded health state.
+///
+/// Health and configuration were previously spread across five separate read
+/// entrypoints (`get_oracle_health`, `is_oracle_circuit_tripped`,
+/// `get_circuit_recovery_state`, `get_identity_oracles`, `get_identity_quorum`),
+/// so an off-chain `/health` probe had to know and fan out all five to answer
+/// "is this feed's oracle gating healthy?".
+///
+/// This performs **no cross-contract calls and no writes** — every field is a
+/// local read of already-recorded state — so it is cheap enough for a
+/// high-frequency health probe and safe to call at any time, including while
+/// the contract is paused. Use [`check_identity_quorum_health`] when you need
+/// the *live* per-feeder health, which necessarily queries the feeders.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleStatusView {
+    pub feed_type: OracleFeedType,
+    pub token: Address,
+    /// The oracle the circuit-agnostic priority chain currently resolves to:
+    /// per-token override → feed-type default → legacy `price_oracle`
+    /// (`Identity` only). `None` = nothing registered.
+    pub resolved_oracle: Option<Address>,
+    /// Last recorded single-oracle health snapshot, or `None` if this feed +
+    /// token has never been queried.
+    ///
+    /// Caveat: the multi-oracle Identity quorum path deliberately does not
+    /// write this key (it models one oracle per feed + token), so while a
+    /// quorum list is registered this stays `None` no matter how often
+    /// verification runs. That blind spot is exactly what
+    /// [`check_identity_quorum_health`] fills.
+    pub health: Option<OracleHealthStatus>,
+    /// Whether the circuit breaker is currently open for this feed + token.
+    pub circuit_tripped: bool,
+    /// In-progress half-open recovery of an open breaker (Issue #1048), or
+    /// `None` when nothing is recovering.
+    pub recovery: Option<CircuitRecoveryState>,
+    /// Registered Identity quorum feeders, in registration order. Empty for
+    /// non-`Identity` feeds and when the multi-oracle quorum is not in use (in
+    /// which case the single-oracle chain above governs).
+    pub identity_oracles: soroban_sdk::Vec<Address>,
+    /// Configured Identity quorum threshold — the `N` of `N`-of-`M`. A single
+    /// protocol-wide setting, reported for every feed, so only meaningful
+    /// alongside `identity_oracles` when that list is non-empty. Note
+    /// `remove_identity_oracle` does not re-validate the threshold, so removing
+    /// feeders can leave a quorum too few feeders remain to reach — comparing
+    /// this against `identity_oracles.len()` is how that state is caught.
+    pub identity_quorum: u32,
+    /// Registered price sources for this feed (cross-source deviation
+    /// checking). Empty for non-`Price` feeds.
+    pub price_sources: soroban_sdk::Vec<Address>,
+}
+
+/// Issue #1055: read the whole recorded oracle configuration + health state for
+/// `feed_type` + `token` in a single call. Permissionless; performs no
+/// cross-contract calls and writes nothing.
+pub fn get_oracle_status(env: Env, feed_type: OracleFeedType, token: Address) -> OracleStatusView {
+    OracleStatusView {
+        feed_type,
+        token: token.clone(),
+        resolved_oracle: resolve_oracle(&env, feed_type, &token),
+        health: env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleHealth(feed_type, token.clone())),
+        circuit_tripped: is_oracle_circuit_tripped(&env, feed_type, &token),
+        recovery: env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleCircuitRecovery(feed_type, token.clone())),
+        identity_oracles: get_identity_oracles(env.clone(), feed_type),
+        identity_quorum: get_identity_quorum(env.clone()),
+        price_sources: get_price_sources(env, feed_type),
+    }
+}
+
+/// Issue #1055: the single per-feeder predicate shared by the funding gate
+/// ([`check_identity_quorum`]) and the [`check_identity_quorum_health`]
+/// diagnostic, so the two can never disagree.
+///
+/// A feeder that reverts/traps/returns an undecodable payload degrades to
+/// "no opinion" via the non-panicking `try_invoke_contract` (mirroring
+/// [`query_price`](crate::oracle_registry)) rather than aborting the whole
+/// call — but it still cannot contribute an agreement.
+fn classify_identity_feeder(
+    env: &Env,
+    oracle: &Address,
+    payer: &Address,
+    current_ledger: u32,
+    max_age_ledgers: u64,
+) -> FeederHealth {
+    let result = env.try_invoke_contract::<OracleVerificationResponse, soroban_sdk::Error>(
+        oracle,
+        &Symbol::new(env, "get_payer_data"),
+        vec![env, payer.clone().into_val(env)],
+    );
+    match result {
+        // Issue #1050: the same shared freshness rule the gate and the
+        // recorded health snapshot use, so "fresh" means one thing everywhere.
+        Ok(Ok(response)) => {
+            if is_oracle_data_stale(current_ledger, response.timestamp, max_age_ledgers) {
+                FeederHealth::Stale
+            } else if response.is_verified {
+                FeederHealth::Verified
+            } else {
+                FeederHealth::Unverified
+            }
+        }
+        _ => FeederHealth::Unreachable,
+    }
+}
+
+/// Issue #1055: live per-feeder health for the Identity quorum on `feed_type` +
+/// `token`, plus the resulting quorum verdict.
+///
+/// This is the missing reader for quorum-mode health: the funding gate
+/// ([`check_identity_quorum`]) never writes the single-oracle `OracleHealth`
+/// key, so before this the *only* way to learn that one of several feeders had
+/// gone stale, unverified, or unreachable was to observe funding failing closed
+/// (which rolls its events back). The classification is produced by the same
+/// [`classify_identity_feeder`] helper the gate uses, so `verified_count` /
+/// `quorum_met` here always match what the gate decided, and `quorum_met` in
+/// turn tracks `IdentityVerificationOutcome::Verified` from
+/// [`check_oracle_verification`] (when the list is non-empty).
+///
+/// Permissionless and never-erroring: a feeder that reverts is reported as
+/// [`FeederHealth::Unreachable`] rather than propagating an error. Like
+/// [`check_oracle_health`] it writes nothing and emits nothing — the fan-out is
+/// bounded by [`MAX_IDENTITY_ORACLES_PER_FEED`], so its cost is bounded even
+/// with a full feeder list.
+pub fn check_identity_quorum_health(
+    env: Env,
+    feed_type: OracleFeedType,
+    token: Address,
+    payer: Address,
+) -> IdentityQuorumHealth {
+    let feeders = get_identity_oracles(env.clone(), feed_type);
+    let active = !feeders.is_empty();
+    let required_quorum = get_identity_quorum(env.clone());
+    let current_ledger = env.ledger().sequence();
+    let max_age = crate::storage::get_config(&env)
+        .map(|c| c.max_oracle_age_ledgers)
+        .unwrap_or(crate::DEFAULT_MAX_ORACLE_AGE_LEDGERS);
+
+    let mut observations = soroban_sdk::Vec::new(&env);
+    let mut verified_count: u32 = 0;
+    for feeder in feeders.iter() {
+        let health = classify_identity_feeder(&env, &feeder, &payer, current_ledger, max_age);
+        if health == FeederHealth::Verified {
+            verified_count += 1;
+        }
+        observations.push_back(health);
+    }
+
+    IdentityQuorumHealth {
+        feed_type,
+        token,
+        feeders,
+        observations,
+        verified_count,
+        required_quorum,
+        quorum_met: active && verified_count >= required_quorum,
+    }
 }
 
 /// Issue #860: circuit/health gate every price read must pass before it

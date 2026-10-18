@@ -480,6 +480,230 @@ fn test_max_queue_size_ttl_margin_crosses_zero_boundary() {
 }
 
 // ================================================================
+// Issue #1057 — worst-case queue insertion (position sweep)
+// ================================================================
+//
+// **Before:** the #1062 suite above pins the *bound* (`MAX_FUND_QUEUE_LEN`)
+// and the TTL behaviour at it, and `tests_benchmarks.rs` measured a single
+// max-size admission — one displacing join into a full queue of *equal*
+// scores, which happens to land at the head. Nothing varied the insertion
+// position, so "the displacing case is the worst case" was an assumption: with
+// identical scores *every* admitted joiner is forced to index 0, so the suite
+// cannot tell a head insert from a tail one, and the `QueueFull` admission
+// boundary was only ever probed with equal scores.
+//
+// **After:** the tests below build a full queue with *distinct, strictly
+// descending* scores and aim joiners at specific positions, pinning the
+// insertion semantics the worst-case benchmark relies on:
+//   * a head insert lands at index 0 and displaces only the tail (success);
+//   * a mid-score joiner lands in its sorted slot (success);
+//   * the admission boundary is exact — `score == tail.score` is rejected
+//     while `score == tail.score + 1` is admitted (failure / boundary);
+//   * a displacing head insert still requires the joiner's authorization
+//     (authorization);
+//   * and, the ledger-boundary case that matters for MEV mitigation, a
+//     displacing insert must **not** reset `FundQueueOpenedAt`, so a latecomer
+//     cannot keep pushing back `resolve_fund_queue`'s maturity gate by
+//     re-joining.
+//
+// The per-position cost itself is recorded in `tests_benchmarks.rs`
+// (`benchmark_worst_case_queue_insertion`).
+
+/// Read the fund queue into a plain Rust vec of `(lp, score)` pairs, head
+/// first, so assertions can index positions directly.
+fn queue_entries(t: &TestEnv, id: u64) -> std::vec::Vec<(Address, u32)> {
+    t.env.as_contract(&t.contract.address, || {
+        let q = invoice::get_fund_queue(&t.env, id);
+        let mut out = std::vec::Vec::new();
+        for i in 0..q.len() {
+            let entry = q.get(i).unwrap();
+            out.push((entry.lp, entry.score));
+        }
+        out
+    })
+}
+
+/// Fill `id`'s queue to exactly `MAX_FUND_QUEUE_LEN` with *distinct, strictly
+/// descending* scores (`100, 98, …, 2`), returning the LPs in queue order
+/// (head first). Unlike `fill_fund_queue_to_max`, positions are meaningful
+/// here: a joiner's `insert_pos` is the first index whose score is below it.
+fn fill_fund_queue_distinct_descending(t: &TestEnv, id: u64) -> std::vec::Vec<Address> {
+    let mut lps = std::vec::Vec::new();
+    for i in 0..MAX_FUND_QUEUE_LEN {
+        let lp = Address::generate(&t.env);
+        set_lp_score_direct(t, &lp, 100 - 2 * i);
+        t.contract.join_fund_queue(&lp, &id);
+        lps.push(lp);
+    }
+    lps
+}
+
+fn fund_queue_opened_at(t: &TestEnv, id: u64) -> Option<u32> {
+    t.env.as_contract(&t.contract.address, || {
+        invoice::get_fund_queue_opened_at(&t.env, id)
+    })
+}
+
+#[test]
+fn test_1057_head_insert_lands_at_index_zero_and_displaces_tail() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let original = fill_fund_queue_distinct_descending(&t, id);
+
+    // Above every retained entry => insert at index 0, evicting only the tail.
+    let joiner = Address::generate(&t.env);
+    set_lp_score_direct(&t, &joiner, 101);
+    t.contract.join_fund_queue(&joiner, &id);
+
+    let q = queue_entries(&t, id);
+    assert_eq!(q.len(), MAX_FUND_QUEUE_LEN, "a displacing join keeps the bound");
+    assert_eq!(q[0].0, joiner, "a top score must land at the head");
+    assert_eq!(q[0].1, 101);
+    assert_eq!(
+        q[1].0, original[0],
+        "the displaced ordering must shift every retained entry down one"
+    );
+    assert_eq!(
+        q[MAX_FUND_QUEUE_LEN as usize - 1].0,
+        original[MAX_FUND_QUEUE_LEN as usize - 2],
+        "only the old tail (score 2) may be displaced"
+    );
+    for pair in q.windows(2) {
+        assert!(
+            pair[0].1 > pair[1].1,
+            "the queue must stay strictly descending after a head insert"
+        );
+    }
+}
+
+#[test]
+fn test_1057_middle_score_insert_lands_in_sorted_position() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let original = fill_fund_queue_distinct_descending(&t, id);
+
+    // Score 51 slots between the 52 at index 24 and the 50 at index 25.
+    let joiner = Address::generate(&t.env);
+    set_lp_score_direct(&t, &joiner, 51);
+    t.contract.join_fund_queue(&joiner, &id);
+
+    let q = queue_entries(&t, id);
+    assert_eq!(q.len(), MAX_FUND_QUEUE_LEN);
+    assert_eq!(q[24].1, 52, "the preceding entry keeps the next-higher score");
+    assert_eq!(q[25].0, joiner, "score 51 must land at index 25");
+    assert_eq!(q[25].1, 51);
+    assert_eq!(q[26].1, 50, "the following entry is the next-lower score");
+    for pair in q.windows(2) {
+        assert!(pair[0].1 > pair[1].1, "queue must stay strictly descending");
+    }
+    assert_eq!(
+        q[MAX_FUND_QUEUE_LEN as usize - 1].0,
+        original[MAX_FUND_QUEUE_LEN as usize - 2],
+        "a middle insert still displaces only the tail"
+    );
+}
+
+#[test]
+fn test_1057_admission_boundary_tail_plus_one_is_admitted() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let _ = fill_fund_queue_distinct_descending(&t, id); // tail score is 2
+
+    // Exactly one point above the tail: admitted (a strict win), and it lands
+    // in the freed tail slot at index MAX - 1.
+    let joiner = Address::generate(&t.env);
+    set_lp_score_direct(&t, &joiner, 3);
+    t.contract.join_fund_queue(&joiner, &id);
+
+    let q = queue_entries(&t, id);
+    assert_eq!(
+        q.len(),
+        MAX_FUND_QUEUE_LEN,
+        "score == tail + 1 must be admitted, keeping the bound"
+    );
+    assert_eq!(q[MAX_FUND_QUEUE_LEN as usize - 1].0, joiner);
+    assert_eq!(q[MAX_FUND_QUEUE_LEN as usize - 1].1, 3);
+}
+
+#[test]
+fn test_1057_admission_boundary_tail_score_is_rejected() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let _ = fill_fund_queue_distinct_descending(&t, id);
+    let full = queue_entries(&t, id);
+
+    // Equal to the tail score (2): the bound requires a *strict* win, so this
+    // must be rejected and must leave the queue byte-identical.
+    let latecomer = Address::generate(&t.env);
+    set_lp_score_direct(&t, &latecomer, 2);
+    let res = t.contract.try_join_fund_queue(&latecomer, &id);
+    assert_eq!(res, Err(Ok(ContractError::QueueFull)));
+
+    let after = queue_entries(&t, id);
+    assert_eq!(after, full, "a rejected join must not mutate the queue");
+    assert!(
+        !after.iter().any(|(lp, _)| lp == &latecomer),
+        "the rejected joiner must not appear in the queue"
+    );
+}
+
+#[test]
+fn test_1057_displacing_head_insert_requires_lp_authorization() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let original = fill_fund_queue_distinct_descending(&t, id);
+
+    let joiner = Address::generate(&t.env);
+    set_lp_score_direct(&t, &joiner, 101);
+    // Replace the permissive all-auths mode with an explicit, empty list so
+    // `require_lp` -> `joiner.require_auth()` genuinely fails.
+    t.env.mock_auths(&[]);
+
+    let res = t.contract.try_join_fund_queue(&joiner, &id);
+    assert!(
+        res.is_err(),
+        "a displacing join must require the joining LP's authorization"
+    );
+
+    // A rejected displacing join must not displace, evict, or reorder anything.
+    let q = queue_entries(&t, id);
+    assert_eq!(q.len(), MAX_FUND_QUEUE_LEN);
+    assert_eq!(
+        q[0].0, original[0],
+        "the head must be untouched by a rejected join"
+    );
+    assert!(!q.iter().any(|(lp, _)| lp == &joiner));
+}
+
+#[test]
+fn test_1057_displacing_insert_does_not_reset_queue_opened_at() {
+    let t = setup();
+    let id = submit_standard_invoice(&t);
+    let _ = fill_fund_queue_distinct_descending(&t, id);
+
+    let opened_at = fund_queue_opened_at(&t, id).expect("the first join records the open ledger");
+
+    // Move the ledger forward, then displace the head: `FundQueueOpenedAt` must
+    // stay pinned to the *first* join, or a latecomer could keep pushing back
+    // `resolve_fund_queue`'s maturity gate by re-joining.
+    advance_ledgers(&t.env, 50);
+    let joiner = Address::generate(&t.env);
+    set_lp_score_direct(&t, &joiner, 101);
+    t.contract.join_fund_queue(&joiner, &id);
+
+    assert_eq!(
+        fund_queue_opened_at(&t, id),
+        Some(opened_at),
+        "a displacing join must not reset the queue's open ledger"
+    );
+    assert_eq!(
+        queue_entries(&t, id)[0].0,
+        joiner,
+        "the displacing join itself must still have landed at the head"
+    );
+}
+
+// ================================================================
 // Issue #1063 — stress concurrent invoice settlements
 // ================================================================
 //

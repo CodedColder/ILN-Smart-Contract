@@ -69,9 +69,10 @@ use soroban_sdk::{
 use crate::access::ADMIN_ACTION_LOG_CAPACITY;
 use crate::constants::{
     DEFAULT_RATE_LIMIT_LEDGERS, FUND_QUEUE_TTL_EXTEND_TO, FUND_QUEUE_TTL_THRESHOLD,
-    MAX_FUND_QUEUE_LEN, MAX_PRICE_SOURCES_PER_FEED, TOP_PAYERS_CAPACITY,
+    MAX_FUND_QUEUE_LEN, MAX_IDENTITY_ORACLES_PER_FEED, MAX_PRICE_SOURCES_PER_FEED,
+    TOP_PAYERS_CAPACITY,
 };
-use crate::oracle_registry::OracleFeedType;
+use crate::oracle_registry::{FeederHealth, IdentityVerificationOutcome, OracleFeedType};
 
 const BENCH_INVOICE_AMOUNT: i128 = 1_000_000_000;
 const BENCH_DISCOUNT_RATE: u32 = 300;
@@ -835,6 +836,140 @@ fn benchmark_ttl_cost_across_queue_sizes() {
             MAX_CPU_INSTRUCTIONS,
             MAX_MEMORY_BYTES,
         );
+    }
+}
+
+// ================================================================
+// Issue #1057: benchmark worst-case queue insertion
+// ================================================================
+//
+// **Before:** `benchmark_join_fund_queue_at_max_queue_size` (#1062) measured a
+// single point — one displacing admission into a full queue whose entries all
+// share the *same* score. With equal scores every admitted joiner is forced to
+// index 0, so that measurement could not distinguish a head insert from a tail
+// one, never established that the head is the worst position, and never measured
+// the `QueueFull` rejection path at the bound. "Worst case" was asserted, not
+// shown.
+//
+// **After:** this sweeps the insertion position at the hard bound
+// (`MAX_FUND_QUEUE_LEN`) over a queue of *distinct, strictly descending* scores —
+// head (index 0), middle, and tail — and measures the `QueueFull` rejection path
+// alongside. Each point is asserted against the same absolute ceilings as the
+// rest of the file.
+//
+// The result is dominated by the serialized entry size at the bound — the O(n)
+// duplicate scan, the full re-serialize on `save_fund_queue`, and the TTL
+// extension over the largest possible value — not by the insertion *index*:
+// `Vec::insert`'s element shift runs host-native and is negligible beside the
+// ledger read/write of a 50-entry vector. That is the finding the issue asked
+// for: the worst case is *any* admission into a full queue, so what CI must hold
+// is the bound (`MAX_FUND_QUEUE_LEN`), and its cost is captured below and in
+// #1062.
+
+/// Set `lp`'s reputation score inside the benchmark contract's storage, so a
+/// subsequent join can be aimed at a specific insertion position.
+fn set_lp_score_bench(bench: &BaseBenchEnv, lp: &Address, score: u32) {
+    bench.env.as_contract(&bench.contract.address, || {
+        set_lp_score(&bench.env, lp, score);
+    });
+}
+
+/// Submit a fresh invoice and fill its fund queue to exactly
+/// `MAX_FUND_QUEUE_LEN` with *distinct, strictly descending* scores
+/// (`100, 98, …, 2`), so a later joiner can be aimed at any insertion position.
+fn setup_bench_queue_distinct(bench: &BaseBenchEnv) -> u64 {
+    let invoice_id = submit_invoice_bench(bench);
+    for i in 0..MAX_FUND_QUEUE_LEN {
+        let lp = Address::generate(&bench.env);
+        set_lp_score_bench(bench, &lp, 100 - 2 * i);
+        bench.contract.join_fund_queue(&lp, &invoice_id);
+    }
+    invoice_id
+}
+
+#[test]
+fn benchmark_worst_case_queue_insertion() {
+    let bench = setup_benchmark_env();
+
+    // One full queue per insertion position, so each measured join starts from
+    // an identical full, distinctly-scored queue.
+    let head_id = setup_bench_queue_distinct(&bench);
+    let middle_id = setup_bench_queue_distinct(&bench);
+    let tail_id = setup_bench_queue_distinct(&bench);
+    let reject_id = setup_bench_queue_distinct(&bench);
+
+    let mut rows: std::vec::Vec<(&str, u64, u64)> = std::vec::Vec::new();
+
+    // Head: score above every retained entry -> insert at index 0, the maximum
+    // element-shift position, displacing the tail.
+    let head_lp = Address::generate(&bench.env);
+    set_lp_score_bench(&bench, &head_lp, 101);
+    let (cpu, mem) = measure(&bench.env, "join_fund_queue_head_insert_at_max", || {
+        bench.contract.join_fund_queue(&head_lp, &head_id);
+    });
+    assert_within_resource_budget(
+        "join_fund_queue_head_insert_at_max",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+    rows.push(("head (index 0, displacing)", cpu, mem));
+
+    // Middle: score 51 slots between the 52 at index 24 and the 50 at index 25.
+    let mid_lp = Address::generate(&bench.env);
+    set_lp_score_bench(&bench, &mid_lp, 51);
+    let (cpu, mem) = measure(&bench.env, "join_fund_queue_middle_insert_at_max", || {
+        bench.contract.join_fund_queue(&mid_lp, &middle_id);
+    });
+    assert_within_resource_budget(
+        "join_fund_queue_middle_insert_at_max",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+    rows.push(("middle (index 25)", cpu, mem));
+
+    // Tail: score 3 is one above the tail (2) -> admitted into the freed tail
+    // slot; the minimum element-shift position.
+    let tail_lp = Address::generate(&bench.env);
+    set_lp_score_bench(&bench, &tail_lp, 3);
+    let (cpu, mem) = measure(&bench.env, "join_fund_queue_tail_insert_at_max", || {
+        bench.contract.join_fund_queue(&tail_lp, &tail_id);
+    });
+    assert_within_resource_budget(
+        "join_fund_queue_tail_insert_at_max",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+    rows.push(("tail (index 49, admitted)", cpu, mem));
+
+    // Rejection: score equal to the tail -> `QueueFull`. The full O(n) duplicate
+    // scan plus the bound check run, but no write happens, so this is the floor
+    // of the worst-case path.
+    let reject_lp = Address::generate(&bench.env);
+    set_lp_score_bench(&bench, &reject_lp, 2);
+    let (cpu, mem) = measure(&bench.env, "join_fund_queue_rejected_at_max", || {
+        let _ = bench.contract.try_join_fund_queue(&reject_lp, &reject_id);
+    });
+    assert_within_resource_budget(
+        "join_fund_queue_rejected_at_max",
+        cpu,
+        mem,
+        MAX_CPU_INSTRUCTIONS,
+        MAX_MEMORY_BYTES,
+    );
+    rows.push(("rejected (score == tail)", cpu, mem));
+
+    std::println!(
+        "\n| Insertion into a full queue (Issue #1057) | CPU Instructions | Memory (bytes) |"
+    );
+    std::println!("| ---------------------------------------- | ---------------- | -------------- |");
+    for (label, cpu, mem) in &rows {
+        std::println!("| {label} | {cpu} | {mem} |");
     }
 }
 
@@ -1874,5 +2009,392 @@ fn benchmark_oracle_verification_diagnostic_events() {
         ),
     ] {
         assert_within_resource_budget(name, cpu, mem, MAX_CPU_INSTRUCTIONS, MAX_MEMORY_BYTES);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Issue #1054: cost of rejecting compromised feeder data
+// -----------------------------------------------------------------------
+
+/// Issue #1054 before/after. **Before** the wave-9 oracle hardening, a
+/// registered Identity feeder whose payload was attacker-controlled (a
+/// "compromised feeder") had no defense at the ILN gate: a replayed,
+/// future-dated, regressed, frozen, or lying attestation was trusted and
+/// `fund_invoice` opened on it. **After**, each hostile payload is rejected at
+/// a distinct, named branch of the shared gate — freshness (#1050),
+/// monotonicity (#1052), duplicate bound (#1053), quorum disagreement
+/// (#1047) — and, because a rejected `fund_invoice` rolls its events back, the
+/// rejection is *observable* on the permissionless `check_oracle_verification`
+/// keeper path (#1049).
+///
+/// This measures the marginal cost of every rejection branch through that
+/// never-erroring diagnostic, so each outcome is directly assertable and
+/// nothing is rolled back. The first row is the honest, fresh, verified feeder
+/// — the only shape that still passes, identical to pre-#1054 behavior and so
+/// the baseline. Every hostile vector must be rejected *and* stay inside the
+/// same per-invocation budget as that passing path; the deltas are the price
+/// of no longer trusting a compromised feeder.
+#[test]
+fn benchmark_compromised_feeder_rejection_paths() {
+    let bench = setup_benchmark_env();
+
+    // Fixed headroom above the freshness window so no age arithmetic
+    // underflows while the ledger is advanced between registrations.
+    let mut ledger = bench.env.ledger().get();
+    ledger.sequence_number = 1_000;
+    bench.env.ledger().set(ledger);
+
+    let max_age: u64 = 10;
+    bench.contract.set_max_oracle_age(&max_age).unwrap();
+
+    let mut outcome = IdentityVerificationOutcome::Verified;
+
+    // Row 1 — baseline: honest, fresh, verified feeder. The only payload the
+    // gate still accepts; identical to pre-#1054 behavior.
+    let honest = bench.env.register_contract(None, BenchTimestampedOracle);
+    BenchTimestampedOracleClient::new(&bench.env, &honest)
+        .set_timestamp(&bench.env.ledger().sequence());
+    bench.contract.register_oracle(&OracleFeedType::Identity, &honest);
+    let (ok_cpu, ok_mem) = measure(&bench.env, "compromised_feeder_baseline_verified", || {
+        outcome = bench.contract.check_oracle_verification(
+            &OracleFeedType::Identity,
+            &bench.token,
+            &bench.payer,
+        );
+    });
+    assert_eq!(
+        outcome,
+        IdentityVerificationOutcome::Verified,
+        "an honest fresh feeder must still verify"
+    );
+
+    // Row 2 — stale replay: a captured attestation older than the window. A
+    // distinct oracle address keeps this a pure freshness rejection (the
+    // monotonicity/duplicate checks are per-oracle and reset on the switch).
+    advance_benchmark_ledger(&bench.env);
+    let replay = bench.env.register_contract(None, BenchTimestampedOracle);
+    let replay_ts = bench.env.ledger().sequence() - (max_age as u32 + 5);
+    BenchTimestampedOracleClient::new(&bench.env, &replay).set_timestamp(&replay_ts);
+    bench.contract.register_oracle(&OracleFeedType::Identity, &replay);
+    let (replay_cpu, replay_mem) = measure(&bench.env, "compromised_feeder_stale_replay", || {
+        outcome = bench.contract.check_oracle_verification(
+            &OracleFeedType::Identity,
+            &bench.token,
+            &bench.payer,
+        );
+    });
+    assert_eq!(
+        outcome,
+        IdentityVerificationOutcome::Stale,
+        "a replayed stale attestation must be rejected"
+    );
+
+    // Row 3 — clock skew: a future-dated timestamp is treated as stale (#1050).
+    advance_benchmark_ledger(&bench.env);
+    let skewed = bench.env.register_contract(None, BenchTimestampedOracle);
+    let skewed_ts = bench.env.ledger().sequence() + 1_000;
+    BenchTimestampedOracleClient::new(&bench.env, &skewed).set_timestamp(&skewed_ts);
+    bench.contract.register_oracle(&OracleFeedType::Identity, &skewed);
+    let (skew_cpu, skew_mem) = measure(&bench.env, "compromised_feeder_future_timestamp", || {
+        outcome = bench.contract.check_oracle_verification(
+            &OracleFeedType::Identity,
+            &bench.token,
+            &bench.payer,
+        );
+    });
+    assert_eq!(
+        outcome,
+        IdentityVerificationOutcome::Stale,
+        "a future-dated (clock-skewed) timestamp must be rejected as stale"
+    );
+
+    // Row 4 — timestamp regression: the same oracle rolls its timestamp back
+    // (#1052). Seed one baseline observation so the regression has a floor.
+    advance_benchmark_ledger(&bench.env);
+    let regressing = bench.env.register_contract(None, BenchTimestampedOracle);
+    let reg_client = BenchTimestampedOracleClient::new(&bench.env, &regressing);
+    let base_ts = bench.env.ledger().sequence();
+    reg_client.set_timestamp(&base_ts);
+    bench.contract.register_oracle(&OracleFeedType::Identity, &regressing);
+    let _ = bench.contract.check_oracle_verification(
+        &OracleFeedType::Identity,
+        &bench.token,
+        &bench.payer,
+    );
+    reg_client.set_timestamp(&(base_ts - 1));
+    let (reg_cpu, reg_mem) = measure(&bench.env, "compromised_feeder_timestamp_regression", || {
+        outcome = bench.contract.check_oracle_verification(
+            &OracleFeedType::Identity,
+            &bench.token,
+            &bench.payer,
+        );
+    });
+    assert_eq!(
+        outcome,
+        IdentityVerificationOutcome::TimestampRegression,
+        "a rolled-back timestamp must be rejected"
+    );
+
+    // Row 5 — frozen snapshot: the same oracle re-serves one identical
+    // timestamp past the duplicate cap (#1053). Seed the streak to the cap,
+    // then the measured read is the one over it.
+    advance_benchmark_ledger(&bench.env);
+    let frozen = bench.env.register_contract(None, BenchTimestampedOracle);
+    BenchTimestampedOracleClient::new(&bench.env, &frozen)
+        .set_timestamp(&bench.env.ledger().sequence());
+    bench.contract.register_oracle(&OracleFeedType::Identity, &frozen);
+    for _ in 0..(crate::oracle_registry::MAX_CONSECUTIVE_DUPLICATE_UPDATES + 1) {
+        let _ = bench.contract.check_oracle_verification(
+            &OracleFeedType::Identity,
+            &bench.token,
+            &bench.payer,
+        );
+    }
+    let (frozen_cpu, frozen_mem) = measure(&bench.env, "compromised_feeder_frozen_snapshot", || {
+        outcome = bench.contract.check_oracle_verification(
+            &OracleFeedType::Identity,
+            &bench.token,
+            &bench.payer,
+        );
+    });
+    assert_eq!(
+        outcome,
+        IdentityVerificationOutcome::DuplicateUpdate,
+        "a frozen (re-served) timestamp past the cap must be rejected"
+    );
+
+    // Row 6 — quorum disagreement: three Identity feeders where the
+    // compromised ones cannot reach the threshold (#1047). Registered last
+    // because a non-empty list short-circuits the single-oracle chain above.
+    for i in 0..3u32 {
+        if i > 0 {
+            advance_benchmark_ledger(&bench.env);
+        }
+        let id = bench.env.register_contract(None, BenchQuorumOracle);
+        BenchQuorumOracleClient::new(&bench.env, &id).set_verified(&(i < 2));
+        bench
+            .contract
+            .add_identity_oracle(&OracleFeedType::Identity, &id);
+    }
+    bench.contract.set_identity_quorum(&3);
+    let (disq_cpu, disq_mem) =
+        measure(&bench.env, "compromised_feeder_quorum_disagreement", || {
+            outcome = bench.contract.check_oracle_verification(
+                &OracleFeedType::Identity,
+                &bench.token,
+                &bench.payer,
+            );
+        });
+    assert_eq!(
+        outcome,
+        IdentityVerificationOutcome::QuorumDisagreement,
+        "a compromised minority must not reach the quorum"
+    );
+
+    std::println!(
+        "\n| Compromised-feeder payload (Issue #1054) | Outcome | CPU Instructions | Memory (bytes) |"
+    );
+    std::println!(
+        "| ---------------------------------------- | ------- | ---------------- | -------------- |"
+    );
+    std::println!("| honest, fresh, verified (baseline) | Verified | {ok_cpu} | {ok_mem} |");
+    std::println!("| stale replay | Stale | {replay_cpu} | {replay_mem} |");
+    std::println!("| future-dated clock skew | Stale | {skew_cpu} | {skew_mem} |");
+    std::println!("| timestamp regression | TimestampRegression | {reg_cpu} | {reg_mem} |");
+    std::println!("| frozen snapshot (duplicate) | DuplicateUpdate | {frozen_cpu} | {frozen_mem} |");
+    std::println!(
+        "| quorum disagreement | QuorumDisagreement | {disq_cpu} | {disq_mem} |"
+    );
+
+    for (name, cpu, mem) in [
+        ("compromised_feeder_baseline_verified", ok_cpu, ok_mem),
+        ("compromised_feeder_stale_replay", replay_cpu, replay_mem),
+        ("compromised_feeder_future_timestamp", skew_cpu, skew_mem),
+        (
+            "compromised_feeder_timestamp_regression",
+            reg_cpu,
+            reg_mem,
+        ),
+        ("compromised_feeder_frozen_snapshot", frozen_cpu, frozen_mem),
+        (
+            "compromised_feeder_quorum_disagreement",
+            disq_cpu,
+            disq_mem,
+        ),
+    ] {
+        assert_within_resource_budget(name, cpu, mem, MAX_CPU_INSTRUCTIONS, MAX_MEMORY_BYTES);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Issue #1055: cost of exposing oracle health and quorum
+// -----------------------------------------------------------------------
+
+/// Issue #1055 before/after. **Before**, answering "is oracle gating for this
+/// feed + token healthy?" meant fanning out across five separate read
+/// entry-points (`get_oracle_health`, `is_oracle_circuit_tripped`,
+/// `get_circuit_recovery_state`, `get_identity_oracles`, `get_identity_quorum`),
+/// and the *live* health of an Identity quorum had no reader at all: in quorum
+/// mode `check_identity_quorum` never writes the single-oracle `OracleHealth`
+/// key, so `get_oracle_health` reports `None` forever. **After**, one aggregate
+/// read (`get_oracle_status`) returns the recorded configuration + health state
+/// in a single call, and `check_identity_quorum_health` reports the live
+/// per-feeder health and the quorum verdict for a payer — sharing the funding
+/// gate's own per-feeder predicate, so the two can never disagree.
+///
+/// This measures both exposure paths. `get_oracle_status` is deliberately
+/// local-reads-only (no cross-contract calls, no writes) so it is cheap and
+/// pause-safe; `check_identity_quorum_health` performs the live fan-out and is
+/// measured cumulatively at 1 / 5 / `MAX_IDENTITY_ORACLES_PER_FEED` feeders to
+/// show that its worst case is a fixed, pre-bounded cost rather than an
+/// open-ended one.
+#[test]
+fn benchmark_oracle_status_and_quorum_exposure() {
+    let bench = setup_benchmark_env();
+
+    // Fixed headroom above the freshness window so the stale timestamp below
+    // cannot underflow.
+    let mut ledger = bench.env.ledger().get();
+    ledger.sequence_number = 1_000;
+    bench.env.ledger().set(ledger);
+
+    let max_age: u64 = 10;
+    bench.contract.set_max_oracle_age(&max_age).unwrap();
+
+    // Row 1 — unconfigured feed: nothing registered, so the aggregate view is
+    // all-empty. The floor cost of the one-call read.
+    let (unconfigured_cpu, unconfigured_mem) =
+        measure(&bench.env, "oracle_status_view_unconfigured", || {
+            let view = bench
+                .contract
+                .get_oracle_status(&OracleFeedType::Identity, &bench.token);
+            assert!(view.resolved_oracle.is_none());
+            assert!(view.health.is_none());
+            assert!(!view.circuit_tripped);
+            assert!(view.recovery.is_none());
+            assert!(view.identity_oracles.is_empty());
+            assert!(view.price_sources.is_empty());
+        });
+
+    // Row 2 — healthy feed: one registered oracle with a recorded health
+    // snapshot, so the single read reports the resolution and the health state
+    // together (previously two separate entrypoints).
+    let healthy = bench.env.register_contract(None, BenchTimestampedOracle);
+    BenchTimestampedOracleClient::new(&bench.env, &healthy)
+        .set_timestamp(&bench.env.ledger().sequence());
+    bench.contract.register_oracle(&OracleFeedType::Identity, &healthy);
+    let _ = bench
+        .contract
+        .check_oracle_health(&OracleFeedType::Identity, &bench.token, &bench.payer);
+    let (healthy_cpu, healthy_mem) = measure(&bench.env, "oracle_status_view_healthy", || {
+        let view = bench
+            .contract
+            .get_oracle_status(&OracleFeedType::Identity, &bench.token);
+        assert_eq!(view.resolved_oracle, Some(healthy.clone()));
+        assert!(view.health.is_some());
+        assert!(!view.circuit_tripped);
+        assert!(view.recovery.is_none());
+    });
+
+    // Row 3 — open breaker + in-progress recovery: a per-token override serving
+    // stale data trips the circuit after `MAX_CONSECUTIVE_STALE_QUERIES` stale
+    // observations; the aggregate read then reports both the open breaker and
+    // the half-open recovery bookkeeping (previously two more entrypoints).
+    let stale_token = Address::generate(&bench.env);
+    let stale_oracle = bench.env.register_contract(None, BenchTimestampedOracle);
+    let stale_ts = bench.env.ledger().sequence() - 20;
+    BenchTimestampedOracleClient::new(&bench.env, &stale_oracle).set_timestamp(&stale_ts);
+    bench
+        .contract
+        .register_token_oracle(&OracleFeedType::Identity, &stale_token, &stale_oracle);
+    for _ in 0..crate::oracle_registry::MAX_CONSECUTIVE_STALE_QUERIES {
+        let _ = bench
+            .contract
+            .check_oracle_health(&OracleFeedType::Identity, &stale_token, &bench.payer);
+    }
+    let (tripped_cpu, tripped_mem) =
+        measure(&bench.env, "oracle_status_view_tripped_recovery", || {
+            let view = bench
+                .contract
+                .get_oracle_status(&OracleFeedType::Identity, &stale_token);
+            assert!(view.circuit_tripped);
+            assert!(view.recovery.is_some());
+            assert_eq!(
+                view.recovery.as_ref().unwrap().tripped_oracle,
+                stale_oracle
+            );
+        });
+
+    // Rows 4-6 — live quorum fan-out: `check_identity_quorum_health` queries
+    // each registered Identity feeder, so its cost grows with the list up to the
+    // `MAX_IDENTITY_ORACLES_PER_FEED` bound. Measured cumulatively at 1 / 5 /
+    // cap feeders, all honest + fresh (every feeder `Verified`).
+    let mut fanout: std::vec::Vec<(std::string::String, u64, u64)> = std::vec::Vec::new();
+    let mut feeders_added: u32 = 0;
+    for target in [1u32, 5, MAX_IDENTITY_ORACLES_PER_FEED] {
+        while feeders_added < target {
+            if feeders_added > 0 {
+                advance_benchmark_ledger(&bench.env);
+            }
+            let id = bench.env.register_contract(None, BenchQuorumOracle);
+            BenchQuorumOracleClient::new(&bench.env, &id).set_verified(&true);
+            bench
+                .contract
+                .add_identity_oracle(&OracleFeedType::Identity, &id);
+            feeders_added += 1;
+        }
+        let name = format!("identity_quorum_health_fanout_{target}");
+        let (cpu, mem) = measure(&bench.env, &name, || {
+            let health = bench.contract.check_identity_quorum_health(
+                &OracleFeedType::Identity,
+                &bench.token,
+                &bench.payer,
+            );
+            assert_eq!(health.feeders.len(), target);
+            assert_eq!(health.observations.len(), target);
+            assert_eq!(health.verified_count, target);
+            assert_eq!(health.observations.get(0), Some(FeederHealth::Verified));
+            assert!(health.quorum_met);
+        });
+        fanout.push((name, cpu, mem));
+    }
+
+    std::println!(
+        "\n| Oracle exposure view (Issue #1055) | State | CPU Instructions | Memory (bytes) |"
+    );
+    std::println!(
+        "| ---------------------------------- | ----- | ---------------- | -------------- |"
+    );
+    std::println!(
+        "| get_oracle_status | unconfigured feed | {unconfigured_cpu} | {unconfigured_mem} |"
+    );
+    std::println!("| get_oracle_status | healthy + recorded | {healthy_cpu} | {healthy_mem} |");
+    std::println!(
+        "| get_oracle_status | breaker open + recovering | {tripped_cpu} | {tripped_mem} |"
+    );
+    for (name, cpu, mem) in &fanout {
+        let feeders = name.rsplit('_').next().unwrap_or("?");
+        std::println!(
+            "| check_identity_quorum_health | {feeders} feeder(s) | {cpu} | {mem} |"
+        );
+    }
+
+    for (name, cpu, mem) in [
+        (
+            "oracle_status_view_unconfigured",
+            unconfigured_cpu,
+            unconfigured_mem,
+        ),
+        ("oracle_status_view_healthy", healthy_cpu, healthy_mem),
+        (
+            "oracle_status_view_tripped_recovery",
+            tripped_cpu,
+            tripped_mem,
+        ),
+    ] {
+        assert_within_resource_budget(name, cpu, mem, MAX_CPU_INSTRUCTIONS, MAX_MEMORY_BYTES);
+    }
+    for (name, cpu, mem) in &fanout {
+        assert_within_resource_budget(name, *cpu, *mem, MAX_CPU_INSTRUCTIONS, MAX_MEMORY_BYTES);
     }
 }

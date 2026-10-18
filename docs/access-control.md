@@ -157,6 +157,8 @@ eligibility when `fund_invoice` is called with `require_oracle_verification = tr
 | `set_identity_quorum` | Admin | Sets how many registered Identity feeders must agree a payer is verified before funding proceeds (the `N` in `N`-of-`M`; valid range `[1, 20]`, else `InvalidIdentityQuorum`; rate-limited: ~10min, Issue #1047) |
 | `get_identity_oracles` | Anyone | Reads the registered Identity feeders for a feed type |
 | `get_identity_quorum` | Anyone | Reads the configured Identity verification quorum (defaults to 1) |
+| `get_oracle_status` | Anyone | One-call aggregate of a feed + token's oracle configuration and recorded health — resolved oracle, cached health, breaker flag, half-open recovery, Identity feeders + threshold, price sources. **Local reads only** (no cross-contract calls, no writes), accessible while paused (Issue #1055) |
+| `check_identity_quorum_health` | Anyone | Live per-feeder health for a payer (`FeederHealth`: `Verified` / `Unverified` / `Stale` / `Unreachable`) plus `verified_count`, `required_quorum` and `quorum_met`; shares the funding gate's per-feeder predicate; permissionless, read-only, fan-out bounded by `MAX_IDENTITY_ORACLES_PER_FEED` (Issue #1055) |
 
 > **Feeder disagreement (Issue #1047).** When one or more Identity feeders are
 > registered, `fund_invoice`'s oracle gate queries **all** of them and requires
@@ -192,6 +194,17 @@ eligibility when `fund_invoice` is called with `require_oracle_verification = tr
 > commit. It requires **no** authorization, grants no privilege, and adds no
 > successful-path side effect beyond the oracle health snapshot. See
 > [oracle-integration.md](oracle-integration.md#observing-gate-failures-issue-1049).
+
+> **Health & quorum exposure (Issue #1055).** Reading oracle configuration and
+> health used to require fanning out across five entry points, and the live
+> health of a multi-oracle Identity quorum had no reader at all (in quorum mode
+> the single-oracle `OracleHealth` key is never written). `get_oracle_status`
+> collapses the configuration/health reads into one permissionless call and makes
+> no cross-contract calls or writes, so it is safe at any frequency and while
+> paused; `check_identity_quorum_health` adds the missing live quorum reader,
+> sharing the funding gate's per-feeder predicate so the two can never disagree.
+> Neither view takes `require_auth` or grants any privilege. See
+> [oracle-integration.md](oracle-integration.md#exposing-health-and-quorum-issue-1055).
 
 ### Insurance Pool Integration
 
@@ -374,6 +387,7 @@ Other documented exemptions (full matrix and rationale: [docs/rate-limiting.md](
 - `record_twap_sample` — high-frequency keeper op; limiting it would starve the TWAP window
 - multisig `execute_proposal` — replaced by N-of-M threshold + proposal-expiry timelock
 - `check_oracle_health` — feeds the circuit breaker itself; limiting it would starve the breaker
+- `get_oracle_status` / `check_identity_quorum_health` — read-only observability views (permissionless, no write side effect); limiting them would blind the `/health` probe (Issue #1055)
 
 ### Implementation
 

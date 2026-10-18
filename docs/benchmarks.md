@@ -206,6 +206,59 @@ run the command above and add the printed `BENCHMARK` values to
 `contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
 three entries.
 
+## Worst-case queue insertion (Issue #1057)
+
+`join_fund_queue` has two scans (a duplicate check and the sorted-insert
+position) plus, when the queue is full, a tail displacement and a full
+re-serialize of the whole `Vec<LpFundRequest>`. The worst case is therefore an
+*admission into a full queue*; the fund-queue bound at `MAX_FUND_QUEUE_LEN`
+(50, Issues #1091/#1095) is what keeps that write inside Soroban's
+per-transaction limits.
+
+**Before:** the #1062 section above measured a single point — one displacing
+admission into a full queue whose entries all carried the *same* score. With
+equal scores every admitted joiner is forced to index 0, so that measurement
+could not distinguish a head insert from a tail one, never established that the
+head is the worst position, and never measured the `QueueFull` rejection path at
+the bound. "Worst case" was an assertion, not a demonstration.
+
+**After:** `contracts/invoice_liquidity/src/tests_benchmarks.rs` adds
+`benchmark_worst_case_queue_insertion`, which builds a full queue with
+*distinct, strictly descending* scores (`100, 98, …, 2`) and sweeps the
+insertion position, asserting each point against the same absolute ceilings as
+the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | What it measures |
+| ---------------------------- | ---------------- |
+| `join_fund_queue_head_insert_at_max` | admission at **index 0** — the maximum element-shift position, displacing the tail |
+| `join_fund_queue_middle_insert_at_max` | admission at the **middle** (index 25) |
+| `join_fund_queue_tail_insert_at_max` | admission at the **tail** (index 49) — the minimum element-shift position |
+| `join_fund_queue_rejected_at_max` | the **`QueueFull`** rejection path at the bound (full duplicate scan + bound check, no write) |
+
+The sweep's finding: the cost is dominated by the serialized entry size at the
+bound (the O(n) scans, the full re-serialize, and the TTL extension over the
+largest possible value), **not** by the insertion index — `Vec::insert`'s
+element shift runs host-native and is negligible beside the ledger read/write of
+a 50-entry vector. The rows are therefore near-flat, and the thing CI must hold
+is the bound (`MAX_FUND_QUEUE_LEN`), with the head-insert row as the (marginally)
+worst admission. The behavioural counterpart — head/middle/tail insertion order,
+the exact `QueueFull` admission boundary, the displacing-join authorization
+requirement, and the `FundQueueOpenedAt` ledger boundary — lives in
+`tests_storage.rs` (`test_1057_*`).
+
+Run it with:
+
+```bash
+cd contracts/invoice_liquidity
+cargo test --target x86_64-unknown-linux-gnu benchmark_worst_case_queue_insertion -- --nocapture
+```
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record these as a tracked baseline, run
+the command above and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
 ## Concurrent settlement stress (Issue #1063)
 
 Settlement (`mark_paid`) is the contract's highest-value entry point, and it
@@ -598,6 +651,88 @@ permissionless access, breaker interop) is covered by the
 `test_check_oracle_verification_*` /
 `test_fund_invoice_stale_rejection_events_roll_back_but_diagnostic_commits` tests
 in `tests_oracle_registry.rs`.
+
+## Compromised-feeder rejection-path cost (Issue #1054)
+
+The adversary behind the Identity defences is a **compromised feeder**: an oracle
+that is still an *authorized* registry entry but whose `get_payer_data` payload is
+attacker-controlled. Issue #1054 adds the focused adversarial suite that pins each
+defence against a hostile payload (see
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#17-test-compromised-feeder-data-issue-1054))
+and this benchmark measures the cost of every rejection branch.
+
+**Before:** the individual defences existed but there was no measured figure for
+rejecting a hostile payload, and the #1052/#1053 adversarial tests lived in the
+undeclared `tests_oracle_freshness.rs` module (never compiled).
+
+**After:** each hostile payload is rejected at a distinct, named branch of the
+shared gate. Because a rejected `fund_invoice` rolls its events back, the
+benchmark drives the **permissionless, never-erroring** `check_oracle_verification`
+diagnostic (#1049) so each outcome is directly assertable and nothing rolls back.
+`benchmark_compromised_feeder_rejection_paths` measures one row per branch in one
+run, each asserted against the same absolute ceilings as the rest of the file:
+
+| Benchmark (`BENCHMARK` name) | Outcome asserted | Path measured |
+| ---------------------------- | ---------------- | ------------- |
+| `compromised_feeder_baseline_verified` | `Verified` | honest, fresh, verified feeder (baseline) |
+| `compromised_feeder_stale_replay` | `Stale` | replayed attestation older than the window |
+| `compromised_feeder_future_timestamp` | `Stale` | future-dated (clock-skewed) timestamp |
+| `compromised_feeder_timestamp_regression` | `TimestampRegression` | same oracle rolls its timestamp back |
+| `compromised_feeder_frozen_snapshot` | `DuplicateUpdate` | identical timestamp past the duplicate cap |
+| `compromised_feeder_quorum_disagreement` | `QuorumDisagreement` | compromised minority cannot reach the quorum |
+
+Each hostile figure should sit close to the honest baseline (the rejection branches
+are comparisons + one failure event on the same snapshot the passing path already
+reads), and every figure stays far inside the per-invocation budget. Rejection
+correctness itself is covered by the `test_1054_*` suite in
+`tests_oracle_registry.rs`.
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record this as a tracked baseline, run the
+command below and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
+
+## Oracle health / quorum exposure cost (Issue #1055)
+
+Answering "is oracle gating for this feed + token healthy?" used to mean fanning
+out across five read entry points, and the live health of an Identity quorum had
+no reader at all (`check_identity_quorum` never writes the single-oracle
+`OracleHealth` key, so `get_oracle_health` is `None` forever in quorum mode).
+Issue #1055 adds two permissionless views — `get_oracle_status` (an aggregate of
+recorded state) and `check_identity_quorum_health` (live per-feeder health +
+quorum verdict) — see
+[`audit-evidence-remediation-map.md`](audit-evidence-remediation-map.md#18-expose-oracle-health-and-quorum-issue-1055).
+
+**Before:** no single figure for either a configuration/health probe or a live
+quorum probe existed, and the quorum path was unobservable.
+
+**After:** `benchmark_oracle_status_and_quorum_exposure` measures both views in
+one run, each asserted against the same absolute ceilings as the rest of the
+file:
+
+| Benchmark (`BENCHMARK` name) | View | State measured |
+| ---------------------------- | ---- | -------------- |
+| `oracle_status_view_unconfigured` | `get_oracle_status` | nothing registered (all-empty view) |
+| `oracle_status_view_healthy` | `get_oracle_status` | one oracle, recorded health (breaker closed) |
+| `oracle_status_view_tripped_recovery` | `get_oracle_status` | breaker open + half-open recovery bookkeeping |
+| `identity_quorum_health_fanout_1` | `check_identity_quorum_health` | 1 registered feeder, all verified |
+| `identity_quorum_health_fanout_5` | `check_identity_quorum_health` | 5 feeders, all verified |
+| `identity_quorum_health_fanout_20` | `check_identity_quorum_health` | `MAX_IDENTITY_ORACLES_PER_FEED` feeders, all verified |
+
+`get_oracle_status` performs no cross-contract calls and writes nothing, so its
+three rows are cheap and flat regardless of registration state — suitable for a
+high-frequency `/health` probe. `check_identity_quorum_health`'s cost grows with
+the feeder list, but the list is capped at `MAX_IDENTITY_ORACLES_PER_FEED` (20),
+so its worst case is a fixed, pre-bounded figure; the 1 / 5 / 20 rows make that
+gradient explicit, and every row stays inside the per-invocation budget. View
+correctness is covered by the `test_1055_*` suite in `tests_oracle_registry.rs`.
+
+**Migration note:** measurement-only addition — no contract behavior, storage
+layout, or baseline format changed. To record this as a tracked baseline, run the
+command below and add the printed `BENCHMARK` values to
+`contracts/invoice_liquidity/benchmarks/baseline.json` alongside the existing
+entries.
 
 ## Updating Baselines
 
