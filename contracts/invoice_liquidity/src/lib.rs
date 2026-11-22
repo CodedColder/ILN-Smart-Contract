@@ -4581,3 +4581,5 @@ mod tests_max_depth_extension;
 mod tests_tie_breaking;
 // Issue #1172: dispute submission / resolution transition + authorization audit
 mod tests_dispute_transitions;
+// Issue #1173: cancellation & expiry accounting audit
+mod tests_cancel_expire_accounting;
