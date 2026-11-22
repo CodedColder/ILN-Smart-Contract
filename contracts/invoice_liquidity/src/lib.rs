@@ -4579,3 +4579,6 @@ mod tests_token_safety;
 mod tests_max_depth_extension;
 // Issue #1027: Focused tests for join-order tie-breaking replacement
 mod tests_tie_breaking;
+// Issue #1184: pause / unpause recovery audit — authorization, idempotency,
+// fail-closed gating, and total recovery after rejected (halted) calls.
+mod tests_pause_recovery;
