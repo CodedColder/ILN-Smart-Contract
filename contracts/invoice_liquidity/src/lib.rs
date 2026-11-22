@@ -4583,3 +4583,5 @@ mod tests_tie_breaking;
 mod tests_dispute_transitions;
 // Issue #1173: cancellation & expiry accounting audit
 mod tests_cancel_expire_accounting;
+// Issue #1174: adversarial fund-queue race coverage
+mod tests_fund_queue_races;
