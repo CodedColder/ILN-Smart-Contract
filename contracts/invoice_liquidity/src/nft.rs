@@ -19,6 +19,40 @@
 /// - Due date
 /// - Discount rate
 /// - Token address
+///
+/// # Invariants (Issue #1181 audit)
+///
+/// - `INV-NFT-1` (existence ⇔ invoice state): `InvoiceNft(id)` exists iff the
+///   invoice is `Funded | PartiallyFunded | Defaulted | Appealed | Disputed`.
+/// - `INV-NFT-2` (single source of truth): `InvoiceNftOwner(id)` and
+///   `InvoiceNft(id).owner` are written and removed together — `mint`,
+///   `transfer`, and `burn` each touch both keys in the same call, so they can
+///   never diverge.
+/// - `INV-NFT-3` (one owner): for a live NFT, the stored owner equals the
+///   current funder (single-funding path via `invoice.funder`) or the lead LP
+///   (largest contribution, earliest on ties) for partial funding.
+/// - `INV-NFT-4` (one-to-one mint): an invoice has at most one NFT;
+///   `mint_invoice_nft` fails with `AlreadyFunded` if one already exists, so a
+///   re-mint can never overwrite live metadata.
+/// - `INV-NFT-5` (metadata freshness): the snapshot fields (`amount`,
+///   `due_date`, `discount_rate`, `token`) are captured once at mint from the
+///   invoice. Invoice terms are immutable once funded, so the snapshot cannot
+///   drift from the invoice; a transfer rewrites only `owner`, never the
+///   snapshot fields.
+///
+/// # Authorization (Issue #1181 audit)
+///
+/// The helpers in this module are **internal state-sync primitives** and do
+/// **not** call `require_auth`. They are invoked only from `lib.rs` entry
+/// points (`fund_invoice`, `mark_paid`, `claim_default`, dispute/appeal paths,
+/// …) that have already authenticated the caller, via `sync_nft_state`.
+///
+/// The `metadata.owner == from` (transfer) and `metadata.owner == owner`
+/// (burn) checks are **consistency guards, not an authorization boundary**: an
+/// address equality check against a caller-supplied value proves nothing about
+/// who authorized the call. Do not expose `transfer_invoice_nft` /
+/// `burn_invoice_nft` as top-level entry points without adding an explicit
+/// `from` / `owner` `require_auth` (`RR-1181-1`).
 use soroban_sdk::{contracttype, Address, Env, Symbol};
 
 use crate::errors::ContractError;

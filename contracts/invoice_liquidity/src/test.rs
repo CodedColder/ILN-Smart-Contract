@@ -1639,3 +1639,187 @@ fn test_high_rep_threshold_reachable() {
     // Integration test for reachable path
     assert!(true);
 }
+
+// ----------------------------------------------------------------
+// Admin rotation / cooldown behaviour (Issue #1183)
+// ----------------------------------------------------------------
+//
+// Scope & data sources
+// --------------------
+// `set_admin` (lib.rs), the per-function rate-limit state in
+// `access::check_rate_limit` (key "set_admin", `ADMIN_CHANGE_COOLDOWN_LEDGERS`
+// = 720 ledgers) and the stored admin at `DataKey::Admin`, read here through
+// `crate::storage::get_admin` inside `as_contract`.
+//
+// Authorization rules
+// -------------------
+// Only the incumbent admin can rotate the role: `require_admin` loads the
+// stored admin and calls its `require_auth`. With `mock_all_auths()` the
+// identity check is vacuous, so the negative authorization case runs on a fresh
+// env without auth mocking (`test_set_admin_unauthorized_caller_rejected`).
+//
+// Failure behaviour
+// -----------------
+// A rejected rotation (unauthorized, uninitialized, or `RateLimited`) returns
+// `Err` before the `Admin` write commits, so the stored admin is unchanged and
+// the cooldown is not consumed (Soroban rolls the failed invocation back).
+
+/// Read the currently stored admin from the contract's own storage context.
+fn admin_address(t: &TestEnv) -> Address {
+    t.env.as_contract(&t.contract.address, || {
+        crate::storage::get_admin(&t.env).expect("admin must be set after initialize")
+    })
+}
+
+#[test]
+fn test_set_admin_first_call_rotates_and_emits_event() {
+    let t = setup();
+    let new_admin = Address::generate(&t.env);
+
+    // The first-ever call of a rate-limited fn is always allowed.
+    t.contract.set_admin(&new_admin);
+
+    // Read emitted events immediately after the invocation (events().all()
+    // reflects only the most recently completed invocation).
+    let events = t.env.events().all();
+    let changed = events
+        .events()
+        .iter()
+        .filter(|e| std::format!("{:?}", e).contains("admin_changed"))
+        .count();
+    assert_eq!(changed, 1, "exactly one admin_changed event expected");
+
+    assert_eq!(
+        admin_address(&t),
+        new_admin,
+        "stored admin must be rotated to the new address"
+    );
+}
+
+#[test]
+fn test_set_admin_self_rotation_is_allowed() {
+    let t = setup();
+    let current = admin_address(&t);
+
+    // Rotating to the same address is a state no-op but must not error.
+    let res = t.contract.try_set_admin(&current);
+    assert!(
+        res.is_ok(),
+        "self-rotation must be accepted (no-op): {res:?}"
+    );
+    assert_eq!(
+        admin_address(&t),
+        current,
+        "admin must be unchanged after a self-rotation"
+    );
+}
+
+#[test]
+fn test_set_admin_second_call_within_cooldown_rejected() {
+    let t = setup();
+    let first = Address::generate(&t.env);
+
+    // First rotation succeeds (no prior record).
+    t.contract.set_admin(&first);
+
+    // Immediate second rotation is inside the 720-ledger cooldown.
+    let res = t.contract.try_set_admin(&Address::generate(&t.env));
+    assert_eq!(
+        res,
+        Err(Ok(ContractError::RateLimited)),
+        "second set_admin within the cooldown must be RateLimited"
+    );
+
+    // The rejected call rolled back — the admin is still `first`, and because
+    // the rate-limit write rolled back too, the cooldown was not consumed.
+    assert_eq!(admin_address(&t), first);
+}
+
+#[test]
+fn test_set_admin_cooldown_boundary_exact_threshold() {
+    let t = setup();
+    let first = Address::generate(&t.env);
+    t.contract.set_admin(&first);
+
+    // One ledger short of the cooldown (720) is still rejected.
+    let mut info = t.env.ledger().get();
+    info.sequence_number += 719;
+    t.env.ledger().set(info);
+    let res = t.contract.try_set_admin(&Address::generate(&t.env));
+    assert_eq!(
+        res,
+        Err(Ok(ContractError::RateLimited)),
+        "one ledger short of the cooldown must be rejected"
+    );
+
+    // At exactly `last + cooldown`, the call is accepted.
+    let mut info = t.env.ledger().get();
+    info.sequence_number += 1;
+    t.env.ledger().set(info);
+    let second = Address::generate(&t.env);
+    let res = t.contract.try_set_admin(&second);
+    assert!(
+        res.is_ok(),
+        "at exactly the cooldown boundary the call must succeed: {res:?}"
+    );
+    assert_eq!(admin_address(&t), second);
+}
+
+/// Soroban `Address` has no invalid/zero representation: every address value a
+/// caller supplies is structurally valid, so `set_admin` accepts any of them
+/// (there is no address-format dimension to validate) — `RR-1183-1`.
+#[test]
+fn test_set_admin_accepts_any_valid_address_rr1183_1() {
+    let t = setup();
+    let rotated = Address::generate(&t.env);
+
+    let res = t.contract.try_set_admin(&rotated);
+    assert!(
+        res.is_ok(),
+        "any structurally valid address must be accepted: {res:?}"
+    );
+    assert_eq!(admin_address(&t), rotated);
+}
+
+#[test]
+fn test_set_admin_unauthorized_caller_rejected() {
+    // Fresh env WITHOUT mock_all_auths: the incumbent admin's require_auth
+    // cannot be satisfied, so the rotation must be rejected.
+    let env = Env::default();
+
+    let admin = Address::generate(&env);
+    let usdc = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let eurc = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let xlm = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    let contract_id = env.register_contract(None, InvoiceLiquidityContract);
+    let client = InvoiceLiquidityContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &usdc, &eurc, &xlm);
+
+    let res = client.try_set_admin(&Address::generate(&env));
+    assert!(
+        res.is_err(),
+        "set_admin without the admin's authorization must fail"
+    );
+}
+
+#[test]
+fn test_set_admin_rejected_before_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, InvoiceLiquidityContract);
+    let client = InvoiceLiquidityContractClient::new(&env, &contract_id);
+
+    let res = client.try_set_admin(&Address::generate(&env));
+    assert_eq!(
+        res,
+        Err(Ok(ContractError::Unauthorized)),
+        "set_admin on an uninitialized contract must be Unauthorized"
+    );
+}

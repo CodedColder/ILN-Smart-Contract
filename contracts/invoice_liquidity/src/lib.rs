@@ -238,19 +238,41 @@ impl InvoiceLiquidityContract {
     }
 
     // ------------------------------------------------------------
-/// `set_admin` contract entry point.
+/// `set_admin` contract entry point — rotate the contract administrator.
 ///
-/// # Arguments
-/// * `env` — host environment
-/// * `new_admin` — see signature
+/// # Authorization (Issue #1183 audit)
+/// The incumbent administrator (stored at `DataKey::Admin`) must authorize the
+/// call: `require_admin` loads that address and invokes `require_auth` on it, so
+/// only the current admin can hand the role over. There is no separate
+/// authorization on `new_admin` — the incoming address is not required to sign.
 ///
-/// # Returns
-/// * `Ok(...)` on success; see Errors
+/// # Rate limiting
+/// Guarded by `ADMIN_CHANGE_COOLDOWN_LEDGERS` (720 ledgers ≈ 1 h).
+/// The **first-ever** call is always allowed (no prior record). A call made
+/// before the cooldown elapses returns `RateLimited`. Because a rejected call
+/// returns an `Err`, Soroban rolls the whole invocation back — including the
+/// rate-limit write and the admin-action log entry — so a rejected attempt does
+/// **not** consume the cooldown and is not recorded as an executed action.
+///
+/// # Self / duplicate / "invalid" addresses
+/// Rotating to the *same* address (`new_admin == current`) is accepted: it is a
+/// state no-op that still emits `admin_changed` (old == new) and consumes the
+/// cooldown. Soroban `Address` values have no invalid/zero representation, so
+/// there is no address-format check to perform — every address value the caller
+/// supplies is structurally valid, and correctness of the handover is the
+/// operator's responsibility (`RR-1183-1`).
+///
+/// # Effects
+/// On success: records the action in the admin audit log, overwrites
+/// `DataKey::Admin`, and emits `admin_changed { old_admin, new_admin,
+/// timestamp }`.
 ///
 /// # Errors
-/// * `Unauthorized` if caller is not admin; plus validation errors
+/// * `Unauthorized` — caller is not the current admin, or the contract is not
+///   initialized.
+/// * `RateLimited` — a prior successful `set_admin` is still within its cooldown.
 ///
-/// Access: Admin only
+/// Access: current admin only
 pub fn set_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
         require_admin(&env)?;
         check_rate_limit(&env, "set_admin", ADMIN_CHANGE_COOLDOWN_LEDGERS)?;
