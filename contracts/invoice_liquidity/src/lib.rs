@@ -4579,3 +4579,5 @@ mod tests_token_safety;
 mod tests_max_depth_extension;
 // Issue #1027: Focused tests for join-order tie-breaking replacement
 mod tests_tie_breaking;
+// Issue #1172: dispute submission / resolution transition + authorization audit
+mod tests_dispute_transitions;
