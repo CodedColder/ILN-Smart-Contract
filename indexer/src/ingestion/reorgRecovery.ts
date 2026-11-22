@@ -31,6 +31,7 @@ import type { IngestionLockHandle } from './ingestionLock.js';
 import type { LedgerHeaderSource } from './ledgerHeaders.js';
 import { createHorizonLedgerHeaderSource } from './ledgerHeaders.js';
 import { runReplay, type ReplayOptions, type ReplayResult } from './replay.js';
+import type { RetryPolicy } from './horizonPages.js';
 import {
   LedgerReorgDetector,
   latchHalt,
@@ -54,6 +55,8 @@ export interface ReorgRecoveryOptions
   fetchImpl?: typeof fetch;
   decodeTransactionEvents?: (record: HorizonTransactionRecord) => DecodedContractEvent[];
   pageSize?: number;
+  /** Bounded retry policy for replay's Horizon reads. */
+  retry?: RetryPolicy;
   /** Upper bound on waiting for ingestion leadership. Defaults to 30s. */
   acquireTimeoutMs?: number;
 }
@@ -66,6 +69,9 @@ export interface ReorgRecoveryResult {
   deletedReputationUpdates: number;
   deletedInvoices: number;
   deletedLedgerHeaders: number;
+  deletedInsuranceEnrollments?: number;
+  deletedInsurancePremiums?: number;
+  deletedInsuranceClaims?: number;
   replay: ReplayResult | null;
   /** A newer divergence appeared while replaying — recovery must re-run. */
   reDetected: boolean;
@@ -152,6 +158,9 @@ interface RollbackCounts {
   deletedReputationUpdates: number;
   deletedInvoices: number;
   deletedLedgerHeaders: number;
+  deletedInsuranceEnrollments?: number;
+  deletedInsurancePremiums?: number;
+  deletedInsuranceClaims?: number;
 }
 
 /**
@@ -180,9 +189,9 @@ function rollbackIndexedState(
     const deletedReputationUpdates = db
       .prepare('DELETE FROM reputation_updates WHERE ledger >= ?')
       .run(divergenceLedger).changes;
-    db.prepare('DELETE FROM insurance_pool_enrollments WHERE ledger >= ?').run(divergenceLedger);
-    db.prepare('DELETE FROM insurance_pool_premiums WHERE ledger >= ?').run(divergenceLedger);
-    db.prepare('DELETE FROM insurance_pool_claims WHERE ledger >= ?').run(divergenceLedger);
+    const deletedInsuranceEnrollments = db.prepare('DELETE FROM insurance_pool_enrollments WHERE ledger >= ?').run(divergenceLedger).changes;
+    const deletedInsurancePremiums = db.prepare('DELETE FROM insurance_pool_premiums WHERE ledger >= ?').run(divergenceLedger).changes;
+    const deletedInsuranceClaims = db.prepare('DELETE FROM insurance_pool_claims WHERE ledger >= ?').run(divergenceLedger).changes;
 
     const deletedInvoices = db
       .prepare(
@@ -205,6 +214,9 @@ function rollbackIndexedState(
       deletedReputationUpdates,
       deletedInvoices,
       deletedLedgerHeaders,
+      deletedInsuranceEnrollments,
+      deletedInsurancePremiums,
+      deletedInsuranceClaims,
     };
   });
 
@@ -238,6 +250,7 @@ async function replayFromDivergence(
       : {}),
     ...(options.logger !== undefined ? { logger: options.logger } : {}),
     ...(options.pageSize !== undefined ? { pageSize: options.pageSize } : {}),
+    ...(options.retry !== undefined ? { retry: options.retry } : {}),
   };
 
   return runReplay(replayOptions);

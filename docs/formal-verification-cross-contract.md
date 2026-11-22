@@ -116,7 +116,7 @@ At any ledger sequence `current_ledger < eta_ledger` (including boundary `eta_le
 
 **Why cross-contract:** The timelock is tracked in `iln_governance` storage, but its guarantee protects parameter integrity across the target contracts. If governance could bypass `eta_ledger`, timelocked protections on economic parameters (such as `update_fee_rate`, `update_max_discount`, or `upgrade`) would be void.
 
-**Verified by:** `x6_governance_execution_not_before_eta_invariant`
+**Verified by:** *no test named `x6_governance_execution_not_before_eta_invariant` exists in the tree* (finding F-1 in [`cross-contract-accounting-audit.md`](cross-contract-accounting-audit.md)). Not a registry obligation; the nearest evidence is the governance suites listed in [`formal-verification.md`](formal-verification.md).
 
 ---
 
@@ -130,7 +130,7 @@ At any ledger sequence `current_ledger < eta_ledger` (including boundary `eta_le
 
 **Why cross-contract:** Veto power acts as an emergency stop for malicious or flawed proposals targeting downstream protocol contracts. Veto safety guarantees that once a proposal is blocked, its actions can never reach the downstream contracts regardless of subsequent ledger progression.
 
-**Verified by:** `x7_governance_veto_transition_safety`
+**Verified by:** *no test named `x7_governance_veto_transition_safety` exists in the tree* (finding F-1 in [`cross-contract-accounting-audit.md`](cross-contract-accounting-audit.md)). Not a registry obligation; the nearest evidence is the governance suites listed in [`formal-verification.md`](formal-verification.md).
 
 ---
 
@@ -144,7 +144,7 @@ At any ledger sequence `current_ledger < eta_ledger` (including boundary `eta_le
 
 **Why cross-contract:** Governance parameters and proposal execution govern the configuration of all five protocol contracts. Enforcing authorization across each lifecycle transition ensures malicious external callers cannot trigger unauthorized cross-contract configuration mutations.
 
-**Verified by:** `x8_governance_proposal_lifecycle_authorization`
+**Verified by:** *no test named `x8_governance_proposal_lifecycle_authorization` exists in the tree* (finding F-1 in [`cross-contract-accounting-audit.md`](cross-contract-accounting-audit.md)). Not a registry obligation; the nearest evidence is the governance suites listed in [`formal-verification.md`](formal-verification.md).
 
 ---
 
@@ -163,6 +163,10 @@ At any ledger sequence `current_ledger < eta_ledger` (including boundary `eta_le
 | X3 Default claim vs pool balance | `x3_default_claim_reduces_insurance_pool_by_payout` | #855 |
 | X4 Token conservation | `x4_payment_token_conserved_across_iln_and_insurance` | #855 |
 | X5 No double insurance pay | `x5_insurance_compensation_not_paid_twice_for_same_invoice` | #855 |
-| X6 Governance execution not before ETA | `x6_governance_execution_not_before_eta_invariant` | #1087 |
-| X7 Model veto transition safety | `x7_governance_veto_transition_safety` | #1088 |
-| X8 Proposal lifecycle authorization | `x8_governance_proposal_lifecycle_authorization` | #1089 |
+| X6 Governance execution not before ETA | *none in tree (F-1)* | #1087 |
+| X7 Model veto transition safety | *none in tree (F-1)* | #1088 |
+| X8 Proposal lifecycle authorization | *none in tree (F-1)* | #1089 |
+| X9 Funding/settlement atomic across ILN, token, distribution | `xc_funding_rolls_back_when_distribution_accrual_fails`, `xc_settlement_rolls_back_when_distribution_settlement_fails`, `xc_token_failure_rolls_back_funding_and_accrual` | #1160 |
+| X10 Default/dispute refunds atomic with insurance pool | `xc_failed_default_leaves_insurance_untouched_and_success_is_once`, `xc_insurance_failure_does_not_corrupt_pool_or_block_default`, `xc_insolvent_dispute_resolution_reverts_atomically` | #1160 |
+| X11 Per-operation token flows exact and bounded | `xc_funding_and_settlement_ledger_is_exact_with_bounded_dust`, `xc_partial_funding_cancel_refunds_exact_deposits`, `xc_upheld_dispute_ledger_reserve_bears_freelancer_payout`, `xc_refunded_funding_volume_still_accrues_lp_reward` | #1160 |
+| X12 ILN and pool balances cover outstanding obligations | `xc_iln_balance_equals_outstanding_obligations`, `xc_insurance_pool_token_balance_matches_accounting` | #1160 |

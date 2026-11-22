@@ -10,6 +10,22 @@ To regenerate: `cd cli && git-cliff --config .cliff.toml`
 
 ---
 
+## [Unreleased]
+
+### Changed
+- `iln pay` no longer prints a hard-coded 0.5% "LP reward". The preview now:
+  - states that LPs are paid only on full settlement when the payment is partial
+    (`mark_paid` records `amount_paid` and moves nothing to funders);
+  - on a final payment, computes the LP payout with the on-chain formula
+    (`fee = amount * fee_bps / 10000`, `payout = (amount - fee) * lp_funded / amount`,
+    truncating integer math, `earned = max(payout - lp_funded, 0)`) when the fetcher
+    supplies `lpFundedAmount` and `feeRateBps`;
+  - otherwise says the preview is unavailable rather than showing a made-up number.
+  The settlement receipt's "LP earned" continues to come from the executed
+  transaction and is authoritative if fee tier or funders changed before submission.
+
+---
+
 ## [0.1.0] - 2024
 
 ### Added

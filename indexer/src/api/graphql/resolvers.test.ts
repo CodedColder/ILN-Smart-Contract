@@ -207,6 +207,17 @@ describe("invoices", () => {
     expect(result.pageSize).toBe(100);
   });
 
+  it("paginates deterministically when sort keys tie", () => {
+    db.prepare(`UPDATE invoices SET created_at = 1000`).run();
+
+    const page1 = resolvers().invoices(null, { pagination: { page: 1, pageSize: 2 } });
+    const page2 = resolvers().invoices(null, { pagination: { page: 2, pageSize: 2 } });
+    const ids = [...page1.invoices, ...page2.invoices].map((invoice) => invoice.id);
+
+    expect(new Set(ids).size).toBe(3);
+    expect(ids).toEqual([3, 2, 1]);
+  });
+
   it("combines multiple filters", () => {
     const result = resolvers().invoices(null, {
       filter: { status: 'Funded', token: 'USDC' },

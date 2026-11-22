@@ -37,8 +37,16 @@ fn right_child(index: u32) -> u32 {
     index.saturating_mul(2).saturating_add(2)
 }
 
-fn entry_score(entry: &TopPayerEntry) -> u32 {
-    entry.score
+/// Total, deterministic ranking order: higher score ranks higher; on equal
+/// scores the *lower* address ranks higher. Returns `true` when `a` ranks
+/// strictly below `b`.
+///
+/// The heap is a min-heap over this order (root = lowest-ranked entry), so the
+/// root is always the next eviction victim and equal-score ties are resolved by
+/// address rather than by insertion history. Addresses are unique within the
+/// heap, so two distinct entries are never equal under this order.
+fn ranks_below(a: &TopPayerEntry, b: &TopPayerEntry) -> bool {
+    a.score < b.score || (a.score == b.score && a.address > b.address)
 }
 
 fn sift_up(heap: &mut Vec<TopPayerEntry>, mut index: u32) {
@@ -46,7 +54,7 @@ fn sift_up(heap: &mut Vec<TopPayerEntry>, mut index: u32) {
         let parent = parent_index(index);
         let current = heap.get(index).unwrap();
         let parent_entry = heap.get(parent).unwrap();
-        if entry_score(&current) >= entry_score(&parent_entry) {
+        if !ranks_below(&current, &parent_entry) {
             break;
         }
         heap.set(parent, current);
@@ -65,7 +73,7 @@ fn sift_down(heap: &mut Vec<TopPayerEntry>, mut index: u32) {
         if left < len {
             let left_entry = heap.get(left).unwrap();
             let smallest_entry = heap.get(smallest).unwrap();
-            if entry_score(&left_entry) < entry_score(&smallest_entry) {
+            if ranks_below(&left_entry, &smallest_entry) {
                 smallest = left;
             }
         }
@@ -73,7 +81,7 @@ fn sift_down(heap: &mut Vec<TopPayerEntry>, mut index: u32) {
         if right < len {
             let right_entry = heap.get(right).unwrap();
             let smallest_entry = heap.get(smallest).unwrap();
-            if entry_score(&right_entry) < entry_score(&smallest_entry) {
+            if ranks_below(&right_entry, &smallest_entry) {
                 smallest = right;
             }
         }
@@ -117,7 +125,7 @@ fn remove_payer_from_heap(heap: &mut Vec<TopPayerEntry>, payer: &Address) {
         if index > 0 {
             let parent = parent_index(index);
             let parent_entry = heap.get(parent).unwrap();
-            if entry_score(&current) < entry_score(&parent_entry) {
+            if ranks_below(&current, &parent_entry) {
                 sift_up(heap, index);
                 return;
             }
@@ -136,18 +144,18 @@ fn insert_into_heap(heap: &mut Vec<TopPayerEntry>, payer: Address, score: u32) {
         return;
     }
 
+    // Full: the newcomer must strictly outrank the current lowest-ranked entry
+    // (score, then address tie-break) to displace it.
     let min_entry = heap.get(0).unwrap();
-    if score <= min_entry.score {
+    let candidate = TopPayerEntry {
+        address: payer,
+        score,
+    };
+    if !ranks_below(&min_entry, &candidate) {
         return;
     }
 
-    heap.set(
-        0,
-        TopPayerEntry {
-            address: payer,
-            score,
-        },
-    );
+    heap.set(0, candidate);
     sift_down(heap, 0);
 }
 
@@ -159,7 +167,9 @@ pub fn update_top_payers_on_score_change(env: &Env, payer: &Address, new_score: 
     save_top_payers_heap(env, &heap);
 }
 
-/// Return up to `limit` top payers from the maintained heap (descending score).
+/// Return up to `limit` top payers from the maintained heap, best first.
+/// Order is total and deterministic: descending score, ties broken by
+/// ascending address (independent of insertion/update history).
 pub fn get_top_payers(env: &Env, limit: u32) -> Vec<TopPayerEntry> {
     let heap = get_top_payers_heap(env);
     let heap_len = heap.len();
@@ -182,7 +192,7 @@ pub fn get_top_payers(env: &Env, limit: u32) -> Vec<TopPayerEntry> {
                 None => best_index = Some(i),
                 Some(best) => {
                     let best_entry = heap.get(best).unwrap();
-                    if candidate.score > best_entry.score {
+                    if ranks_below(&best_entry, &candidate) {
                         best_index = Some(i);
                     }
                 }

@@ -860,8 +860,25 @@ pub fn propose_admin_transfer(env: Env, new_admin: Address) -> Result<u64, Insur
     }
 
 /// Execute a previously proposed admin transfer once its timelock has
+/// expired. The pending admin must authorize the call (Issue #1265): an
+/// address that cannot sign — a typo, an unfunded key, a contract with no
+/// auth path — can therefore never become admin, so a transfer can never
+/// leave claims, premiums or the solvency circuit with no authorized owner.
+/// Until the pending admin accepts, the current admin keeps full authority
+/// and can `cancel_admin_transfer`.
 ///
-/// Access: Anyone
+/// # Arguments
+/// * `env` — host environment
+///
+/// # Returns
+/// * `Ok(())` once the pending admin is installed
+///
+/// # Errors
+/// * `NoPendingProposal` if no transfer was proposed
+/// * `TimelockNotExpired` if called before the proposal's eta
+/// * Authorization failure if the pending admin did not sign
+///
+/// Access: Caller (require_auth)
 pub fn execute_admin_transfer(env: Env) -> Result<(), InsuranceError> {
         let storage = env.storage().instance();
         let new_admin: Address = storage
@@ -874,6 +891,8 @@ pub fn execute_admin_transfer(env: Env) -> Result<(), InsuranceError> {
         if env.ledger().timestamp() < eta {
             return Err(InsuranceError::TimelockNotExpired);
         }
+
+        new_admin.require_auth();
 
         storage.set(&DataKey::Admin, &new_admin);
         storage.remove(&DataKey::PendingAdmin);

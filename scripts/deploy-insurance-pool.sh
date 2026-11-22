@@ -15,6 +15,15 @@
 #                            Defaults to the deploying account's own address.
 #   INSURANCE_POOL_COVERAGE  Flat per-claim compensation cap, in token stroops.
 #                            Defaults to 1000000000 (100 XLM at 7 decimals).
+#   INSURANCE_POOL_TOKEN     Required. Premium/claim token contract (SAC) ID.
+#                            `initialize` takes it as a mandatory argument;
+#                            without it the invoke fails and the freshly
+#                            deployed pool is left uninitialized, so anyone
+#                            could initialize it first (Issue #1265).
+#
+# The pool admin must sign `initialize` (admin.require_auth()), so
+# INSURANCE_POOL_ADMIN must be the source account or another key the source
+# can sign for. The script verifies the stored token afterwards.
 
 set -euo pipefail
 
@@ -44,6 +53,15 @@ fi
 SOURCE_ADDRESS="$(stellar keys address "$SOURCE")"
 ADMIN="${INSURANCE_POOL_ADMIN:-$SOURCE_ADDRESS}"
 COVERAGE="${INSURANCE_POOL_COVERAGE:-1000000000}"
+TOKEN="${INSURANCE_POOL_TOKEN:-}"
+if [[ -z "$TOKEN" ]]; then
+  echo -e "${RED}❌ INSURANCE_POOL_TOKEN is not set (premium/claim token contract ID)${NC}"
+  exit 1
+fi
+if [[ "$ADMIN" != "$SOURCE_ADDRESS" ]]; then
+  echo -e "${RED}❌ INSURANCE_POOL_ADMIN must equal the source account ($SOURCE_ADDRESS): initialize requires the admin's signature${NC}"
+  exit 1
+fi
 
 echo "Building insurance_pool..."
 cargo build --target wasm32v1-none --release --quiet -p insurance_pool
@@ -89,7 +107,19 @@ stellar contract invoke \
   --id "$CONTRACT_ID" \
   -- initialize \
   --admin "$ADMIN" \
-  --coverage "$COVERAGE"
+  --coverage "$COVERAGE" \
+  --token "$TOKEN"
+
+STORED_TOKEN=$(stellar contract invoke \
+  --network "$NETWORK" \
+  --source "$SOURCE" \
+  --id "$CONTRACT_ID" \
+  -- get_token_address | tr -d '"')
+if [[ "$STORED_TOKEN" != "$TOKEN" ]]; then
+  echo -e "${RED}❌ Initialization not confirmed: get_token_address returned '$STORED_TOKEN'${NC}"
+  exit 1
+fi
+echo -e "  ${GREEN}✓${NC} Initialized and verified (token=$TOKEN)"
 
 ENV_FILE=".contracts-${NETWORK}.env"
 if [[ -f "$ENV_FILE" ]] && grep -q '^INSURANCE_POOL_ID=' "$ENV_FILE"; then

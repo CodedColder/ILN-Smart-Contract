@@ -79,7 +79,38 @@ export interface IngestedEventRecord {
   topics_json: string;
 }
 
+/** Position of an event in chain order: ledger, then paging token, then event index. */
+export interface EventPosition {
+  ledger: number;
+  transaction_paging_token: string;
+  event_index: number;
+}
+
+export interface StoredInvoiceEvent {
+  ledger: number;
+  /** Null only for legacy rows written before paging tokens were recorded. */
+  transaction_paging_token: string | null;
+  event_index: number | null;
+  event_type: string;
+  contract_event_type: string | null;
+  contract_id: string | null;
+  transaction_hash: string | null;
+  timestamp: number;
+  data: string;
+  topics_json: string;
+}
+
 export interface EventRepository {
+  /**
+   * Run `fn` atomically: every write inside commits together or not at all.
+   * Implementations without transactions may omit it; callers then fall back
+   * to running `fn` directly.
+   */
+  transaction?<T>(fn: () => T): T;
+  /** Whether an event for `invoiceId` sorts after `position` in chain order. */
+  hasLaterInvoiceEvent?(invoiceId: number, position: EventPosition): boolean;
+  /** Every stored event for `invoiceId`, in chain order. */
+  listInvoiceEvents?(invoiceId: number): StoredInvoiceEvent[];
   getState(key: string): string | undefined;
   setState(key: string, value: string): void;
   getInvoice(id: number): InvoiceRecord | undefined;
@@ -95,6 +126,47 @@ export interface EventRepository {
 
 export function createSqlEventRepository(db: Database.Database): EventRepository {
   return {
+    transaction(fn) {
+      // better-sqlite3 nests these as savepoints, so a batch transaction can
+      // wrap per-record ones.
+      return db.transaction(fn)();
+    },
+    hasLaterInvoiceEvent(invoiceId, position) {
+      const row = db
+        .prepare(
+          `
+          SELECT 1 FROM events
+           WHERE invoice_id = @invoiceId
+             AND (
+               ledger > @ledger
+               OR (ledger = @ledger AND CAST(transaction_paging_token AS INTEGER) > CAST(@token AS INTEGER))
+               OR (ledger = @ledger AND transaction_paging_token = @token AND event_index > @eventIndex)
+             )
+           LIMIT 1
+        `
+        )
+        .get({
+          invoiceId,
+          ledger: position.ledger,
+          token: position.transaction_paging_token,
+          eventIndex: position.event_index,
+        });
+      return row !== undefined;
+    },
+    listInvoiceEvents(invoiceId) {
+      return db
+        .prepare(
+          `
+          SELECT ledger, transaction_paging_token, event_index, event_type,
+                 contract_event_type, contract_id, transaction_hash, timestamp,
+                 data, topics_json
+            FROM events
+           WHERE invoice_id = ?
+           ORDER BY ledger ASC, CAST(transaction_paging_token AS INTEGER) ASC, event_index ASC, id ASC
+        `
+        )
+        .all(invoiceId) as StoredInvoiceEvent[];
+    },
     getState(key) {
       const row = db
         .prepare('SELECT state_value FROM indexer_state WHERE state_key = ?')

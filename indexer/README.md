@@ -80,9 +80,20 @@ docker compose down
 - `RATE_LIMIT_ANON_MAX` - Anonymous requests per window (default `60`)
 - `RATE_LIMIT_API_KEY_MAX` - API-key requests per window (default `600`)
 - `RATE_LIMIT_WINDOW_MS` - Rate-limit window in ms (default `60000`)
+- `TRUST_PROXY` - Express `trust proxy` value (e.g. `1`, `true`, or a subnet list). Leave unset when directly exposed so `X-Forwarded-For` cannot spoof rate-limit identity.
 - `GRAPHQL_MAX_DEPTH` / `GRAPHQL_MAX_COMPLEXITY` - GraphQL abuse limits (defaults `8` / `200`)
 - `INGESTION_ENABLED` - Set `false` on read-only API replicas (default `true`)
 - `HEALTH_MAX_LAG_LEDGERS` - Lag threshold for degraded health (default `50`)
+- `CATCHUP_FROM_LEDGER` - Enables historical catch-up from this ledger (inclusive) before live streaming
+- `CATCHUP_TO_LEDGER` - Catch-up end ledger (exclusive; default: earliest ledger already indexed)
+- `CATCHUP_BATCH_SIZE` - Ledgers per checkpointed catch-up batch (default `1000`)
+
+### Historical catch-up, replay and recovery
+
+- **Catch-up** backfills `[CATCHUP_FROM_LEDGER, CATCHUP_TO_LEDGER)` in checkpointed batches. A batch's checkpoint advances only after all of its rows commit; failed, interrupted, or gap-blocked runs resume from the checkpoint on the next start, and ledgers Horizon cannot serve are reported as a gap instead of being marked complete.
+- **Replay** (`npm run replay -- --from-ledger N [--to-ledger M]`, range `[N, M)`) re-processes history idempotently, commits each transaction atomically with its cursor, retries transient Horizon errors, and stops with a resume ledger on any unrecoverable failure.
+
+Operator runbook: [docs/indexer-operations.md §5–§5a](../docs/indexer-operations.md#5-checkpoint-replay-from-an-arbitrary-ledger).
 
 ### Health Check
 

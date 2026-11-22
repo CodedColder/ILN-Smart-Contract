@@ -90,7 +90,7 @@ fn register_oracle_with_timestamp(t: &crate::test::TestEnv, oracle_ts: u32) -> A
     let oracle_id = t.env.register_contract(None, MockTimestampedOracle);
     let oracle_client = MockTimestampedOracleClient::new(&t.env, &oracle_id);
     oracle_client.set_timestamp(&oracle_ts);
-    t.contract.set_price_oracle(&oracle_id).unwrap();
+    t.contract.set_price_oracle(&oracle_id);
     oracle_id
 }
 
@@ -106,7 +106,6 @@ fn make_invoice(t: &crate::test::TestEnv) -> u64 {
             &t.token.address,
             &ReferralCode::None,
         )
-        .unwrap()
 }
 
 /// Advance the ledger sequence by `delta` ledgers.
@@ -132,10 +131,9 @@ fn test_fresh_oracle_passes() {
     let invoice_id = make_invoice(&t);
 
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
 
-    let invoice = t.contract.get_invoice(&invoice_id).unwrap();
+    let invoice = t.contract.get_invoice(&invoice_id);
     assert_eq!(invoice.status, InvoiceStatus::Funded);
 }
 
@@ -147,7 +145,7 @@ fn test_stale_oracle_fails() {
     let t = setup();
     // Set a tiny max age so we can manufacture staleness easily.
     let max_age: u64 = 10;
-    t.contract.set_max_oracle_age(&max_age).unwrap();
+    t.contract.set_max_oracle_age(&max_age);
 
     let current_seq = t.env.ledger().sequence(); // 100
                                                  // Oracle timestamp is older than max_age (age = 20 ≥ 10).
@@ -173,7 +171,7 @@ fn test_stale_oracle_fails() {
 fn test_boundary_one_before_limit_passes() {
     let t = setup();
     let max_age: u64 = 10;
-    t.contract.set_max_oracle_age(&max_age).unwrap();
+    t.contract.set_max_oracle_age(&max_age);
 
     let current_seq = t.env.ledger().sequence(); // 100
                                                  // age = 9 < 10 → should pass.
@@ -182,10 +180,9 @@ fn test_boundary_one_before_limit_passes() {
     let invoice_id = make_invoice(&t);
 
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
 
-    let invoice = t.contract.get_invoice(&invoice_id).unwrap();
+    let invoice = t.contract.get_invoice(&invoice_id);
     assert_eq!(invoice.status, InvoiceStatus::Funded);
 }
 
@@ -196,7 +193,7 @@ fn test_boundary_one_before_limit_passes() {
 fn test_boundary_exactly_at_limit_fails() {
     let t = setup();
     let max_age: u64 = 10;
-    t.contract.set_max_oracle_age(&max_age).unwrap();
+    t.contract.set_max_oracle_age(&max_age);
 
     let current_seq = t.env.ledger().sequence(); // 100
                                                  // age = 10 = max_age → should fail.
@@ -222,7 +219,7 @@ fn test_boundary_exactly_at_limit_fails() {
 fn test_zero_max_age_disables_check() {
     let t = setup();
     // Disable freshness check entirely.
-    t.contract.set_max_oracle_age(&0u64).unwrap();
+    t.contract.set_max_oracle_age(&0u64);
 
     let current_seq = t.env.ledger().sequence();
     // Very old timestamp — age would exceed any real limit.
@@ -232,10 +229,9 @@ fn test_zero_max_age_disables_check() {
 
     // Should succeed because max_oracle_age_ledgers == 0 skips the check.
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
 
-    let invoice = t.contract.get_invoice(&invoice_id).unwrap();
+    let invoice = t.contract.get_invoice(&invoice_id);
     assert_eq!(invoice.status, InvoiceStatus::Funded);
 }
 
@@ -252,11 +248,10 @@ fn test_governance_can_update_max_oracle_age() {
 
     let invoice_id1 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id1, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id1, &INVOICE_AMOUNT, &true);
 
     // Governance tightens the limit to 3 ledgers — same oracle data now stale.
-    t.contract.set_max_oracle_age(&3u64).unwrap();
+    t.contract.set_max_oracle_age(&3u64);
     assert_eq!(t.contract.get_max_oracle_age(), 3u64);
 
     let invoice_id2 = make_invoice(&t);
@@ -277,7 +272,7 @@ fn test_governance_can_update_max_oracle_age() {
 #[test]
 fn test_stale_oracle_ignored_when_flag_false() {
     let t = setup();
-    t.contract.set_max_oracle_age(&5u64).unwrap();
+    t.contract.set_max_oracle_age(&5u64);
 
     let current_seq = t.env.ledger().sequence();
     // Deliberately stale: age = 99 ≥ 5.
@@ -287,10 +282,9 @@ fn test_stale_oracle_ignored_when_flag_false() {
 
     // flag=false → oracle not consulted → no staleness check → succeeds.
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &false)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &false);
 
-    let invoice = t.contract.get_invoice(&invoice_id).unwrap();
+    let invoice = t.contract.get_invoice(&invoice_id);
     assert_eq!(invoice.status, InvoiceStatus::Funded);
 }
 
@@ -301,7 +295,7 @@ fn test_stale_oracle_ignored_when_flag_false() {
 fn test_data_becomes_stale_as_ledger_advances() {
     let t = setup();
     let max_age: u64 = 5;
-    t.contract.set_max_oracle_age(&max_age).unwrap();
+    t.contract.set_max_oracle_age(&max_age);
 
     let oracle_ts = t.env.ledger().sequence(); // timestamp frozen at registration
     register_oracle_with_timestamp(&t, oracle_ts);
@@ -310,8 +304,7 @@ fn test_data_becomes_stale_as_ledger_advances() {
     advance_ledger(&t.env, 4);
     let invoice_id1 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id1, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id1, &INVOICE_AMOUNT, &true);
 
     // Advance 1 more ledger — now age = 5 = max_age → stale.
     advance_ledger(&t.env, 1);
@@ -340,10 +333,9 @@ fn test_no_oracle_configured_fails_open() {
     // When require_oracle_verification=true but no oracle is configured,
     // the contract should skip the oracle check and succeed (fail-open).
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
 
-    let invoice = t.contract.get_invoice(&invoice_id).unwrap();
+    let invoice = t.contract.get_invoice(&invoice_id);
     assert_eq!(invoice.status, InvoiceStatus::Funded);
 }
 
@@ -358,7 +350,7 @@ fn test_no_oracle_configured_fails_open() {
 fn test_set_max_oracle_age_succeeds() {
     let t = setup();
 
-    t.contract.set_max_oracle_age(&42).unwrap();
+    t.contract.set_max_oracle_age(&42);
 
     assert_eq!(t.contract.get_max_oracle_age(), 42);
 }
@@ -372,22 +364,21 @@ fn test_set_max_oracle_age_affects_fund_invoice_check() {
     let current_seq = t.env.ledger().sequence();
 
     // Set a tight max age of 5 ledgers.
-    t.contract.set_max_oracle_age(&5).unwrap();
+    t.contract.set_max_oracle_age(&5);
 
     // Oracle timestamp is 4 ledgers old → age=4 < 5 → fresh.
     register_oracle_with_timestamp(&t, current_seq - 4);
 
     let invoice_id1 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id1, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id1, &INVOICE_AMOUNT, &true);
     assert_eq!(
-        t.contract.get_invoice(&invoice_id1).unwrap().status,
+        t.contract.get_invoice(&invoice_id1).status,
         InvoiceStatus::Funded
     );
 
     // Tighten to 3 ledgers → same oracle data (age=4) now stale.
-    t.contract.set_max_oracle_age(&3).unwrap();
+    t.contract.set_max_oracle_age(&3);
 
     let invoice_id2 = make_invoice(&t);
     let result = t
@@ -506,7 +497,7 @@ fn test_is_oracle_data_stale_boundaries() {
 fn test_boundary_one_past_limit_fails() {
     let t = setup();
     let max_age: u64 = 10;
-    t.contract.set_max_oracle_age(&max_age).unwrap();
+    t.contract.set_max_oracle_age(&max_age);
 
     let current_seq = t.env.ledger().sequence();
     register_oracle_with_timestamp(&t, current_seq - 11); // age = 11 >= 10
@@ -529,15 +520,14 @@ fn test_boundary_one_past_limit_fails() {
 #[test]
 fn test_max_age_one_only_the_current_ledger_is_fresh() {
     let t = setup();
-    t.contract.set_max_oracle_age(&1u64).unwrap();
+    t.contract.set_max_oracle_age(&1u64);
     let current_seq = t.env.ledger().sequence();
 
     // age = 0 → fresh.
     register_oracle_with_timestamp(&t, current_seq);
     let id1 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id1, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &id1, &INVOICE_AMOUNT, &true);
 
     // One ledger later the *same* oracle data is stale (age 1 >= 1).
     advance_ledger(&t.env, 1);
@@ -560,7 +550,7 @@ fn test_max_age_one_only_the_current_ledger_is_fresh() {
 fn test_freshness_walk_across_the_boundary() {
     let t = setup();
     let max_age: u64 = 5;
-    t.contract.set_max_oracle_age(&max_age).unwrap();
+    t.contract.set_max_oracle_age(&max_age);
 
     let oracle_ts = t.env.ledger().sequence();
     register_oracle_with_timestamp(&t, oracle_ts);
@@ -642,7 +632,7 @@ fn test_far_future_oracle_timestamp_is_stale() {
 #[test]
 fn test_zero_max_age_still_accepts_future_timestamp() {
     let t = setup();
-    t.contract.set_max_oracle_age(&0u64).unwrap();
+    t.contract.set_max_oracle_age(&0u64);
 
     let current_seq = t.env.ledger().sequence();
     register_oracle_with_timestamp(&t, current_seq + 1); // future-dated
@@ -651,11 +641,10 @@ fn test_zero_max_age_still_accepts_future_timestamp() {
     // The escape hatch (max_age == 0) disables the rule at every input, so the
     // future-timestamp rejection must not fire here.
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
 
     assert_eq!(
-        t.contract.get_invoice(&invoice_id).unwrap().status,
+        t.contract.get_invoice(&invoice_id).status,
         InvoiceStatus::Funded
     );
 }
@@ -706,10 +695,9 @@ fn test_future_timestamp_rejected_through_funding_gate_not_auth() {
 
     let invoice_id2 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id2, &INVOICE_AMOUNT, &false)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id2, &INVOICE_AMOUNT, &false);
     assert_eq!(
-        t.contract.get_invoice(&invoice_id2).unwrap().status,
+        t.contract.get_invoice(&invoice_id2).status,
         InvoiceStatus::Funded
     );
 }
@@ -789,10 +777,9 @@ fn test_1052_first_read_without_baseline_is_accepted() {
 
     let invoice_id = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
     assert_eq!(
-        t.contract.get_invoice(&invoice_id).unwrap().status,
+        t.contract.get_invoice(&invoice_id).status,
         InvoiceStatus::Funded
     );
 
@@ -814,18 +801,16 @@ fn test_1052_equal_timestamp_reread_is_accepted() {
 
     let invoice_id = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
 
     // Ledger moves on but the oracle re-serves its last timestamp.
     advance_ledger(&t.env, 1);
 
     let invoice_id2 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id2, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id2, &INVOICE_AMOUNT, &true);
     assert_eq!(
-        t.contract.get_invoice(&invoice_id2).unwrap().status,
+        t.contract.get_invoice(&invoice_id2).status,
         InvoiceStatus::Funded
     );
 }
@@ -842,8 +827,7 @@ fn test_1052_regression_is_rejected() {
     // Baseline = current_seq.
     let invoice_id = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
 
     // Oracle rolls back to an older (but still "fresh") timestamp.
     MockTimestampedOracleClient::new(&t.env, &oracle_id).set_timestamp(&(current_seq - 20));
@@ -867,8 +851,7 @@ fn test_1052_regression_gate_only_applies_when_oracle_required() {
 
     let invoice_id = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
 
     MockTimestampedOracleClient::new(&t.env, &oracle_id).set_timestamp(&(current_seq - 30));
 
@@ -882,10 +865,9 @@ fn test_1052_regression_gate_only_applies_when_oracle_required() {
     // Gate disabled → same data accepted (the oracle is not consulted).
     let invoice_ungated = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_ungated, &INVOICE_AMOUNT, &false)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_ungated, &INVOICE_AMOUNT, &false);
     assert_eq!(
-        t.contract.get_invoice(&invoice_ungated).unwrap().status,
+        t.contract.get_invoice(&invoice_ungated).status,
         InvoiceStatus::Funded
     );
 }
@@ -902,10 +884,9 @@ fn test_1052_boundary_equal_accepted_and_zero_rejected() {
     stage_prior_data_timestamp(&t, &oracle_id, 1);
     let invoice_id = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
     assert_eq!(
-        t.contract.get_invoice(&invoice_id).unwrap().status,
+        t.contract.get_invoice(&invoice_id).status,
         InvoiceStatus::Funded
     );
 
@@ -931,22 +912,20 @@ fn test_1052_lower_timestamp_from_different_oracle_is_not_a_regression() {
     // Seed the baseline for oracle A.
     let invoice_id = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
 
     // Swap to a different oracle reporting an older timestamp (past the
     // rate-limit cooldown for `set_price_oracle`).
     advance_ledger(&t.env, 150);
     let oracle_b_id = t.env.register_contract(None, MockTimestampedOracle);
     MockTimestampedOracleClient::new(&t.env, &oracle_b_id).set_timestamp(&(current_seq - 40));
-    t.contract.set_price_oracle(&oracle_b_id).unwrap();
+    t.contract.set_price_oracle(&oracle_b_id);
 
     let invoice_id2 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &invoice_id2, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &invoice_id2, &INVOICE_AMOUNT, &true);
     assert_eq!(
-        t.contract.get_invoice(&invoice_id2).unwrap().status,
+        t.contract.get_invoice(&invoice_id2).status,
         InvoiceStatus::Funded
     );
 }
@@ -1034,8 +1013,7 @@ fn test_1053_duplicate_updates_up_to_bound_are_accepted() {
     // First read seeds the baseline (streak 0 — not yet a duplicate).
     let id0 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id0, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &id0, &INVOICE_AMOUNT, &true);
 
     // `MAX_DUPLICATE` further identical reads are exactly the duplicates up
     // to the bound — all accepted.
@@ -1043,10 +1021,9 @@ fn test_1053_duplicate_updates_up_to_bound_are_accepted() {
         advance_ledger(&t.env, 1);
         let id = make_invoice(&t);
         t.contract
-            .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true)
-            .unwrap();
+            .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true);
         assert_eq!(
-            t.contract.get_invoice(&id).unwrap().status,
+            t.contract.get_invoice(&id).status,
             InvoiceStatus::Funded
         );
     }
@@ -1070,14 +1047,12 @@ fn test_1053_duplicate_update_beyond_bound_is_rejected() {
 
     let id0 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id0, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &id0, &INVOICE_AMOUNT, &true);
     for _ in 0..MAX_DUPLICATE {
         advance_ledger(&t.env, 1);
         let id = make_invoice(&t);
         t.contract
-            .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true)
-            .unwrap();
+            .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true);
     }
 
     // Streak is now at the cap; the next identical update is one too many.
@@ -1124,8 +1099,7 @@ fn test_1053_boundary_below_cap_accepted_at_cap_rejected() {
     // One below the cap → the next identical read is accepted (→ cap).
     let id_ok = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id_ok, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &id_ok, &INVOICE_AMOUNT, &true);
     assert_eq!(
         t.contract
             .get_oracle_health(&OracleFeedType::Identity, &t.token.address)
@@ -1153,14 +1127,12 @@ fn test_1053_advancing_timestamp_resets_duplicate_streak() {
     // Drive the streak to the cap through the real funding path.
     let id0 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id0, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &id0, &INVOICE_AMOUNT, &true);
     for _ in 0..MAX_DUPLICATE {
         advance_ledger(&t.env, 1);
         let id = make_invoice(&t);
         t.contract
-            .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true)
-            .unwrap();
+            .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true);
     }
 
     // Oracle advances: same oracle, newer timestamp → accepted, streak resets.
@@ -1170,8 +1142,7 @@ fn test_1053_advancing_timestamp_resets_duplicate_streak() {
 
     let id = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true);
 
     let health = t
         .contract
@@ -1204,10 +1175,9 @@ fn test_1053_duplicate_gate_only_applies_when_oracle_required() {
     // Gate disabled → the oracle is not consulted → accepted.
     let id_ungated = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id_ungated, &INVOICE_AMOUNT, &false)
-        .unwrap();
+        .fund_invoice(&t.funder, &id_ungated, &INVOICE_AMOUNT, &false);
     assert_eq!(
-        t.contract.get_invoice(&id_ungated).unwrap().status,
+        t.contract.get_invoice(&id_ungated).status,
         InvoiceStatus::Funded
     );
 }
@@ -1229,14 +1199,13 @@ fn test_1053_different_oracle_is_not_a_duplicate() {
     advance_ledger(&t.env, 150);
     let oracle_b_id = t.env.register_contract(None, MockTimestampedOracle);
     MockTimestampedOracleClient::new(&t.env, &oracle_b_id).set_timestamp(&current_seq);
-    t.contract.set_price_oracle(&oracle_b_id).unwrap();
+    t.contract.set_price_oracle(&oracle_b_id);
 
     let id = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &true);
     assert_eq!(
-        t.contract.get_invoice(&id).unwrap().status,
+        t.contract.get_invoice(&id).status,
         InvoiceStatus::Funded
     );
 
@@ -1371,7 +1340,7 @@ impl MockFeederOracle {
 fn register_feeder_oracle(t: &crate::test::TestEnv, feeder: &Address) -> Address {
     let oracle_id = t.env.register_contract(None, MockFeederOracle);
     MockFeederOracleClient::new(&t.env, &oracle_id).set_feeder(feeder);
-    t.contract.set_price_oracle(&oracle_id).unwrap();
+    t.contract.set_price_oracle(&oracle_id);
     oracle_id
 }
 
@@ -1400,10 +1369,9 @@ fn test_1046_feeder_authorized_update_opens_funding_gate() {
 
     let funded = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &funded, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &funded, &INVOICE_AMOUNT, &true);
     assert_eq!(
-        t.contract.get_invoice(&funded).unwrap().status,
+        t.contract.get_invoice(&funded).status,
         InvoiceStatus::Funded
     );
 }
@@ -1421,9 +1389,8 @@ fn test_1046_gate_only_applies_when_oracle_required() {
     // succeeds even though no feeder update ever happened.
     let id = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &false)
-        .unwrap();
-    assert_eq!(t.contract.get_invoice(&id).unwrap().status, InvoiceStatus::Funded);
+        .fund_invoice(&t.funder, &id, &INVOICE_AMOUNT, &false);
+    assert_eq!(t.contract.get_invoice(&id).status, InvoiceStatus::Funded);
 }
 
 // ----------------------------------------------------------------
@@ -1433,7 +1400,7 @@ fn test_1046_gate_only_applies_when_oracle_required() {
 #[test]
 fn test_1046_feeder_update_is_subject_to_freshness() {
     let t = setup();
-    t.contract.set_max_oracle_age(&5u64).unwrap();
+    t.contract.set_max_oracle_age(&5u64);
     let feeder = Address::generate(&t.env);
     let oracle = register_feeder_oracle(&t, &feeder);
     let client = MockFeederOracleClient::new(&t.env, &oracle);
@@ -1445,8 +1412,7 @@ fn test_1046_feeder_update_is_subject_to_freshness() {
     advance_ledger(&t.env, 4);
     let fresh = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &fresh, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &fresh, &INVOICE_AMOUNT, &true);
 
     // age = 5 == max → the stale feeder update no longer unlocks funding.
     advance_ledger(&t.env, 1);
@@ -1462,8 +1428,7 @@ fn test_1046_feeder_update_is_subject_to_freshness() {
     client.update_verification(&t.payer, &true);
     let refreshed = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &refreshed, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &refreshed, &INVOICE_AMOUNT, &true);
 }
 
 // ----------------------------------------------------------------
@@ -1475,7 +1440,7 @@ fn test_1046_feeder_update_is_subject_to_freshness() {
 fn test_1046_feeder_update_freshness_boundary_walk() {
     let t = setup();
     let max_age: u64 = 10;
-    t.contract.set_max_oracle_age(&max_age).unwrap();
+    t.contract.set_max_oracle_age(&max_age);
     let feeder = Address::generate(&t.env);
     let oracle = register_feeder_oracle(&t, &feeder);
     let client = MockFeederOracleClient::new(&t.env, &oracle);
@@ -1487,8 +1452,7 @@ fn test_1046_feeder_update_freshness_boundary_walk() {
     advance_ledger(&t.env, 9);
     let fresh = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &fresh, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &fresh, &INVOICE_AMOUNT, &true);
 
     // Ledger 110: age = 10 = max → first stale ledger.
     advance_ledger(&t.env, 1);
@@ -1503,8 +1467,7 @@ fn test_1046_feeder_update_freshness_boundary_walk() {
     client.update_verification(&t.payer, &true);
     let refreshed = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &refreshed, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &refreshed, &INVOICE_AMOUNT, &true);
 }
 
 // ----------------------------------------------------------------
@@ -1521,8 +1484,7 @@ fn test_1046_feeder_can_revoke_verification() {
     client.update_verification(&t.payer, &true);
     let id1 = make_invoice(&t);
     t.contract
-        .fund_invoice(&t.funder, &id1, &INVOICE_AMOUNT, &true)
-        .unwrap();
+        .fund_invoice(&t.funder, &id1, &INVOICE_AMOUNT, &true);
 
     client.update_verification(&t.payer, &false);
     let id2 = make_invoice(&t);
@@ -1531,5 +1493,494 @@ fn test_1046_feeder_can_revoke_verification() {
             .try_fund_invoice(&t.funder, &id2, &INVOICE_AMOUNT, &true),
         Err(Ok(ContractError::PayerUnverified)),
         "a feeder revocation must close the funding gate"
+    );
+}
+
+// ================================================================
+// Issue #1191 — oracle circuit tripping and recovery at ledger boundaries
+// ================================================================
+//
+// Scope and neighbors
+// -------------------
+// This file owns the *freshness* family (#93, #1050, #1052, #1053) and is the
+// natural home for the circuit-breaker behavior those rules feed into: the
+// breaker trips on a sustained run of stale observations, and Issue #1048 makes
+// it half-open — a sustained run of *healthy* observations from the tripping
+// oracle auto-recovers it. The sibling suites own the neighboring failures and
+// are deliberately not duplicated here:
+//   * multi-source price **deviation** outliers — `tests_price_deviation.rs`
+//     (and the #1054 product rules) plus `oracle_registry.rs`;
+//   * Identity feeder **quorum** agreement (`check_identity_quorum`) — the
+//     `tests_oracle_registry.rs` quorum suite;
+//   * the canonical breaker/auto-recovery suite, the price-source registry
+//     invariants (#1190), and the admin-only check for `reset_oracle_circuit`
+//     (`test_reset_oracle_circuit_requires_admin`) — `tests_oracle_registry.rs`.
+//
+// What this section adds is the part those suites leave implicit: the exact
+// **ledger boundaries** of tripping and of half-open recovery, asserted with
+// the fixtures already defined above (the read-only `MockTimestampedOracle`
+// wired in via the legacy `price_oracle` Identity fallback).
+//
+// Data source
+// -----------
+// `check_oracle_health` is used as the observation path. It is permissionless
+// and circuit-agnostic (see its doc) — it resolves through the plain
+// `resolve_oracle`, invokes the oracle's `get_payer_data`, and records the
+// observation without ever erroring on stale data. Soroban rolls back every
+// write of an `Err`-returning invocation, so a *gated* `fund_invoice` path
+// cannot advance breaker bookkeeping while the breaker is open; the
+// never-erroring keeper path is therefore what drives both tripping and
+// recovery. This mirrors the real deployment's monitor/keeper usage.
+//
+// Authorization rules
+// -------------------
+//   * Tripping and auto-recovery require **no** authorization: anyone may call
+//     `check_oracle_health`, and the observations it records are what advance
+//     the stale streak and the recovery streak. This is intentional — recovery
+//     must not be gated behind the very admin action it is meant to make
+//     unnecessary.
+//   * `reset_oracle_circuit` (the governance fast path) is **admin-only** and
+//     rate-limited; its rejection of non-admins is covered by
+//     `tests_oracle_registry.rs::test_reset_oracle_circuit_requires_admin`, and
+//     its clearing of half-open progress is asserted below.
+//   * `set_max_oracle_age` / `set_price_oracle` are admin-only and
+//     rate-limited (`DEFAULT_RATE_LIMIT_LEDGERS`). The fixtures here rely on
+//     `check_rate_limit` allowing a function's first-ever call unconditionally;
+//     where an oracle is swapped mid-test the ledger is advanced past the
+//     cooldown first.
+//
+// Failure behavior (verified, not assumed)
+// -----------------------------------------
+//   * The breaker trips on the `MAX_CONSECUTIVE_STALE_QUERIES`-th consecutive
+//     *stale* observation from the same oracle, and not one observation before.
+//   * While tripped with no fallback registered, `fund_invoice` fails closed
+//     with `OracleCircuitOpen` rather than consulting the (possibly now-fresh)
+//     oracle.
+//   * A single fresh query never recovers. Recovery requires **both**
+//     `CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS` healthy (fresh *and*
+//     timestamp-advancing) observations **and** at least
+//     `CIRCUIT_RECOVERY_MIN_LEDGERS` elapsed since the first of them. "Healthy"
+//     excludes frozen/replayed timestamps and non-fresh data.
+//   * Any unhealthy observation mid-streak resets the recovery streak, and
+//     only the oracle recorded as having tripped the breaker may recover it.
+//   * A recovered oracle that goes stale again re-trips promptly, bounding
+//     flapping.
+
+/// Freshness window the circuit tests use: small enough that a deliberately
+/// old timestamp reads stale without touching the oracle again, yet wide
+/// enough that a same-ledger refresh reads fresh. Read from a literal only
+/// because these tests intentionally *tighten* governance's default window.
+const CIRCUIT_MAX_AGE: u64 = 10;
+
+/// Requested-consecutive-stale threshold, read from the enforcing constant so
+/// the tests cannot drift from the implementation.
+const CIRCUIT_STALE_THRESHOLD: u32 = crate::oracle_registry::MAX_CONSECUTIVE_STALE_QUERIES;
+
+/// Trip the Identity breaker for `t.token` by driving exactly
+/// `CIRCUIT_STALE_THRESHOLD` consecutive stale observations through the
+/// permissionless `check_oracle_health` keeper path, and return the stale
+/// oracle address.
+///
+/// The oracle's timestamp is pinned far enough behind the ledger that it reads
+/// stale on every observation without further ledger movement. `max_oracle_age`
+/// is tightened first so that "far enough" is small; both admin calls are
+/// first-ever for this test, so the rate limiter allows them unconditionally.
+fn trip_identity_circuit(t: &crate::test::TestEnv) -> Address {
+    t.contract.set_max_oracle_age(&CIRCUIT_MAX_AGE);
+    let base = t.env.ledger().sequence();
+    let oracle = register_oracle_with_timestamp(t, base.saturating_sub(50));
+    for _ in 0..CIRCUIT_STALE_THRESHOLD {
+        t.contract.check_oracle_health(
+            &OracleFeedType::Identity,
+            &t.token.address,
+            &t.payer,
+        );
+    }
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "setup must leave the Identity breaker tripped"
+    );
+    oracle
+}
+
+/// Serve one **fresh, timestamp-advancing** observation from `oracle` at the
+/// current ledger and record it through the keeper path. Each call advances the
+/// oracle's timestamp to the current ledger, so consecutive calls (spaced by
+/// `advance_ledger`) are genuine forward data — the "healthy" evidence the
+/// half-open recovery requires.
+fn observe_fresh(t: &crate::test::TestEnv, oracle: &Address) {
+    MockTimestampedOracleClient::new(&t.env, oracle).set_timestamp(&t.env.ledger().sequence());
+    t.contract
+        .check_oracle_health(&OracleFeedType::Identity, &t.token.address, &t.payer);
+}
+
+/// Drive the tripping oracle to a full healthy recovery run: the required
+/// number of healthy observations, spaced past the recovery ledger window.
+fn drive_to_recovery(t: &crate::test::TestEnv, oracle: &Address) {
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+    let needed = crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS;
+    for i in 0..needed {
+        if i > 0 {
+            advance_ledger(&t.env, window);
+        }
+        observe_fresh(t, oracle);
+    }
+}
+
+// ----------------------------------------------------------------
+// Tripping: the streak boundary, and fail-closed funding while open
+// ----------------------------------------------------------------
+
+#[test]
+fn test_1191_circuit_trips_exactly_at_stale_threshold() {
+    let t = setup();
+    t.contract.set_max_oracle_age(&CIRCUIT_MAX_AGE);
+    let base = t.env.ledger().sequence();
+    register_oracle_with_timestamp(&t, base.saturating_sub(50));
+
+    // One observation *below* the threshold must leave the breaker closed.
+    for _ in 0..(CIRCUIT_STALE_THRESHOLD - 1) {
+        t.contract.check_oracle_health(
+            &OracleFeedType::Identity,
+            &t.token.address,
+            &t.payer,
+        );
+    }
+    assert!(
+        !t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "the breaker must not trip one observation below the threshold"
+    );
+
+    // The threshold-crossing observation trips it, and the recorded streak
+    // equals the cap.
+    let health = t
+        .contract
+        .check_oracle_health(&OracleFeedType::Identity, &t.token.address, &t.payer)
+        .unwrap();
+    assert_eq!(health.consecutive_stale_count, CIRCUIT_STALE_THRESHOLD);
+    assert!(t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address));
+
+    // Further stale queries keep it tripped (idempotent); the streak keeps
+    // climbing only for observability, nothing re-fires on an open breaker.
+    let health = t
+        .contract
+        .check_oracle_health(&OracleFeedType::Identity, &t.token.address, &t.payer)
+        .unwrap();
+    assert_eq!(health.consecutive_stale_count, CIRCUIT_STALE_THRESHOLD + 1);
+    assert!(t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address));
+}
+
+#[test]
+fn test_1191_funding_gate_rejects_when_circuit_open() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+
+    // The oracle is refreshed to fresh data...
+    MockTimestampedOracleClient::new(&t.env, &oracle).set_timestamp(&t.env.ledger().sequence());
+
+    // ...but with no fallback registered, oracle-gated funding must fail closed
+    // with OracleCircuitOpen rather than consult the freshly-reporting oracle.
+    let invoice_id = make_invoice(&t);
+    let result = t
+        .contract
+        .try_fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::OracleCircuitOpen)),
+        "an open breaker with no fallback must fail closed"
+    );
+
+    // The gate is a data-validity outcome, not an authorization one: skipping
+    // verification never consults the oracle, so the same invoice funds.
+    let ungated = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &ungated, &INVOICE_AMOUNT, &false);
+    assert_eq!(
+        t.contract.get_invoice(&ungated).status,
+        InvoiceStatus::Funded
+    );
+}
+
+// ----------------------------------------------------------------
+// Recovery: observation-count and ledger-window boundaries
+// ----------------------------------------------------------------
+
+#[test]
+fn test_1191_single_fresh_query_does_not_recover() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+
+    // A single healthy observation must not clear the breaker (anti-flapping).
+    observe_fresh(&t, &oracle);
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "a single fresh query must not auto-recover the breaker"
+    );
+}
+
+#[test]
+fn test_1191_recovery_needs_full_observation_count() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+    let needed = crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS;
+
+    // Observations spanning well past the ledger window but one short of the
+    // required count — still not recovered.
+    for _ in 0..(needed - 1) {
+        observe_fresh(&t, &oracle);
+        advance_ledger(&t.env, window);
+    }
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "fewer than CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS must not recover"
+    );
+
+    // The final healthy observation completes both conditions.
+    observe_fresh(&t, &oracle);
+    assert!(
+        !t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address)
+    );
+}
+
+#[test]
+fn test_1191_recovery_needs_full_ledger_window() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+
+    // Streak start recorded at the current ledger.
+    observe_fresh(&t, &oracle);
+
+    // Second healthy observation one ledger later (keeps the timestamp
+    // advancing while barely moving the ledger window).
+    advance_ledger(&t.env, 1);
+    observe_fresh(&t, &oracle);
+
+    // Third healthy observation, but only `window - 1` ledgers after the streak
+    // began: the required observation count is met while the ledger window is
+    // one short — the exact lower boundary — so recovery must NOT complete.
+    advance_ledger(&t.env, window - 2);
+    observe_fresh(&t, &oracle);
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "recovery must not complete one ledger short of the window"
+    );
+
+    // One ledger later the window is exactly satisfied — recovery completes.
+    advance_ledger(&t.env, 1);
+    observe_fresh(&t, &oracle);
+    assert!(
+        !t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "recovery must complete once the full ledger window elapses"
+    );
+}
+
+// ----------------------------------------------------------------
+// Recovery: healthy means fresh *and* advancing; resets and isolation
+// ----------------------------------------------------------------
+
+#[test]
+fn test_1191_recovery_ignores_frozen_oracle() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let needed = crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS;
+
+    // Re-serve the *same* fresh value repeatedly: non-advancing data is not
+    // evidence of recovery, so even more than the required observations fail.
+    let frozen = t.env.ledger().sequence();
+    let client = MockTimestampedOracleClient::new(&t.env, &oracle);
+    client.set_timestamp(&frozen);
+    for _ in 0..(needed + 1) {
+        t.contract.check_oracle_health(
+            &OracleFeedType::Identity,
+            &t.token.address,
+            &t.payer,
+        );
+        advance_ledger(&t.env, 1);
+    }
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "a frozen (non-advancing) oracle must not recover the breaker"
+    );
+}
+
+#[test]
+fn test_1191_recovery_resets_on_stale_observation() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+
+    // One healthy observation to start the streak...
+    observe_fresh(&t, &oracle);
+    advance_ledger(&t.env, window);
+
+    // ...then a stale observation mid-streak resets the progress.
+    MockTimestampedOracleClient::new(&t.env, &oracle).set_timestamp(&0); // ancient → stale
+    t.contract.check_oracle_health(
+        &OracleFeedType::Identity,
+        &t.token.address,
+        &t.payer,
+    );
+
+    // ...so a single healthy observation afterwards is only streak 1 — still
+    // not recovered. (A point in time recorded just before a reset must not
+    // count toward the run that follows.)
+    advance_ledger(&t.env, window);
+    observe_fresh(&t, &oracle);
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "a stale observation must reset the recovery streak"
+    );
+}
+
+#[test]
+fn test_1191_recovery_ignores_different_oracle() {
+    let t = setup();
+    let stale = trip_identity_circuit(&t);
+
+    // A different oracle reports fresh, advancing data across the full window.
+    advance_ledger(&t.env, 150); // past the set_price_oracle rate-limit cooldown
+    let base = t.env.ledger().sequence();
+    let healthy = register_oracle_with_timestamp(&t, base);
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+    let needed = crate::oracle_registry::CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS;
+    for i in 0..needed {
+        if i > 0 {
+            advance_ledger(&t.env, window);
+        }
+        observe_fresh(&t, &healthy);
+    }
+
+    // But the breaker was tripped by `stale`, so the healthy oracle's sustained
+    // run must not clear it.
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "only the oracle that tripped the breaker may auto-recover it"
+    );
+    assert_ne!(stale, healthy);
+}
+
+// ----------------------------------------------------------------
+// Recovery: end-to-end, event, re-trip, and governance reset
+// ----------------------------------------------------------------
+
+#[test]
+fn test_1191_auto_recovers_and_funding_resumes_without_admin() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+
+    drive_to_recovery(&t, &oracle);
+
+    // No admin/governance call was made anywhere in this test — recovery is
+    // driven entirely by the permissionless keeper path.
+    assert!(
+        !t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "sustained healthy observations must auto-recover the breaker"
+    );
+    assert!(
+        t.contract
+            .get_circuit_recovery_state(&OracleFeedType::Identity, &t.token.address)
+            .is_none(),
+        "a completed recovery must clear the half-open bookkeeping"
+    );
+
+    // Funding resumes against the recovered oracle with no governance reset.
+    let invoice_id = make_invoice(&t);
+    t.contract
+        .fund_invoice(&t.funder, &invoice_id, &INVOICE_AMOUNT, &true);
+    assert_eq!(
+        t.contract.get_invoice(&invoice_id).status,
+        InvoiceStatus::Funded
+    );
+}
+
+#[test]
+fn test_1191_recovery_emits_event() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+
+    t.env.events().all(); // clear setup events
+    drive_to_recovery(&t, &oracle);
+
+    let events = t.env.events().all();
+    let recovered: std::vec::Vec<_> = events
+        .events()
+        .iter()
+        .filter(|e| std::format!("{:?}", e).contains("oracle_circuit_recovered"))
+        .collect();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "auto-recovery must emit exactly one OracleCircuitRecovered event"
+    );
+}
+
+#[test]
+fn test_1191_retrips_after_recovery_if_stale_again() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+    drive_to_recovery(&t, &oracle);
+    assert!(!t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address));
+
+    // The recovered oracle goes stale again → the breaker re-trips, so
+    // auto-recovery cannot be used to keep a flapping oracle trusted.
+    let window = crate::oracle_registry::CIRCUIT_RECOVERY_MIN_LEDGERS as u32;
+    let ancient = t.env.ledger().sequence().saturating_sub(window + 100);
+    MockTimestampedOracleClient::new(&t.env, &oracle).set_timestamp(&ancient);
+    for _ in 0..CIRCUIT_STALE_THRESHOLD {
+        t.contract.check_oracle_health(
+            &OracleFeedType::Identity,
+            &t.token.address,
+            &t.payer,
+        );
+    }
+    assert!(
+        t.contract
+            .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address),
+        "a recovered oracle that goes stale again must re-trip the breaker"
+    );
+}
+
+#[test]
+fn test_1191_reset_clears_recovery_progress() {
+    let t = setup();
+    let oracle = trip_identity_circuit(&t);
+
+    // Start a recovery run so there is half-open progress to clear.
+    observe_fresh(&t, &oracle);
+    assert!(t
+        .contract
+        .get_circuit_recovery_state(&OracleFeedType::Identity, &t.token.address)
+        .is_some());
+
+    // Governance fast path: clears both the tripped flag and the progress.
+    t.contract
+        .reset_oracle_circuit(&OracleFeedType::Identity, &t.token.address);
+    assert!(!t
+        .contract
+        .is_oracle_circuit_tripped(&OracleFeedType::Identity, &t.token.address));
+    assert!(
+        t.contract
+            .get_circuit_recovery_state(&OracleFeedType::Identity, &t.token.address)
+            .is_none(),
+        "the governance reset must also clear half-open recovery progress"
     );
 }

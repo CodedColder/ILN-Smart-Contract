@@ -596,6 +596,33 @@ pub struct FundQueueResolutionAttempted {
     pub success: bool,
 }
 
+/// Issue #1027: emitted by `resolve_fund_queue` only when more than one LP
+/// was tied at the top (current) score and the winner was drawn by
+/// `env.prng()`. Lets off-chain monitors measure tie frequency and per-LP
+/// tie-win rates.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundQueueTieBroken {
+    pub invoice_id: u64,
+    /// Number of entries tied at the top score (always >= 2).
+    pub tied_count: u32,
+    /// Index of the winner within the queue.
+    pub winner_index: u32,
+    pub approved_lp: Address,
+}
+
+/// Issue #1095: emitted when a full fund queue admits a strictly
+/// higher-scored LP and displaces its lowest-scored entry.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundQueueEntryDisplaced {
+    pub invoice_id: u64,
+    pub displaced_lp: Address,
+    pub displaced_score: u32,
+    pub new_lp: Address,
+    pub new_score: u32,
+}
+
 /// Emitted by `recover_fund_queue` (Issues #1020/#1021). `evicted_lp` is the
 /// stalled approved LP removed from the queue (if any); `purged` is true when
 /// the invoice was no longer fundable and all queue state was deleted rather
@@ -756,4 +783,44 @@ pub struct QueueTieScoreMarginUpdated {
     pub old_margin: u32,
     pub new_margin: u32,
     pub updated_by: Address,
+}
+
+// ── Issue #1165: invoice evidence commitment + verification events ────────────
+
+/// Emitted when a freelancer attaches a versioned content commitment to an
+/// invoice. `digest` is a SHA-256 commitment only — never the document or any
+/// PII. Topic: `symbol!("evidence_submitted")`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceSubmitted {
+    pub invoice_id: u64,
+    pub submitter: Address,
+    /// Commitment scheme version the digest is encoded under.
+    pub version: u32,
+    pub digest: BytesN<32>,
+    pub submitted_at: u64,
+}
+
+/// Emitted when an authorized verifier marks an invoice's evidence verified.
+/// Topic: `symbol!("evidence_verified")`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceVerified {
+    pub invoice_id: u64,
+    pub verifier: Address,
+    pub version: u32,
+    pub digest: BytesN<32>,
+    pub verified_at: u64,
+}
+
+/// Emitted when an authorized verifier rejects an invoice's evidence.
+/// Topic: `symbol!("evidence_rejected")`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceRejected {
+    pub invoice_id: u64,
+    pub verifier: Address,
+    pub version: u32,
+    pub digest: BytesN<32>,
+    pub rejected_at: u64,
 }

@@ -95,76 +95,21 @@ pub enum ContractError {
     /// Issue #1020: `recover_fund_queue` was called but there is nothing to
     /// recover yet (no stalled resolution, or the grace period has not elapsed).
     QueueNotStalled = 48,
-    // ── Restored variants referenced by already-merged code ───────────────
-    // These names are referenced by the merged multisig / TWAP / queue /
-    // config code but were absent from this file, so the crate could not
-    // compile. Codes are appended after the existing `1..=49` range so no
-    // previously published error code changes meaning (append-only).
-    /// Issue #1093: fewer price sources responded (or survived outlier
-    /// rejection) than the governance-configured minimum quorum.
-    PriceQuorumNotMet = 49,
-    /// Multisig admin has already been initialized.
-    MultisigAlreadyConfigured = 50,
-    /// Signer set / threshold combination is invalid.
-    InvalidMultisigConfig = 51,
-    /// A multisig operation was attempted before multisig was configured.
-    MultisigNotConfigured = 52,
-    /// Caller is not in the multisig signer set.
-    NotAuthorizedSigner = 53,
-    /// An identical pending proposal already exists.
-    DuplicateProposal = 54,
-    /// No proposal exists with the given id.
-    ProposalNotFound = 55,
-    /// Proposal has already been executed.
-    ProposalAlreadyExecuted = 56,
-    /// Proposal is past its expiry and can no longer be signed or executed.
-    ProposalExpired = 57,
-    /// Signer has already approved this proposal.
-    AlreadySigned = 58,
-    /// Proposal does not yet have enough approvals to execute.
-    ThresholdNotReached = 59,
-    /// A signer rotation is already scheduled (Issue #640).
-    RotationAlreadyPending = 60,
-    /// No signer rotation is scheduled (Issue #640).
-    RotationNotFound = 61,
-    /// Signer rotation timelock has not yet elapsed (Issue #640).
-    RotationTimelockNotExpired = 62,
-    /// TWAP read requested with fewer observations than required.
-    InsufficientTwapObservations = 63,
-    /// Fund-queue index invariant violated (unreachable under normal execution).
-    QueueIndexOutOfBounds = 64,
-    /// Funder-list index invariant violated (unreachable under normal execution).
-    FunderIndexOutOfBounds = 65,
-    /// `decay_rate_bps` outside its governance bound.
-    InvalidDecayRate = 66,
-    /// `high_rep_threshold` outside its governance bound.
-    InvalidRepThreshold = 67,
-    /// Token account is frozen / not authorized for the contract.
-    AccountFrozen = 68,
-    /// Token authorization could not be determined for either party.
-    TokenAuthorizationUnavailable = 69,
-    /// `decimals()` could not be read from the token contract.
-    TokenDecimalsUnavailable = 70,
-    /// No decimals have been configured/cached for this token.
-    TokenDecimalsNotConfigured = 71,
-    /// Declared decimals exceed the maximum or disagree with the token.
-    InvalidTokenDecimals = 72,
-    /// More price sources were registered than the configured maximum.
-    TooManyPriceSources = 73,
-    /// More identity-oracle sources were registered than the maximum.
-    TooManyIdentityOracles = 74,
-    /// Identity-verification quorum is outside its governance bound.
-    InvalidIdentityQuorum = 75,
-    /// Issue #1053: too many consecutive identical oracle timestamps.
-    OracleDuplicateUpdate = 76,
-    /// Issue #1052: replayed / rolled-back oracle data timestamp.
-    OracleTimestampRegression = 77,
-    /// The contract's own token balance cannot satisfy the payout.
-    InsufficientContractBalance = 78,
-    /// The queue entry has been archived and cannot be read/mutated.
-    QueueStateArchived = 79,
-    /// A storage rollback would be unsafe for the requested migration.
-    RollbackUnsafe = 80,
-    /// An upgrade would drop required TTL metadata for existing entries.
-    UpgradeRemovesTtlFields = 81,
+    // ── Issue #1165: invoice evidence commitment lifecycle ─────────
+    /// No evidence commitment is on record for the invoice.
+    EvidenceNotFound = 49,
+    /// The evidence commitment has already been verified or rejected, so it
+    /// can no longer be re-attached or re-reviewed.
+    EvidenceAlreadyReviewed = 50,
+    /// The supplied content commitment is already attached to a *different*
+    /// invoice — the same off-chain evidence cannot be financed twice.
+    DuplicateEvidenceCommitment = 51,
+    /// The supplied commitment is unusable: a zero digest commits to nothing,
+    /// and version `0` is not a supported scheme version.
+    InvalidEvidenceCommitment = 52,
+    // ── Issue #1166: initialize write-sequence hardening ───────────
+    /// `initialize` finished its writes but the instance is not fully and
+    /// consistently initialized (authority or one of the three bootstrap
+    /// tokens is missing). The call reverts, so no partial state is committed.
+    InitializationInconsistent = 53,
 }

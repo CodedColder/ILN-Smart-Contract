@@ -34,6 +34,7 @@ import type { AllowanceParams, AllowanceResult } from "../types.js";
  * @param server         - Soroban RPC server instance
  * @param params         - Token address, owner, and spender addresses
  * @param sourceAccount  - Account used as the simulation source (sequence consumed)
+ * @param networkPassphrase - Network the simulation targets (defaults to TESTNET)
  * @returns AllowanceResult with `amount` (bigint) and `expirationLedger`
  *
  * @throws When the RPC simulation returns an error response
@@ -41,7 +42,8 @@ import type { AllowanceParams, AllowanceResult } from "../types.js";
 export async function getAllowance(
   server: SorobanRpc.Server,
   params: AllowanceParams,
-  sourceAccount: Account
+  sourceAccount: Account,
+  networkPassphrase: string = Networks.TESTNET
 ): Promise<AllowanceResult> {
   const tokenContract = new Contract(params.tokenAddress);
 
@@ -53,7 +55,7 @@ export async function getAllowance(
 
   const tx = new TransactionBuilder(sourceAccount, {
     fee: BASE_FEE,
-    networkPassphrase: Networks.TESTNET,
+    networkPassphrase,
   })
     .addOperation(op)
     .setTimeout(30)
@@ -85,6 +87,49 @@ export async function getAllowance(
     amount: BigInt(String(native)),
     expirationLedger: 0,
   };
+}
+
+// ---------------------------------------------------------------------------
+// getTokenBalance
+// ---------------------------------------------------------------------------
+
+/**
+ * Query a SEP-41 token balance (`balance(id)`) for `owner` via simulation.
+ *
+ * Read-only: nothing is signed or submitted. A missing return value is
+ * treated as a zero balance.
+ *
+ * @throws When the RPC simulation returns an error response
+ */
+export async function getTokenBalance(
+  server: SorobanRpc.Server,
+  tokenAddress: string,
+  owner: string,
+  sourceAccount: Account,
+  networkPassphrase: string = Networks.TESTNET
+): Promise<bigint> {
+  const op = new Contract(tokenAddress).call(
+    "balance",
+    new Address(owner).toScVal()
+  );
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(op)
+    .setTimeout(30)
+    .build();
+
+  const simResult = await server.simulateTransaction(tx);
+
+  if (SorobanRpc.Api.isSimulationError(simResult)) {
+    throw new Error(`Balance simulation failed: ${simResult.error}`);
+  }
+  if (!simResult.result?.retval) {
+    return 0n;
+  }
+  return BigInt(String(scValToNative(simResult.result.retval)));
 }
 
 // ---------------------------------------------------------------------------

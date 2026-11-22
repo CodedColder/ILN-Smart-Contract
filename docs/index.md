@@ -31,6 +31,9 @@ Start here when you are looking for ILN protocol, contract, service, or contribu
 |----------|-------------|
 | [Security Policy](security.md) | Vulnerability classes, reporting, response timelines, severity, and safe harbor. |
 | [Threat Model](threat-model.md) | Trust assumptions, risks, and mitigations. |
+| [Reentrancy Audit](reentrancy-audit.md) | Cross-contract reentrancy review of funding, insurance claim and distribution settlement: protection layers, verified behaviour, residual risk. |
+| [Cross-Contract Accounting Audit](cross-contract-accounting-audit.md) | Token-flow model, conservation and obligation invariants across ILN, distribution and insurance; findings and residual risk. |
+| [Integration Test Fixtures](integration-test-fixtures.md) | Setup/cleanup audit of the five-contract lifecycle suite: fixture contract, isolation, testnet independence, findings. |
 | [Governance Security Summary](governance-security-summary.md) | Reviewer-facing synthesis of governance-hardening findings: quadratic voting, delegation bounds, snapshot timing, spam resistance, quorum, and the veto sunset roadmap. |
 | [Public Status Page](public-status-page.md) | Public, non-sensitive protocol-health page: what is shown/excluded, hosting decision, thresholds, failure behaviour. |
 | [Incident Response Runbook](incident-response-runbook.md) | Protocol-wide incident coordination: severity, roles, `pause()` decision authority, communication, and links to every component runbook. |

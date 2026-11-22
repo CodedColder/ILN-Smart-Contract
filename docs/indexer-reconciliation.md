@@ -11,7 +11,7 @@ the notifications service when drift exceeds tolerance.
 
 1. **Sample** — each run selects up to `RECONCILIATION_SAMPLE_SIZE` random invoice ids from the `invoices` table (`ORDER BY RANDOM()`).
 2. **Read chain truth** — for each sampled id the job performs a read-only Soroban simulation of `get_invoice(invoice_id)` via [`indexer/src/reconciliation/chainReader.ts`](../indexer/src/reconciliation/chainReader.ts) (no fees, no submission). It also calls `get_invoice_count()`.
-3. **Compare** — per-invoice fields compared: `status`, `amount`, `amount_funded`, `amount_paid`. The global indexed count is compared against `get_invoice_count()`.
+3. **Compare** — per-invoice fields compared: `status`, `amount`, `amount_funded`, `amount_paid`, `funder`. The global indexed count is compared against `get_invoice_count()`. A run is reported `healthy` only when every chain read succeeds and no drift is found; a run where the chain count or sampled reads are unavailable is `inconclusive`, never healthy.
 4. **Alert** — if drift beyond tolerance is detected, an `indexer_drift_detected` payload (severity `critical`) is POSTed to `RECONCILIATION_ALERT_URL` — point this at the notifications service intake (e.g. `/notify/slack` or any webhook subscription registered there, see [docs/notifications-operations.md](notifications-operations.md)).
 
 ## Cadence & thresholds

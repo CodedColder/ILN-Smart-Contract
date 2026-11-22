@@ -76,6 +76,18 @@ export class ILNError extends Error {
   static InvalidAddress: any;
   static InvalidTransfer: any;
   static InsufficientAmount: any;
+  static Reentrancy: any;
+  static RateLimited: any;
+  static QueueNotMature: any;
+  static IncompatibleInterfaceVersion: any;
+  static OracleCircuitOpen: any;
+  static NoPriceSource: any;
+  static AllPriceSourcesRejected: any;
+  static MaxInvoiceAmountExceeded: any;
+  static GlobalVolumeCapExceeded: any;
+  static InvalidTwapWindow: any;
+  static QueueFull: any;
+  static QueueNotStalled: any;
 
   static fromError(error: unknown, context?: ILNErrorContext): Error {
     if (error instanceof ILNError) {
@@ -108,7 +120,9 @@ export class ILNError extends Error {
       return new ILNError.ContractExecutionError(errorString, undefined, context, true);
     }
 
-    const match = errorString.match(/Error\(Contract, (\d+)\)/);
+    // Soroban renders contract errors as `Error(Contract, #N)`; accept the
+    // legacy `Error(Contract, N)` spelling too.
+    const match = errorString.match(/Error\(Contract,\s*#?(\d+)\)/);
     if (match) {
       const code = parseInt(match[1] || "", 10);
       const ctx = { ...context, originalCode: code };
@@ -149,11 +163,30 @@ export class ILNError extends Error {
         case 34: return new ILNError.PayerUnverified(undefined, ctx);
         case 35: return new ILNError.OracleDataStale(undefined, ctx);
         case 36: return new ILNError.AmountTooSmall(undefined, ctx);
-        case 37: return new ILNError.InvoiceNotCancellable(undefined, ctx);
-        case 38: return new ILNError.InvalidAddress(undefined, ctx);
-        case 39: return new ILNError.InvalidTransfer(undefined, ctx);
-        case 999: return new ILNError.InsufficientAmount(undefined, ctx);
+        // Codes below mirror `ContractError` in contracts/invoice_liquidity/src/errors.rs.
+        case 37: return new ILNError.Reentrancy(undefined, ctx);
+        case 38: return new ILNError.RateLimited(undefined, ctx);
+        case 39: return new ILNError.QueueNotMature(undefined, ctx);
+        case 40: return new ILNError.IncompatibleInterfaceVersion(undefined, ctx);
+        case 41: return new ILNError.OracleCircuitOpen(undefined, ctx);
+        case 42: return new ILNError.NoPriceSource(undefined, ctx);
+        case 43: return new ILNError.AllPriceSourcesRejected(undefined, ctx);
+        case 44: return new ILNError.MaxInvoiceAmountExceeded(undefined, ctx);
+        case 45: return new ILNError.GlobalVolumeCapExceeded(undefined, ctx);
+        case 46: return new ILNError.InvalidTwapWindow(undefined, ctx);
+        case 47: return new ILNError.QueueFull(undefined, ctx);
+        case 48: return new ILNError.QueueNotStalled(undefined, ctx);
       }
+      // A well-formed contract error whose code this SDK build does not know
+      // (e.g. contract upgraded ahead of the SDK). Keep the code and say what
+      // to do instead of returning an opaque generic error.
+      return new ContractExecutionError(
+        `Unknown ILN contract error code ${code} (${errorString}). ` +
+          "The contract may be newer than this SDK; upgrade @iln/sdk or check the contract's ContractError enum.",
+        code,
+        ctx,
+        false
+      );
     }
     return new ILNError(errorString, undefined, context, false);
   }
@@ -225,10 +258,29 @@ export class FeeOnTransferToken extends ContractExecutionError { constructor(msg
 export class PayerUnverified extends AuthorizationError { constructor(msg = "Payer unverified", context?: ILNErrorContext) { super(msg, 34, context); } }
 export class OracleDataStale extends ContractExecutionError { constructor(msg = "Oracle data stale", context?: ILNErrorContext) { super(msg, 35, context); } }
 export class AmountTooSmall extends ValidationError { constructor(msg = "Amount too small", context?: ILNErrorContext) { super(msg, 36, context); } }
-export class InvoiceNotCancellable extends InvoiceStateError { constructor(msg = "Invoice not cancellable", context?: ILNErrorContext) { super(msg, 37, context); } }
-export class InvalidAddress extends ValidationError { constructor(msg = "Invalid address", context?: ILNErrorContext) { super(msg, 38, context); } }
-export class InvalidTransfer extends ContractExecutionError { constructor(msg = "Invalid transfer", context?: ILNErrorContext) { super(msg, 39, context); } }
+export class InvoiceNotCancellable extends InvoiceStateError { constructor(msg = "Invoice not cancellable", context?: ILNErrorContext) { super(msg, undefined, context); } }
+export class InvalidAddress extends ValidationError { constructor(msg = "Invalid address", context?: ILNErrorContext) { super(msg, undefined, context); } }
+export class InvalidTransfer extends ContractExecutionError { constructor(msg = "Invalid transfer", context?: ILNErrorContext) { super(msg, undefined, context); } }
 export class InsufficientAmount extends ContractExecutionError { constructor(msg = "Insufficient amount", context?: ILNErrorContext) { super(msg, 999, context); } }
+
+// Client-side only (no on-chain code): InvoiceNotCancellable, InvalidAddress,
+// InvalidTransfer and InsufficientAmount are raised by SDK pre-checks and never
+// produced by `fromError`. Their `code` is therefore undefined (InsufficientAmount
+// keeps the 999 sentinel) so they cannot be confused with on-chain codes 37-48.
+
+// On-chain codes 37-48 (see contracts/invoice_liquidity/src/errors.rs).
+export class Reentrancy extends ContractExecutionError { constructor(msg = "Reentrant call detected", context?: ILNErrorContext) { super(msg, 37, context); } }
+export class RateLimited extends ContractExecutionError { constructor(msg = "Rate limited: cooldown has not elapsed", context?: ILNErrorContext) { super(msg, 38, context, true); } }
+export class QueueNotMature extends ContractExecutionError { constructor(msg = "Fund queue not mature yet", context?: ILNErrorContext) { super(msg, 39, context, true); } }
+export class IncompatibleInterfaceVersion extends ContractExecutionError { constructor(msg = "Incompatible contract interface version", context?: ILNErrorContext) { super(msg, 40, context); } }
+export class OracleCircuitOpen extends ContractExecutionError { constructor(msg = "Oracle circuit breaker is open", context?: ILNErrorContext) { super(msg, 41, context); } }
+export class NoPriceSource extends ContractExecutionError { constructor(msg = "No price source available", context?: ILNErrorContext) { super(msg, 42, context); } }
+export class AllPriceSourcesRejected extends ContractExecutionError { constructor(msg = "All price sources rejected", context?: ILNErrorContext) { super(msg, 43, context); } }
+export class MaxInvoiceAmountExceeded extends ValidationError { constructor(msg = "Invoice amount exceeds the per-invoice cap", context?: ILNErrorContext) { super(msg, 44, context); } }
+export class GlobalVolumeCapExceeded extends ContractExecutionError { constructor(msg = "Token volume cap exceeded", context?: ILNErrorContext) { super(msg, 45, context); } }
+export class InvalidTwapWindow extends ValidationError { constructor(msg = "Invalid TWAP window", context?: ILNErrorContext) { super(msg, 46, context); } }
+export class QueueFull extends InvoiceStateError { constructor(msg = "Fund queue is full", context?: ILNErrorContext) { super(msg, 47, context); } }
+export class QueueNotStalled extends ContractExecutionError { constructor(msg = "Fund queue is not stalled", context?: ILNErrorContext, ) { super(msg, 48, context, true); } }
 
 ILNError.ValidationError = ValidationError;
 ILNError.AuthorizationError = AuthorizationError;
@@ -276,3 +328,15 @@ ILNError.InvoiceNotCancellable = InvoiceNotCancellable;
 ILNError.InvalidAddress = InvalidAddress;
 ILNError.InvalidTransfer = InvalidTransfer;
 ILNError.InsufficientAmount = InsufficientAmount;
+ILNError.Reentrancy = Reentrancy;
+ILNError.RateLimited = RateLimited;
+ILNError.QueueNotMature = QueueNotMature;
+ILNError.IncompatibleInterfaceVersion = IncompatibleInterfaceVersion;
+ILNError.OracleCircuitOpen = OracleCircuitOpen;
+ILNError.NoPriceSource = NoPriceSource;
+ILNError.AllPriceSourcesRejected = AllPriceSourcesRejected;
+ILNError.MaxInvoiceAmountExceeded = MaxInvoiceAmountExceeded;
+ILNError.GlobalVolumeCapExceeded = GlobalVolumeCapExceeded;
+ILNError.InvalidTwapWindow = InvalidTwapWindow;
+ILNError.QueueFull = QueueFull;
+ILNError.QueueNotStalled = QueueNotStalled;

@@ -74,6 +74,12 @@ Configure CLI defaults.
 - `iln config set network <testnet|mainnet>`
 - `iln config set rpcUrl <url>`
 
+Before running `iln export invoices` on mainnet, set the RPC URL to your
+mainnet endpoint and set `ILN_MAINNET_INVOICE_CONTRACT_ID` to the verified
+invoice liquidity deployment address. The CLI rejects a missing address or
+an invalid Stellar contract StrKey before it constructs the RPC client.
+Verify the address against the deployment record for your selected network.
+
 ### Export
 Export invoices to the network.
 - `iln export <file.json>`

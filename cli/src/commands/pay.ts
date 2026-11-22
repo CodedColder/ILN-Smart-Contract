@@ -30,15 +30,31 @@ export type Prompter = (message: string) => Promise<boolean>;
 
 /**
  * Prints the payment preview line shown before signing.
- * "Paying 50 USDC of 100 USDC remaining on Invoice #X (Payer earns LP: Y USDC)"
+ *
+ * LP note rules (mirrors `mark_paid` in contracts/invoice_liquidity):
+ *  - Partial payment: funders are NOT paid; the contract only records
+ *    `amount_paid`. The note says so instead of showing an LP figure.
+ *  - Final payment with fee/funding data: LP payout is computed with the
+ *    on-chain formula (see {@link computeLpSettlement}).
+ *  - Final payment without that data: no number is invented; the note says
+ *    the LP amount cannot be previewed.
  */
 export function printPaymentPreview(
   invoice: InvoicePayState,
   payAmount: number,
 ): void {
-  const lpNote = invoice.lp
-    ? ` (Payer earns LP: ${lpEarningsEstimate(payAmount)} ${invoice.token})`
-    : "";
+  let lpNote = "";
+  if (invoice.lp) {
+    if (payAmount < invoice.remainingAmount) {
+      lpNote = " (LP is paid only when the invoice is fully settled)";
+    } else {
+      const settlement = computeLpSettlement(invoice);
+      lpNote = settlement
+        ? ` (LP net gain on settlement: ${settlement.lpEarned} ${invoice.token}, ` +
+          `LP payout ${settlement.lpPayout} ${invoice.token}; on-chain formula)`
+        : " (LP earnings preview unavailable: fee/funding data not provided)";
+    }
+  }
   console.log(
     `\nPaying ${payAmount} ${invoice.token} of ${invoice.remainingAmount} ` +
       `${invoice.token} remaining on Invoice #${invoice.id}${lpNote}`,
@@ -67,11 +83,75 @@ export function printPartialProgress(result: PayResult): void {
   );
 }
 
-// ── LP earnings estimate (simple placeholder — replace with contract formula) ─
+// ── LP settlement (on-chain formula) ──────────────────────────────────────────
 
-function lpEarningsEstimate(amount: number): number {
-  // 0.5% of paid amount as LP reward estimate; replace with real formula
-  return Math.round(amount * 0.005 * 100) / 100;
+/** Token amounts use 7 decimals on the invoice contract (stroops). */
+const SCALE = 10_000_000n;
+const BPS = 10_000n;
+
+function toUnits(amount: number): bigint {
+  return BigInt(Math.round(amount * Number(SCALE)));
+}
+
+function fromUnits(units: bigint): number {
+  return Number(units) / Number(SCALE);
+}
+
+export interface LpSettlement {
+  /** Protocol fee deducted from the invoice amount on settlement. */
+  protocolFee: number;
+  /** Amount transferred to the LP when the invoice is fully paid. */
+  lpPayout: number;
+  /** `lpPayout - lpFundedAmount`, floored at 0 (matches `lp_earned`). */
+  lpEarned: number;
+}
+
+/**
+ * Mirrors the full-payment branch of `mark_paid`:
+ *
+ *   protocol_fee = invoice.amount * fee_rate_bps / 10_000        (floor)
+ *   distribute   = invoice.amount - protocol_fee
+ *   lp_payout    = distribute * lp_funded / invoice.amount       (floor)
+ *   lp_earned    = max(lp_payout - lp_funded, 0)
+ *
+ * Integer division truncates exactly like the contract. Returns `undefined`
+ * when the inputs needed to apply the formula (`lpFundedAmount`,
+ * `feeRateBps`) are missing or invalid, so callers never print a made-up
+ * figure. Assumption: the CLI-supplied values equal the on-chain values at
+ * submission time; the fee tier or funders may change before the tx lands, in
+ * which case the receipt (`PayResult.lpEarnings`) is authoritative.
+ */
+export function computeLpSettlement(
+  invoice: Pick<InvoicePayState, "totalAmount" | "lpFundedAmount" | "feeRateBps">,
+): LpSettlement | undefined {
+  const { totalAmount, lpFundedAmount, feeRateBps } = invoice;
+  if (
+    lpFundedAmount === undefined ||
+    feeRateBps === undefined ||
+    !Number.isFinite(totalAmount) ||
+    !Number.isFinite(lpFundedAmount) ||
+    !Number.isFinite(feeRateBps) ||
+    totalAmount <= 0 ||
+    lpFundedAmount < 0 ||
+    lpFundedAmount > totalAmount ||
+    feeRateBps < 0 ||
+    feeRateBps > 10_000
+  ) {
+    return undefined;
+  }
+
+  const amount = toUnits(totalAmount);
+  const funded = toUnits(lpFundedAmount);
+  const fee = (amount * BigInt(Math.round(feeRateBps))) / BPS;
+  const distribute = amount - fee;
+  const payout = (distribute * funded) / amount;
+  const earned = payout > funded ? payout - funded : 0n;
+
+  return {
+    protocolFee: fromUnits(fee),
+    lpPayout: fromUnits(payout),
+    lpEarned: fromUnits(earned),
+  };
 }
 
 // ── Command factory ───────────────────────────────────────────────────────────
@@ -90,7 +170,7 @@ export function makePayCommand(
   cmd
     .description("Pay an invoice in full or partially")
     .requiredOption("--id <invoiceId>", "Invoice ID to pay")
-    .option("--amount <usdc>", "Amount to pay (omit for full payment)", parseFloat)
+    .option("--amount <usdc>", "Amount to pay (omit for full payment)", Number)
     .option("--yes", "Skip confirmation prompt", false)
     .action(async (opts: { id: string; amount?: number; yes: boolean }) => {
       const options: PayOptions = {
@@ -116,12 +196,12 @@ export function makePayCommand(
           ? options.amount
           : invoice.remainingAmount; // full payment
 
-      if (payAmount <= 0) {
-        console.error("Payment amount must be greater than 0.");
+      if (!Number.isFinite(payAmount) || payAmount <= 0) {
+        console.error("Payment amount must be a finite number greater than 0.");
         process.exit(1);
       }
 
-      if (payAmount > invoice.remainingAmount) {
+      if (!Number.isFinite(invoice.remainingAmount) || payAmount > invoice.remainingAmount) {
         console.error(
           `Amount ${payAmount} exceeds remaining balance of ${invoice.remainingAmount} ${invoice.token}.`,
         );
@@ -148,8 +228,9 @@ export function makePayCommand(
         result = await executor(options.id, payAmount);
       } catch (err) {
         console.error(
-          `Payment failed: ${err instanceof Error ? err.message : String(err)}`,
+          `Payment could not be confirmed: ${err instanceof Error ? err.message : String(err)}`,
         );
+        console.error("Check the transaction or current invoice state before retrying.");
         process.exit(1);
       }
 

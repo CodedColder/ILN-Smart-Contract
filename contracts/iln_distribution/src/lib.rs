@@ -751,9 +751,14 @@ pub fn accrue_settlement(
         );
     }
 
-    /// #838 — Verify double-initialize panics (most critical error path).
+    /// #838 — Verify double-initialize is rejected (most critical error path).
+    ///
+    /// Issue #1264: `initialize` raises `DistributionError::AlreadyInitialized`
+    /// through `panic_with_error!`, which surfaces as `Error(Contract, #1)`,
+    /// not as the text "already initialized" this test previously expected.
+    /// Asserting on the typed error also proves a second caller cannot rebind
+    /// `IlnContract` (the accrual authority) after deployment.
     #[test]
-    #[should_panic(expected = "already initialized")]
     fn initialize_rejects_double_init() {
         let env = Env::default();
         env.mock_all_auths();
@@ -765,8 +770,17 @@ pub fn accrue_settlement(
         let gov_token_id = env.register_stellar_asset_contract_v2(dist_id.clone());
         dist.initialize(&iln_id, &gov_token_id.address());
 
-        // Second init must panic
-        dist.initialize(&iln_id, &gov_token_id.address());
+        // Second init — even with a different accrual authority — must fail.
+        let attacker_iln = env.register_contract(None, MockIln);
+        assert_eq!(
+            dist.try_initialize(&attacker_iln, &gov_token_id.address()),
+            Err(Ok(DistributionError::AlreadyInitialized))
+        );
+
+        // The original binding still governs accruals.
+        let lp = Address::generate(&env);
+        MockIlnClient::new(&env, &iln_id).accrue_lp(&dist_id, &lp, &HUNDRED_USDC_STROOPS);
+        assert_eq!(dist.get_accrual(&lp), DEFAULT_LP_REWARD_RATE);
     }
 
     /// #839 — Regression: accrue_lp rejects non-ILN caller.
@@ -869,6 +883,70 @@ pub fn accrue_settlement(
         let dist = IlnDistributionClient::new(&env, &dist_id);
 
         dist.verify_mint_authority();
+    }
+
+    /// Issue #1264 — a rejected `initialize` (foreign SAC admin) writes no
+    /// state: the contract stays uninitialized and a correct retry succeeds.
+    #[test]
+    fn rejected_initialize_leaves_contract_retryable() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let iln_id = env.register_contract(None, MockIln);
+        let dist_id = env.register_contract(None, IlnDistribution);
+        let dist = IlnDistributionClient::new(&env, &dist_id);
+
+        let foreign_token = env.register_stellar_asset_contract_v2(Address::generate(&env));
+        assert!(dist.try_initialize(&iln_id, &foreign_token.address()).is_err());
+        assert!(dist.try_verify_mint_authority().is_err());
+
+        let owned_token = env.register_stellar_asset_contract_v2(dist_id.clone());
+        dist.initialize(&iln_id, &owned_token.address());
+        assert!(dist.verify_mint_authority());
+    }
+
+    /// Issue #1264 — the mint path (`claim_tokens`) only runs with the
+    /// claimer's own authorization; nobody can mint on a participant's
+    /// behalf, and a failed claim mints nothing.
+    #[test]
+    fn claim_requires_claimer_auth_and_mints_nothing_without_it() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let iln_id = env.register_contract(None, MockIln);
+        let dist_id = env.register_contract(None, IlnDistribution);
+        let dist = IlnDistributionClient::new(&env, &dist_id);
+        let gov_token = env.register_stellar_asset_contract_v2(dist_id.clone()).address();
+        dist.initialize(&iln_id, &gov_token);
+
+        let lp = Address::generate(&env);
+        MockIlnClient::new(&env, &iln_id).accrue_lp(&dist_id, &lp, &HUNDRED_USDC_STROOPS);
+
+        env.set_auths(&[]);
+        assert!(dist.try_claim_tokens(&lp).is_err());
+        assert_eq!(TokenClient::new(&env, &gov_token).balance(&lp), 0);
+    }
+
+    /// Issue #1264 — reward-rate setters are gated on the bound `IlnContract`
+    /// address; an unauthorized call fails and leaves the rate unchanged.
+    #[test]
+    fn reward_rate_setters_reject_unauthorized_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let iln_id = env.register_contract(None, MockIln);
+        let dist_id = env.register_contract(None, IlnDistribution);
+        let dist = IlnDistributionClient::new(&env, &dist_id);
+        let gov_token = env.register_stellar_asset_contract_v2(dist_id.clone()).address();
+        dist.initialize(&iln_id, &gov_token);
+
+        env.set_auths(&[]);
+        assert!(dist.try_set_lp_reward_rate(&1).is_err());
+        assert!(dist.try_set_freelancer_reward_rate(&1).is_err());
+        assert!(dist.try_set_payer_reward_rate(&1).is_err());
+        assert_eq!(dist.get_lp_reward_rate(), DEFAULT_LP_REWARD_RATE);
+        assert_eq!(dist.get_freelancer_reward_rate(), DEFAULT_FREELANCER_REWARD_RATE);
+        assert_eq!(dist.get_payer_reward_rate(), DEFAULT_PAYER_REWARD_RATE);
     }
 
     /// Issue #660 / #661 — property-based tests for the reward-conservation

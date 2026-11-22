@@ -234,8 +234,22 @@ synchronously.  If the cross-contract call reverts, `execute_proposal`
 also reverts, leaving the proposal status unchanged (`Passed`).  It can be
 retried once the root cause is fixed.
 
-There is **no timelock delay** — execution happens in the same transaction as
-the `execute_proposal` call, immediately after the voting window closes.
+Execution is two-step: the first `execute_proposal` after `voting_end` moves a
+winning proposal to `Passed` and sets `eta_ledger`; a later call executes it
+once `current_ledger >= eta_ledger`. The delay is the admin-configured
+`execution_delay` (ledgers, default `0`).
+
+**Timelock policy versioning (Issue #982).** Every change to the timelock
+policy (an effective `set_execution_delay` change or `disable_veto_power`)
+bumps `get_timelock_policy_version()` and emits `timelock_policy_updated`.
+Each proposal persists a `ProposalTimelockPolicy` snapshot
+(`get_proposal_timelock_policy(id)`) recording the version/delay at creation
+and at queue time. The delay applied at queue time is
+`max(delay at creation, delay at queue)`, and if the policy version changes
+after queueing, the current delay is re-applied from the queue ledger with the
+later eta winning. A policy change can therefore lengthen, but never shorten,
+an in-flight proposal's timelock. See
+[governance-timelock-policy.md](governance-timelock-policy.md).
 
 ---
 
@@ -263,8 +277,9 @@ executed on-chain.
 | Property | Detail |
 |----------|--------|
 | Callable by | ILN contract (`iln_contract.require_auth()`) — triggered by a passed governance proposal |
-| Effect | Sets `VetoPowerEnabled = false` permanently (one-way switch) |
-| After disabling | Any call to `veto_proposal` returns `VetoPowerDisabled` |
+| Precondition (Issue #981) | `get_execution_delay() >= MIN_ACTIVE_TIMELOCK_LEDGERS` (17,280 ledgers ≈ 24 h); otherwise returns `TimelockNotActive` and the veto stays enabled |
+| Effect | Sets `VetoPowerEnabled = false` permanently (one-way switch); bumps the timelock policy version |
+| After disabling | Any call to `veto_proposal` returns `VetoPowerDisabled`; `set_execution_delay` rejects values below `MIN_ACTIVE_TIMELOCK_LEDGERS` with `TimelockNotActive`; proposals already queued have the active delay re-applied from their queue ledger |
 
 ### Function: `is_veto_power_enabled() → bool`
 

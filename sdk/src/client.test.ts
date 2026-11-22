@@ -1,4 +1,4 @@
-import { vi, describe, it, expect} from 'vitest';
+import { vi, describe, it, expect, beforeEach } from 'vitest';
 /**
  * Tests for ILNClient — covers:
  *   - testnet / mainnet / custom factory methods
@@ -8,6 +8,12 @@ import { vi, describe, it, expect} from 'vitest';
 
 import { ILNClient, iln, TESTNET_RPC_URL, MAINNET_RPC_URL, CONTRACT_REGISTRY } from "./client.js";
 import { Networks } from "@stellar/stellar-sdk";
+import { ValidationError } from "./errors.js";
+import { submitBatchTransaction as mockedSubmitBatch } from "./methods/batch.js";
+
+vi.mock("./methods/batch.js", () => ({
+  submitBatchTransaction: vi.fn().mockResolvedValue("BATCH_HASH"),
+}));
 
 // ---------------------------------------------------------------------------
 // Mock SorobanRpc.Server to avoid real network connections in tests
@@ -250,5 +256,128 @@ describe("ILNClient.verifyNetwork", () => {
     const client = ILNClient.testnet();
     // Explicit verification should succeed
     await client.verifyNetwork();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// submitBatchTransaction() — network and contract pinning (fail before signing)
+// ---------------------------------------------------------------------------
+
+describe("ILNClient.submitBatchTransaction pinning", () => {
+  const PINNED = CONTRACT_REGISTRY.testnet.invoiceLiquidity;
+  const TOKEN = "CTOKENXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+  const ROGUE = "CROGUEXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+
+  function makeSigner(extra: Record<string, unknown> = {}) {
+    return {
+      publicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      getPublicKey: vi.fn().mockReturnValue("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
+      signTransaction: vi.fn(),
+      ...extra,
+    } as any;
+  }
+  const call = (contractId: string) => ({ contractId, method: "fund_invoice", args: [] });
+
+  beforeEach(() => {
+    (mockedSubmitBatch as any).mockClear();
+  });
+
+  it("submits when every call targets a configured contract", async () => {
+    const client = ILNClient.testnet(makeSigner());
+    await expect(client.submitBatchTransaction([call(PINNED)])).resolves.toBe("BATCH_HASH");
+  });
+
+  it("rejects an unknown contract ID before the network check, the signer or submission", async () => {
+    const signer = makeSigner();
+    const client = ILNClient.testnet(signer);
+    const getNetwork = client.rpc.getNetwork as any;
+    getNetwork.mockClear();
+
+    await expect(
+      client.submitBatchTransaction([call(PINNED), call(ROGUE)])
+    ).rejects.toBeInstanceOf(ValidationError);
+
+    expect(getNetwork).not.toHaveBeenCalled();
+    expect(signer.signTransaction).not.toHaveBeenCalled();
+    expect(mockedSubmitBatch).not.toHaveBeenCalled();
+  });
+
+  it("names the offending call and contract in the error", async () => {
+    const client = ILNClient.testnet(makeSigner());
+    await expect(client.submitBatchTransaction([call(PINNED), call(ROGUE)])).rejects.toThrow(
+      /Contract ID mismatch: call #1 \(fund_invoice\) targets "CROGUE/
+    );
+  });
+
+  it("allows extra contracts only when listed in additionalContractIds", async () => {
+    const plain = ILNClient.testnet(makeSigner());
+    await expect(plain.submitBatchTransaction([call(TOKEN)])).rejects.toBeInstanceOf(ValidationError);
+
+    const allowed = ILNClient.custom({
+      rpcUrl: TESTNET_RPC_URL,
+      networkPassphrase: Networks.TESTNET,
+      contractId: PINNED,
+      signer: makeSigner(),
+      additionalContractIds: [TOKEN],
+    });
+    await expect(allowed.submitBatchTransaction([call(TOKEN), call(PINNED)])).resolves.toBe("BATCH_HASH");
+  });
+
+  it("never treats an empty (unpopulated) registry entry as a pinned contract", async () => {
+    const client = ILNClient.testnet(makeSigner());
+    await expect(client.submitBatchTransaction([call("")])).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it("rejects when the signer declares a different network, without signing", async () => {
+    const signer = makeSigner({ networkPassphrase: Networks.PUBLIC });
+    const client = ILNClient.testnet(signer);
+
+    await expect(client.submitBatchTransaction([call(PINNED)])).rejects.toThrow(/Network mismatch: signer/);
+    expect(signer.signTransaction).not.toHaveBeenCalled();
+    expect(mockedSubmitBatch).not.toHaveBeenCalled();
+  });
+
+  it("rejects when the RPC passphrase differs from the client's, without signing", async () => {
+    const signer = makeSigner();
+    const client = ILNClient.mainnet(signer, { contractId: "CMAINNETXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" });
+
+    await expect(
+      client.submitBatchTransaction([call("CMAINNETXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")])
+    ).rejects.toThrow("Network mismatch");
+    expect(signer.signTransaction).not.toHaveBeenCalled();
+    expect(mockedSubmitBatch).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the RPC cannot be reached to verify the network", async () => {
+    const client = ILNClient.testnet(makeSigner());
+    (client.rpc.getNetwork as any).mockRejectedValueOnce(new Error("ECONNREFUSED"));
+
+    await expect(client.submitBatchTransaction([call(PINNED)])).rejects.toThrow(
+      /Failed to verify network passphrase: ECONNREFUSED/
+    );
+    expect(mockedSubmitBatch).not.toHaveBeenCalled();
+  });
+
+  it("does not cache a failed verification (next call re-verifies)", async () => {
+    const client = ILNClient.testnet(makeSigner());
+    (client.rpc.getNetwork as any).mockRejectedValueOnce(new Error("blip"));
+
+    await expect(client.submitBatchTransaction([call(PINNED)])).rejects.toThrow();
+    await expect(client.submitBatchTransaction([call(PINNED)])).resolves.toBe("BATCH_HASH");
+  });
+
+  it("verifies the network once per client, then reuses the result", async () => {
+    const client = ILNClient.testnet(makeSigner());
+    const getNetwork = client.rpc.getNetwork as any;
+    getNetwork.mockClear();
+
+    await client.submitBatchTransaction([call(PINNED)]);
+    await client.submitBatchTransaction([call(PINNED)]);
+    expect(getNetwork).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires a signer", async () => {
+    const client = ILNClient.testnet();
+    await expect(client.submitBatchTransaction([call(PINNED)])).rejects.toThrow("requires a signer");
   });
 });

@@ -1,5 +1,5 @@
 use crate::errors::ContractError;
-use crate::invoice::{get_invoice_funders, invoice_exists, load_invoice, StorageKey};
+use crate::invoice::{get_invoice_funders, invoice_exists, try_load_invoice, StorageKey};
 use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,7 +35,9 @@ pub fn require_submitter_by_id(
     if !invoice_exists(env, invoice_id) {
         return Err(ContractError::InvoiceNotFound);
     }
-    let invoice = load_invoice(env, invoice_id);
+    // Issue #1167: checked load — `invoice_exists` above already returned
+    // `InvoiceNotFound`, so this never rewrites that error into a host trap.
+    let invoice = try_load_invoice(env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
     caller.require_auth();
     if caller != &invoice.freelancer {
         return Err(ContractError::Unauthorized);
@@ -47,7 +49,9 @@ pub fn require_payer_by_id(env: &Env, invoice_id: u64) -> Result<(), ContractErr
     if !invoice_exists(env, invoice_id) {
         return Err(ContractError::InvoiceNotFound);
     }
-    let invoice = load_invoice(env, invoice_id);
+    // Issue #1167: checked load — `invoice_exists` above already returned
+    // `InvoiceNotFound`, so this never rewrites that error into a host trap.
+    let invoice = try_load_invoice(env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
     invoice.payer.require_auth();
     Ok(())
 }

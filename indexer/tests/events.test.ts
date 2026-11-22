@@ -63,4 +63,18 @@ describe('GET /events', () => {
     expect(res.body.events).toHaveLength(1);
     expect(res.body.events[0].type).toBe('InvoicePaid'); // timestamp 1001 is newer
   });
+
+  it('should cap pageSize at 100 and fall back on invalid paging params', async () => {
+    seedInvoice(db, { id: 1, freelancer: 'GFREELANCER' });
+    seedEvent(db, { invoice_id: 1 });
+
+    const capped = await request(app).get('/events?address=GFREELANCER&pageSize=9999');
+    expect(capped.status).toBe(200);
+    expect(capped.body.pageSize).toBe(100);
+
+    const invalid = await request(app).get('/events?address=GFREELANCER&page=x&pageSize=y');
+    expect(invalid.status).toBe(200);
+    expect(invalid.body.page).toBe(1);
+    expect(invalid.body.pageSize).toBe(20);
+  });
 });

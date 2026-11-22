@@ -117,7 +117,7 @@
 | execute_coverage_change | env: Env | Result<(), InsuranceError> | expired. Callable by anyone once the delay has elapsed. |
 | cancel_coverage_change | env: Env | Result<(), InsuranceError> | Cancel a pending coverage change proposal. Requires current admin auth. |
 | propose_admin_transfer | env: Env, new_admin: Address | Result<u64, InsuranceError> | previously pending admin proposal. |
-| execute_admin_transfer | env: Env | Result<(), InsuranceError> | expired. Callable by anyone once the delay has elapsed. |
+| execute_admin_transfer | env: Env | Result<(), InsuranceError> | Accept a pending admin transfer once its timelock has expired. Requires the pending admin's auth. |
 | cancel_admin_transfer | env: Env | Result<(), InsuranceError> | Cancel a pending admin transfer proposal. Requires current admin auth. |
 | get_pending_coverage | env: Env | Option<(i128, u64)> | Returns the pending coverage proposal (new cap, eta), if any. |
 | get_pending_admin | env: Env | Option<(Address, u64)> | Returns the pending admin transfer proposal (new admin, eta), if any. |

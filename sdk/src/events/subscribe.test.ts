@@ -60,6 +60,26 @@ function makeRaw(
 // ---------------------------------------------------------------------------
 
 describe("parseContractEvent", () => {
+  it("ignores fields added by a future contract version", () => {
+    const raw = makeRaw("partially_paid", [4n, "GPAYER"], {
+      amount_paid_now: "2",
+      total_amount_paid: "5",
+      remaining_amount: "8",
+      future_field: { version: 2 },
+    });
+    expect(parseContractEvent(raw)).toMatchObject({
+      type: "partially_paid",
+      invoiceId: 4n,
+      remainingAmount: 8n,
+    });
+    expect(parseContractEvent(raw)).not.toHaveProperty("future_field");
+  });
+
+  it("ignores an event whose decoded payload is not a field map", () => {
+    const raw = makeRaw("partially_paid", [4n, "GPAYER"], {});
+    expect(parseContractEvent({ ...raw, value: "malformed" })).toBeNull();
+  });
+
   it("parses submitted", () => {
     const raw = makeRaw("submitted", [1n, "GFREELANCER", "GPAYER"], {
       token: "CDTOKEN",
@@ -621,6 +641,38 @@ describe("subscribe — reconnection", () => {
 });
 
 describe("replay and gap recovery", () => {
+  it("delivers each cursor once across overlapping replay pages and the live stream", async () => {
+    const first = { ...makeRaw("paused", [], { timestamp: "100" }), id: "100-1", ledger: 100 };
+    const second = { ...makeRaw("unpaused", [], { timestamp: "100" }), id: "100-2", ledger: 100 };
+    const { horizon, call, triggerMessage } = makeMockHorizon();
+    call.mockResolvedValueOnce({ records: [first, first] });
+    call.mockResolvedValueOnce({ records: [first, second] });
+    call.mockResolvedValueOnce({ records: [first, second] });
+    const received: (string | undefined)[] = [];
+
+    const unsubscribe = subscribe(horizon, "CBCONTRACT", { fromLedger: 100 }, event => {
+      received.push(event.pagingToken);
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    triggerMessage(second);
+
+    expect(received).toEqual(["100-1", "100-2"]);
+    expect(call).toHaveBeenCalledTimes(3);
+    unsubscribe();
+  });
+
+  it("suppresses pending historical delivery after unsubscribe", async () => {
+    const record = { ...makeRaw("paused", [], { timestamp: "100" }), id: "100-1", ledger: 100 };
+    const { horizon, call, stream } = makeMockHorizon();
+    call.mockResolvedValueOnce({ records: [record] });
+    const handler = vi.fn();
+    const unsubscribe = subscribe(horizon, "CBCONTRACT", { fromLedger: 100 }, handler);
+    unsubscribe();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(stream).not.toHaveBeenCalled();
+  });
   it("replay() queries history and processes events", async () => {
     const raw1 = { id: "100-1", ledger: 100, type: "contract", topic: [encodeVal("paused")], value: encodeVal({ timestamp: "100" }) };
     const raw2 = { id: "100-2", ledger: 100, type: "contract", topic: [encodeVal("unpaused")], value: encodeVal({ timestamp: "101" }) };

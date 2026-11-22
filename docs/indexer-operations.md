@@ -130,9 +130,14 @@ bad range instead ([incident runbook](indexer-incident-runbook.md) Option B):
 # Re-process everything from ledger N onward (N itself included)
 pnpm --filter @iln/indexer replay -- --from-ledger 12345678
 
-# Repair only a bounded window, e.g. the ledgers a bad deploy touched
+# Repair only a bounded window, e.g. the ledgers a bad deploy touched.
+# Range is [--from-ledger, --to-ledger): 12400000 itself is NOT replayed.
 pnpm --filter @iln/indexer replay -- --from-ledger 12345678 --to-ledger 12400000
 ```
+
+Exit codes: `0` range complete; `1` replay stopped (prints the resume ledger);
+`2` finished but incomplete (`--continue-on-error` skipped undecodable
+transactions, or a pending ledger divergence halted it).
 
 Procedure:
 
@@ -145,10 +150,61 @@ Procedure:
 Safety properties:
 
 - Ingestion writes are idempotent: `invoices` upsert on conflict; `events`/`reputation_updates` deduplicate on `(transaction_hash, event_index)` — replays cannot create duplicate rows.
-- Per-transaction failures are logged and skipped (`failedTransactions` in the summary); exit code 2 signals partial success for alerting wrappers.
+- **Atomic per transaction.** A transaction's invoice/event/reputation/insurance rows and the `last_processed_*` cursor commit in one SQLite transaction. A crash or commit failure leaves the database exactly at the previous transaction boundary — never rows without a cursor, never a cursor without rows.
+- **Strict by default.** The first transaction that cannot be decoded or persisted stops the run (exit `1`). Everything before the printed `resume ledger` is committed; re-run with `--from-ledger <resume ledger>` (that ledger is re-processed idempotently). `--continue-on-error` restores the old log-and-skip behaviour for *decode* failures only, lists the skipped hashes, and exits `2`; database errors always stop the run.
+- **Bounded retries.** Horizon 429/5xx/network errors are retried with exponential backoff (5 attempts by default); exhaustion stops the run like any other failure — it is never treated as "no more data".
+- **Correct cursor.** Replay positions Horizon at the TOID of `--from-ledger` (`ledger << 32`), follows `_links.next`, and stops on an empty page (the chain tip — Horizon always returns a `next` link). Records repeated across pages are skipped and counted (`duplicatesSkipped`).
+- **Out-of-order safe.** Re-covering an older window after newer events are stored does not roll invoices back: when an event older than an invoice's newest stored event arrives, the invoice is re-derived from its full event history in chain order.
+- **Reorg aware.** If a ledger divergence is pending (or is detected mid-run by the attached detector), replay writes nothing further, returns `haltedByReorg: true` / `complete: false`, and the CLI exits `2`. Run [reorg recovery](indexer-reorg-handling.md) first.
 - The parent invoice row is always written before its child event rows, so foreign keys stay satisfied with `foreign_keys=ON`.
 
-Regression tests: [`indexer/tests/replay.test.ts`](../indexer/tests/replay.test.ts) intentionally corrupts derived state, replays from a pre-corruption checkpoint, and asserts the correct state is restored without duplicate events.
+#### Recovering from an interrupted or failed replay
+
+| Symptom | Persisted state | Action |
+| --- | --- | --- |
+| Process killed / host crash mid-replay | Rows + cursor at the last fully committed transaction | `--from-ledger $(sqlite3 $DB_PATH "SELECT state_value FROM indexer_state WHERE state_key='last_processed_ledger'")` with the original `--to-ledger` |
+| Exit `1` (`Replay failed … Resume with: …`) | Everything before the resume ledger committed | Fix the cause (Horizon, disk, decoder), then run the printed command |
+| Exit `2`, `failedTransactions > 0` | Range NOT complete; listed hashes missing | Fix the decoder and replay the affected ledgers without `--continue-on-error` |
+| Exit `2`, `haltedByReorg: true` | Nothing written at/after the fork | Run reorg recovery, then replay |
+
+Overlapping or repeated ranges are always safe; there is no need to compute an exact non-overlapping window.
+
+Regression tests: [`indexer/tests/replay.test.ts`](../indexer/tests/replay.test.ts) intentionally corrupts derived state, replays from a pre-corruption checkpoint, and asserts the correct state is restored without duplicate events. [`indexer/tests/crashRecovery.test.ts`](../indexer/tests/crashRecovery.test.ts) kills the process between a transaction's rows and its cursor write, aborts real SQLite commits with triggers, reopens the database file as a restarted process would, replays overlapping ranges, and checks that reconciliation and reorg state refuse to report replayed data as healthy/canonical.
+
+## 5a. Historical catch-up (backfill)
+
+Catch-up ingests a ledger range the live stream never saw — typically from
+the contract's deployment ledger up to the first ledger the indexer streamed.
+It runs under the ingestion lease, before live streaming starts:
+
+```bash
+CATCHUP_FROM_LEDGER=1200000   # deployment ledger (inclusive). Unset = catch-up disabled
+CATCHUP_TO_LEDGER=1300000     # exclusive. Unset = earliest ledger already in `events`
+CATCHUP_BATCH_SIZE=1000       # ledgers per checkpointed batch
+```
+
+Behaviour (`indexer/src/ingestion/catchup.ts`):
+
+- **Range** is `[CATCHUP_FROM_LEDGER, CATCHUP_TO_LEDGER)`, split into batches of `CATCHUP_BATCH_SIZE` ledgers. Each batch reads Horizon `/transactions` from the TOID of its first ledger and follows continuation links until the batch end (or the chain tip).
+- **Decoding and writes** are the live listener's (`EventListener.processTransaction`), with ledger-header reorg verification. Each transaction commits atomically. The **live cursor is never touched**.
+- **Checkpoint** `catchup_checkpoint:<from>-<to>` in `indexer_state` (JSON: `nextLedger`, `status`) advances to a batch's end **only after every transaction in that batch committed**. On restart catch-up resumes at `nextLedger`; a partially written batch is simply re-covered (idempotent).
+- **Gaps are reported, not skipped.** Before every batch the indexer reads Horizon's root (`history_elder_ledger`/`history_latest_ledger`). Any part of the batch Horizon does not serve (pruned history, or not yet closed) fails the run with `kind: gap` and the missing ranges; the checkpoint stays before it.
+- **Failure kinds** (logged as `historical catch-up incomplete`): `fetch` (Horizon retries exhausted or a non-retryable 4xx), `ingestion` (decode or database failure, including the checkpoint write), `reorg` (divergence flagged — run recovery), `gap`, `aborted` (lease lost / shutdown). In every case `resumeFromLedger` is the first ledger not covered by a committed batch, and live streaming still starts.
+
+Inspect progress:
+
+```bash
+sqlite3 $DB_PATH "SELECT state_key, state_value FROM indexer_state WHERE state_key LIKE 'catchup_checkpoint:%'"
+```
+
+Recovery:
+
+- **Interrupted / crashed / `fetch` / `ingestion`** — fix the cause and restart the indexer with the same range; it resumes from `nextLedger`.
+- **`gap`** — point `HORIZON_URL` at a full-history Horizon (or archive), or narrow the range to what is served and record the unrecoverable window in the incident log. Never mark it complete by hand.
+- **`reorg`** — let the reorg recovery path clear the latch, then restart.
+- **Re-run a completed range** — a `complete` checkpoint is a no-op; delete that `indexer_state` row (or call `executeCatchup({ …, restart: true })`) to re-cover it. Re-running is idempotent and does not roll back newer invoice state.
+
+Tests: [`indexer/tests/catchup.test.ts`](../indexer/tests/catchup.test.ts) covers range boundaries, TOID cursors, continuation links with partial and overlapping pages, duplicate transactions, bounded and non-retryable failures, injected database and checkpoint-write failures, mid-batch process interruption with resume from a fresh instance, retention/tip gaps, reorg halts, and idempotent re-runs.
 
 ## 6. Continuous reconciliation
 

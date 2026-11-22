@@ -20,6 +20,7 @@
 
 import { SorobanRpc } from "@stellar/stellar-sdk";
 import type { ISigner } from "./signers/ISigner.js";
+import { ValidationError } from "./errors.js";
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -106,6 +107,13 @@ export interface ILNClientConfig {
    * When provided, overrides the registry lookup for the bound network.
    */
   contracts?: Partial<ContractAddresses>;
+  /**
+   * Extra contract IDs that `submitBatchTransaction` may target in addition
+   * to the configured ILN contracts (e.g. the SEP-41 token contract for an
+   * `approve` call bundled with `fund_invoice`). Any call to a contract that
+   * is neither configured nor listed here is rejected before signing.
+   */
+  additionalContractIds?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +163,8 @@ export class ILNClient {
   private _getDistributionAccrual?: typeof import("./methods/distribution.js").getDistributionAccrual;
   private _submitBatchTransaction?: typeof import("./methods/batch.js").submitBatchTransaction;
   private _networkVerified = false;
+  /** Contract IDs a batch may target (configured ILN contracts + extras). */
+  private readonly _pinnedContractIds: ReadonlySet<string>;
 
   constructor(config: ILNClientConfig) {
     this.rpc = new SorobanRpc.Server(config.rpcUrl);
@@ -168,6 +178,53 @@ export class ILNClient {
       fundQueue: config.contracts?.fundQueue ?? "",
       nft: config.contracts?.nft ?? "",
     };
+    this._pinnedContractIds = new Set(
+      [...Object.values(this.contracts), ...(config.additionalContractIds ?? [])].filter(
+        (id) => typeof id === "string" && id.length > 0
+      )
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Pre-signing guards
+  // --------------------------------------------------------------------------
+
+  /**
+   * Reject any call whose `contractId` is not one of this client's pinned
+   * contracts. Runs before the network check and before the signer is ever
+   * invoked, so a mistyped, stale or attacker-supplied contract ID can never
+   * reach a signature.
+   *
+   * @throws {ValidationError} naming the offending call index and contract ID
+   */
+  private assertPinnedContracts(
+    calls: import("./methods/batch.js").BatchContractCall[]
+  ): void {
+    calls.forEach((call, i) => {
+      if (!this._pinnedContractIds.has(call.contractId)) {
+        throw new ValidationError(
+          `Contract ID mismatch: call #${i} (${call.method}) targets "${call.contractId}", ` +
+            `which is not a contract configured on this client. Configured: ` +
+            `${[...this._pinnedContractIds].join(", ") || "(none)"}. ` +
+            `Add it to \`additionalContractIds\` if it is intentional.`
+        );
+      }
+    });
+  }
+
+  /**
+   * If the signer advertises its own network passphrase (e.g. FreighterSigner),
+   * require it to equal this client's before signing, so a wallet on another
+   * network cannot sign a transaction built for this one.
+   */
+  private assertSignerNetwork(signer: ISigner): void {
+    const signerPassphrase = (signer as { networkPassphrase?: unknown }).networkPassphrase;
+    if (typeof signerPassphrase === "string" && signerPassphrase !== this.networkPassphrase) {
+      throw new Error(
+        `Network mismatch: signer is configured for "${signerPassphrase}" but this client ` +
+          `uses "${this.networkPassphrase}". Refusing to sign.`
+      );
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -182,9 +239,11 @@ export class ILNClient {
    * this client. On mismatch, throws with a clear diagnostic message so the
    * operator can fix their configuration before submitting any transactions.
    *
-   * Call this after construction (or use the `testnet()` / `mainnet()` factory
-   * methods which call it automatically) to guard against costly
-   * mainnet-contract-against-testnet-RPC mistakes.
+   * The factory methods are synchronous and do NOT call this. It is run
+   * automatically (once per client, result cached) by `submitBatchTransaction`
+   * before anything is signed; call it yourself after construction to fail
+   * fast on a misconfigured RPC. Read-only methods do not verify the network.
+   * Failure to reach the RPC is also an error (fail closed), never a pass.
    *
    * @throws {Error} if the RPC passphrase does not match the configured passphrase
    *
@@ -486,6 +545,11 @@ export class ILNClient {
    * @param calls - Array of contract call specifications
    * @returns Transaction hash submitted to the network
    *
+   * @throws {ValidationError} If any call targets a contract that is not configured on this
+   *   client (`contracts` / `contractId` / `additionalContractIds`) — before anything is signed
+   * @throws {Error} "Network mismatch" if the signer's declared network, or the RPC endpoint's
+   *   passphrase, differs from the client's; or if the RPC cannot be reached to verify it
+   *   (fail closed) — before anything is signed
    * @throws If the batch simulation fails or submission is rejected
    *
    * @example
@@ -510,7 +574,12 @@ export class ILNClient {
     if (!this.signer) {
       throw new Error("Batch transaction submission requires a signer");
     }
-    // Verify network passphrase before submitting any transaction
+    // Pre-signing guards, cheapest first; none of them touches the signer.
+    //  1. every call targets a pinned contract
+    //  2. the signer's network (if it declares one) matches this client
+    //  3. the RPC endpoint's passphrase matches this client (network call)
+    this.assertPinnedContracts(calls);
+    this.assertSignerNetwork(this.signer);
     if (!this._networkVerified) {
       await this.verifyNetwork();
       this._networkVerified = true;

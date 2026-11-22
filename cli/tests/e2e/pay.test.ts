@@ -1,16 +1,18 @@
-import { vi, describe, it, expect } from 'vitest';
+import { afterEach, vi, describe, it, expect } from 'vitest';
 /**
  * Tests for `iln pay` — full and partial payment flows.
  * Issue: #232
  */
 
 import { makePayCommand } from "../../src/commands/pay";
-import { printPaymentPreview, printPartialProgress, printSettlementReceipt } from "../../src/commands/pay";
+import { printPaymentPreview, printPartialProgress, printSettlementReceipt, computeLpSettlement } from "../../src/commands/pay";
 import type { InvoicePayState, PayResult } from "../../src/commands/pay-types";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const INVOICE_ID = "INV-100";
+
+afterEach(() => vi.restoreAllMocks());
 
 function mockInvoice(overrides: Partial<InvoicePayState> = {}): InvoicePayState {
   return {
@@ -136,6 +138,42 @@ describe("iln pay — partial payment", () => {
     expect(executor).not.toHaveBeenCalled();
     exitSpy.mockRestore();
   });
+
+  it.each(["NaN", "Infinity", "50USDC"])("rejects invalid amount %s before confirmation", async (amount) => {
+    const fetcher = vi.fn().mockResolvedValue(mockInvoice());
+    const executor = vi.fn();
+    const prompter = makePromptYes();
+    const cmd = makePayCommand(prompter, fetcher, executor);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => { throw new Error("exit"); });
+
+    try {
+      await expect(cmd.parseAsync(["node", "iln", "--id", INVOICE_ID, "--amount", amount])).rejects.toThrow("exit");
+      expect(prompter).not.toHaveBeenCalled();
+      expect(executor).not.toHaveBeenCalled();
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it("does not retry or print a receipt after an unconfirmed submission", async () => {
+    const fetcher = vi.fn().mockResolvedValue(mockInvoice());
+    const executor = vi.fn().mockRejectedValue(new Error("RPC timed out"));
+    const cmd = makePayCommand(makePromptYes(), fetcher, executor);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => { throw new Error("exit"); });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await expect(cmd.parseAsync(["node", "iln", "--id", INVOICE_ID, "--yes"])).rejects.toThrow("exit");
+      expect(executor).toHaveBeenCalledTimes(1);
+      expect(errors).toHaveBeenCalledWith(expect.stringContaining("before retrying"));
+      expect(logs).not.toHaveBeenCalledWith(expect.stringContaining("Settlement Receipt"));
+    } finally {
+      exitSpy.mockRestore();
+      errors.mockRestore();
+      logs.mockRestore();
+    }
+  });
 });
 
 // ── Payment preview ───────────────────────────────────────────────────────────
@@ -156,13 +194,14 @@ describe("iln pay — payment preview", () => {
     ).toBe(true);
   });
 
-  it("printPaymentPreview includes LP note when lp is set", () => {
+  it("printPaymentPreview says LP is not paid on a partial payment", () => {
     const logs: string[] = [];
     vi.spyOn(console, "log").mockImplementation((...a) => logs.push(a.join(" ")));
 
     printPaymentPreview(mockInvoice(), 50);
 
-    expect(logs[0]).toMatch(/Payer earns LP/);
+    expect(logs[0]).toMatch(/LP is paid only when the invoice is fully settled/);
+    expect(logs[0]).not.toMatch(/0\.25/);
   });
 
   it("printPaymentPreview omits LP note when lp is undefined", () => {
@@ -171,7 +210,52 @@ describe("iln pay — payment preview", () => {
 
     printPaymentPreview(mockInvoice({ lp: undefined }), 50);
 
-    expect(logs[0]).not.toMatch(/Payer earns LP/);
+    expect(logs[0]).not.toMatch(/LP/);
+  });
+
+  it("printPaymentPreview uses the on-chain formula on final payment", () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a) => logs.push(a.join(" ")));
+
+    // fee = 100 * 50bps = 0.5; distribute = 99.5; LP funded 100 of 100 → payout 99.5,
+    // earned floored at 0 (payout < funded), still rendered from the formula.
+    printPaymentPreview(mockInvoice({ lpFundedAmount: 100, feeRateBps: 50 }), 100);
+
+    expect(logs[0]).toMatch(/on-chain formula/);
+  });
+
+  it("printPaymentPreview does not invent a figure without fee/funding data", () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a) => logs.push(a.join(" ")));
+
+    printPaymentPreview(mockInvoice(), 100);
+
+    expect(logs[0]).toMatch(/preview unavailable/);
+  });
+});
+
+describe("iln pay — computeLpSettlement", () => {
+  it("matches mark_paid truncating integer math", () => {
+    // 1000 total, 30 bps fee => fee 3, distribute 997, LP funded 1000 => payout 997
+    expect(
+      computeLpSettlement({ totalAmount: 1000, lpFundedAmount: 1000, feeRateBps: 30 }),
+    ).toEqual({ protocolFee: 3, lpPayout: 997, lpEarned: 0 });
+  });
+
+  it("floors lpEarned at zero instead of going negative", () => {
+    const s = computeLpSettlement({ totalAmount: 100, lpFundedAmount: 50, feeRateBps: 100 });
+    expect(s?.lpEarned).toBe(0);
+  });
+
+  it.each([
+    { totalAmount: 100, lpFundedAmount: undefined, feeRateBps: 30 },
+    { totalAmount: 100, lpFundedAmount: 50, feeRateBps: undefined },
+    { totalAmount: 0, lpFundedAmount: 0, feeRateBps: 30 },
+    { totalAmount: 100, lpFundedAmount: 150, feeRateBps: 30 },
+    { totalAmount: 100, lpFundedAmount: 50, feeRateBps: 10_001 },
+    { totalAmount: NaN, lpFundedAmount: 50, feeRateBps: 30 },
+  ])("returns undefined for missing/invalid input %#", (input) => {
+    expect(computeLpSettlement(input)).toBeUndefined();
   });
 });
 

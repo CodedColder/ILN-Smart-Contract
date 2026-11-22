@@ -3,11 +3,31 @@
  * fundInvoice — LP-facing SDK method for the Invoice Liquidity Network.
  *
  * Handles the full two-step allowance + funding flow automatically:
- *   1. Fetch the invoice to determine the token and amount required.
- *   2. Query the LP's current token allowance for the contract.
- *   3. If insufficient, build, sign and submit an `approve` transaction.
- *   4. Build, sign and submit the `fund_invoice` contract call.
- *   5. Return `{ txHash, effectiveYieldBps }`.
+ *   1. Fetch the invoice; fund only its unfunded remainder.
+ *   2. Check the LP's token balance covers the discounted cost
+ *      (`computeFundingCost`) — fails before anything is signed.
+ *   3. Query the LP's current token allowance for the contract.
+ *   4. Build and simulate `fund_invoice` (typed ILNError on rejection).
+ *   5. If the allowance is insufficient, sign and submit an `approve` tx.
+ *   6. Sign and submit the `fund_invoice` call.
+ *   7. Return `{ txHash, effectiveYieldBps }`.
+ *
+ * Failure/interruption semantics:
+ *   - Failures in steps 1-4 have no on-chain effect.
+ *   - `txHash` means the network ACCEPTED the tx (status PENDING/DUPLICATE);
+ *     it is not a confirmation of ledger inclusion. Callers must poll
+ *     `getTransaction(txHash)` before treating the funding as final.
+ *   - `TRY_AGAIN_LATER` / `ERROR` are thrown; nothing was accepted.
+ *   - If the approve is accepted but the fund submission fails or the process
+ *     dies, the approve remains valid until it expires (~720 ledgers) and a
+ *     re-run re-checks the allowance instead of approving twice.
+ *   - Re-running after a successful fund throws "cannot be funded" (status
+ *     Funded) — it never double-funds. A tranche that raced another LP is
+ *     rejected on-chain (OverfundingRejected).
+ *   - NOTE: the contract moves the LP's funds with `transfer` (funder
+ *     authorisation), not `transfer_from`, so the allowance is not consumed
+ *     by `fund_invoice`; the approve step is a defensive pre-condition kept
+ *     for token/contract variants that pull funds.
  *
  * Progress is surfaced via optional callbacks on FundOptions so integrators
  * can update UI without polling.
@@ -29,10 +49,26 @@ import {
 import type { FundOptions, FundResult, InvoiceView } from "../types.js";
 import {
   getAllowance,
+  getTokenBalance,
   buildApproveTransaction,
   isAllowanceSufficient,
 } from "../utils/allowance.js";
 import { retry } from "../utils/retry.js";
+import { ILNError } from "../errors.js";
+
+/**
+ * LP cost for funding `fundAmount` of an invoice, mirroring `fund_invoice`:
+ *   cost = fundAmount - floor(fundAmount * discountRateBps / 10_000)
+ * (the contract transfers `cost` from the LP; the freelancer later receives
+ * the discounted payout and the payer repays the full face amount).
+ */
+export function computeFundingCost(
+  fundAmount: bigint,
+  discountRateBps: number
+): bigint {
+  const discount = (fundAmount * BigInt(discountRateBps)) / 10_000n;
+  return fundAmount - discount;
+}
 
 // ---------------------------------------------------------------------------
 // computeEffectiveYieldBps (exported for consumers and tests)
@@ -102,14 +138,17 @@ async function fetchInvoice(
     dueDate: Number(raw["due_date"]),
     discountRate: Number(raw["discount_rate"]),
     status: String(raw["status"]),
+    amountFunded: BigInt(String(raw["amount_funded"] ?? 0)),
   };
 }
 
 /**
  * Sign a base64-XDR transaction envelope with `signer` and submit it.
- * Returns the transaction hash on success.
+ * Returns the transaction hash once the network has ACCEPTED it (PENDING or
+ * DUPLICATE). This does not wait for ledger inclusion.
  *
- * @throws When the network returns `status: "ERROR"`.
+ * @throws When the network returns `status: "ERROR"` or `"TRY_AGAIN_LATER"`
+ *         (the transaction was not accepted, so no hash is returned).
  */
 async function signAndSubmit(
   server: SorobanRpc.Server,
@@ -123,6 +162,11 @@ async function signAndSubmit(
   if (result.status === "ERROR") {
     throw new Error(
       `Transaction failed: ${JSON.stringify(result.errorResult)}`
+    );
+  }
+  if (result.status === "TRY_AGAIN_LATER") {
+    throw new Error(
+      "Transaction was not accepted by the network (TRY_AGAIN_LATER); nothing was submitted, safe to retry"
     );
   }
   return result.hash;
@@ -198,6 +242,7 @@ async function verifyOracle(
  * @throws When the invoice is not fundable (wrong status, not found, etc.)
  * @throws When the approve or fund transaction is rejected by the network
  * @throws When oracle verification is required but fails
+ * @throws {ILNError.InsufficientAmount} When the LP's token balance is below the funding cost
  *
  * @example
  * ```ts
@@ -229,7 +274,7 @@ export async function fundInvoice(
   // 1. Load the LP's on-chain account (for sequence numbers)
   const lpAddress = lpKeypair.publicKey();
   const accountData = await retry(() => server.getAccount(lpAddress));
-  let sequence = accountData.sequence;
+  const sequence = accountData.sequence;
 
   const makeAccount = (seq: string) => new Account(lpAddress, seq);
 
@@ -258,36 +303,95 @@ export async function fundInvoice(
     );
   }
 
-  // 4. Allowance check
+  // 4. Amount to fund and LP cost. `fund_invoice` rejects any tranche that
+  //    would push amount_funded past amount (OverfundingRejected), so only
+  //    the unfunded remainder is funded.
+  const fundAmount = invoice.amount - (invoice.amountFunded ?? 0n);
+  if (fundAmount <= 0n) {
+    throw new Error(`Invoice ${invoiceId} has no remaining amount to fund`);
+  }
+  const cost = computeFundingCost(fundAmount, invoice.discountRate);
+
+  // 5. Balance check (read-only). Fails before anything is signed so an LP
+  //    who cannot pay never burns fees on an approve tx.
+  const balance = await retry(() =>
+    getTokenBalance(
+      server,
+      invoice.token,
+      lpAddress,
+      makeAccount(sequence),
+      networkPassphrase
+    )
+  );
+  if (balance < cost) {
+    throw new ILNError.InsufficientAmount(
+      `Insufficient token balance to fund invoice ${invoiceId}: need ${cost}, have ${balance}`
+    );
+  }
+
+  // 6. Allowance check
   const ledgerInfo = await retry(() => server.getLatestLedger());
   const currentLedger = ledgerInfo.sequence;
 
   const allowance = await getAllowance(
     server,
     { tokenAddress: invoice.token, owner: lpAddress, spender: contractAddress },
-    makeAccount(sequence)
+    makeAccount(sequence),
+    networkPassphrase
   );
 
   const needsApproval = !isAllowanceSufficient(
     allowance,
-    invoice.amount,
+    fundAmount,
     currentLedger + 10 // require at least 10 ledgers validity remaining
   );
 
+  // 7. Build and simulate fund_invoice BEFORE any approve is submitted, so a
+  //    contract-level rejection (paused, overfunded, unauthorized, frozen
+  //    funder, volume cap, ...) surfaces as a typed ILNError without costing
+  //    the LP an approve fee. If an approve will be sent first it consumes
+  //    one sequence number, so the fund tx is built at sequence + 1.
+  //    Contract signature: fund_invoice(funder, invoice_id, fund_amount,
+  //    require_oracle_verification).
+  const fundSequence = needsApproval ? String(BigInt(sequence) + 1n) : sequence;
+  const contract = new Contract(contractAddress);
+  const fundOp = contract.call(
+    "fund_invoice",
+    new Address(lpAddress).toScVal(),
+    nativeToScVal(invoiceId, { type: "u64" }),
+    nativeToScVal(fundAmount, { type: "i128" }),
+    nativeToScVal(requireOracleVerification, { type: "bool" })
+  );
+
+  const fundTx = new TransactionBuilder(makeAccount(fundSequence), {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(fundOp)
+    .setTimeout(30)
+    .build();
+
+  let preparedFundTx;
+  try {
+    preparedFundTx = await retry(() => server.prepareTransaction(fundTx));
+  } catch (err) {
+    throw ILNError.fromError(err, { contractId: contractAddress });
+  }
+
   if (needsApproval) {
-    // 5a. Notify caller
+    // 8a. Notify caller
     onApprovalRequired?.({
-      requiredAmount: invoice.amount,
+      requiredAmount: fundAmount,
       currentAllowance: allowance.amount,
     });
 
-    // 5b. Build, sign and submit the approve tx
+    // 8b. Build, sign and submit the approve tx
     const approveXdr = await buildApproveTransaction(
       server,
       invoice.token,
       makeAccount(sequence),
       contractAddress,
-      invoice.amount,
+      fundAmount,
       networkPassphrase
     );
 
@@ -299,29 +403,9 @@ export async function fundInvoice(
     );
 
     onApprovalSent?.({ approveTxHash });
-
-    // Bump sequence: the approve tx consumed one number
-    sequence = String(BigInt(sequence) + 1n);
   }
 
-  // 6. Build the fund_invoice call
-  const contract = new Contract(contractAddress);
-  const fundOp = contract.call(
-    "fund_invoice",
-    new Address(lpAddress).toScVal(),
-    nativeToScVal(invoiceId, { type: "u64" }),
-    nativeToScVal(invoice.amount, { type: "i128" })
-  );
-
-  const fundTx = new TransactionBuilder(makeAccount(sequence), {
-    fee: BASE_FEE,
-    networkPassphrase,
-  })
-    .addOperation(fundOp)
-    .setTimeout(30)
-    .build();
-
-  const preparedFundTx = await retry(() => server.prepareTransaction(fundTx));
+  // 9. Sign and submit the (already simulated) fund_invoice tx
   (preparedFundTx as Transaction).sign(lpKeypair);
 
   const fundSendResult = await retry(() => server.sendTransaction(
@@ -333,8 +417,13 @@ export async function fundInvoice(
       `fund_invoice failed: ${JSON.stringify(fundSendResult.errorResult)}`
     );
   }
+  if (fundSendResult.status === "TRY_AGAIN_LATER") {
+    throw new Error(
+      "fund_invoice was not accepted by the network (TRY_AGAIN_LATER); nothing was submitted, safe to retry"
+    );
+  }
 
-  // 7. Compute annualised yield and notify
+  // 10. Compute annualised yield and notify
   const effectiveYieldBps = computeEffectiveYieldBps(
     invoice.discountRate,
     invoice.dueDate

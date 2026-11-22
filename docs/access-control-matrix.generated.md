@@ -198,7 +198,7 @@ the narrative.
 | `cancel_admin_transfer` | Admin | `contracts/insurance_pool/src/lib.rs` |
 | `cancel_coverage_change` | Admin | `contracts/insurance_pool/src/lib.rs` |
 | `cancel_risk_multiplier` | Admin | `contracts/insurance_pool/src/lib.rs` |
-| `execute_admin_transfer` | Anyone | `contracts/insurance_pool/src/lib.rs` |
+| `execute_admin_transfer` | Caller (require_auth) | `contracts/insurance_pool/src/lib.rs` |
 | `execute_coverage_change` | Anyone | `contracts/insurance_pool/src/lib.rs` |
 | `execute_risk_multiplier` | Anyone | `contracts/insurance_pool/src/lib.rs` |
 | `get_backstop_balance` | Anyone | `contracts/insurance_pool/src/lib.rs` |

@@ -13,6 +13,10 @@
 //!   claim once re-authorized.
 //! - Issue #1073: `add_token` requires the SAC authorization interface and
 //!   verifies the contract and admin are authorized holders.
+//! - Issue #1177: decimals are registered here and consumed only for the
+//!   invoice amount floor. This module performs **no amount scaling**; see the
+//!   DECIMAL-NORMALIZATION INVARIANTS block below and
+//!   `docs/token-decimal-normalization.md`.
 
 use soroban_sdk::{
     contracttype,
@@ -23,6 +27,40 @@ use soroban_sdk::{
 use crate::errors::ContractError;
 use crate::events::{PayoutEscrowed, PendingPayoutClaimed};
 use crate::storage::DataKey;
+
+// ----------------------------------------------------------------
+// DECIMAL-NORMALIZATION INVARIANTS (Issue #1177)
+//
+// These declare the verified precision-handling contract between this
+// module and every financial entry point. The rationale, entry-point map
+// and residual-risk notes live in docs/token-decimal-normalization.md.
+//
+// INV-DN1: Precision is *registered*, never inferred. A token's scale is
+//   the u32 stored under DataKey::TokenDecimals(token); a token with no
+//   entry fails closed with TokenDecimalsNotConfigured. There is no
+//   silent default.
+// INV-DN2: `add_token` only admits a token whose declared decimals equal
+//   its own decimals(); the value persisted is therefore validated.
+//   `initialize`'s bootstrap tokens (USDC/EURC = 6, XLM = 7) are written
+//   directly and are NOT validated against the token — see RR-4 in the doc.
+// INV-DN3: Amounts are carried in the token's NATIVE precision. The
+//   normalize_* helpers in lib.rs are identity functions; no path rescales
+//   an amount by registered decimals.
+// INV-DN4: Registered decimals are consumed in exactly one place — the
+//   invoice amount floor `10^decimals` via
+//   validate_invoice_terms_with_token. It gates submission/update/batch
+//   and is the only amount comparison that depends on decimals.
+// INV-DN5: The outbound-payout paths below (transfer_out_strict,
+//   pay_or_escrow, claim_pending) transfer the exact amount argument and
+//   store that same value as pending payout — they never scale it. A
+//   caller that hands them a rescaled amount would pay it out verbatim.
+//
+// Because INV-DN3 holds, the base units transferred by every funding,
+// settlement and payout path equal the base units accounted (INV-DN6
+// parity). Any change making a normalize_* non-identity must also
+// normalize the corresponding accounting writes and the add_volume call,
+// or that parity breaks.
+// ----------------------------------------------------------------
 
 /// Largest precision a token may register. `ten_pow` saturates beyond
 /// 10^38, and no SEP-41 / SAC asset in use exceeds 18.

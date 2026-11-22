@@ -39,6 +39,12 @@ export interface CreateAppOptions {
   chainReader?: Pick<ChainReader, 'getProtocolStatus'>;
   /** Pre-built protocol-status service (overrides `chainReader`); for tests. */
   protocolStatusService?: ProtocolStatusService;
+  /**
+   * Express `trust proxy` setting. Defaults to unset (do not trust forwarding
+   * headers) so clients cannot spoof `X-Forwarded-For` and reset rate limits.
+   * Set only when a trusted reverse proxy strips client-supplied headers.
+   */
+  trustProxy?: boolean | number | string;
 }
 
 export function createApp(
@@ -46,6 +52,9 @@ export function createApp(
   options: CreateAppOptions = {}
 ): express.Express {
   const app = express();
+  if (options.trustProxy !== undefined) {
+    app.set('trust proxy', options.trustProxy);
+  }
   const apiKeys = options.apiKeys ?? config.apiKeys;
   const rateLimitWindowMs = options.rateLimitWindowMs ?? config.rateLimitWindowMs;
   const rateLimitAnonymousMax =

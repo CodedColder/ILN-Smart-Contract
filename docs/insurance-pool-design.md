@@ -67,7 +67,7 @@ immediately:
 | `execute_coverage_change()` | — | Apply the pending coverage change once its ETA has passed. Callable by anyone. |
 | `cancel_coverage_change()` | admin | Cancel a pending coverage change before it executes. |
 | `propose_admin_transfer(new_admin) -> u64` | admin | Queue an admin transfer; returns the ETA. |
-| `execute_admin_transfer()` | — | Apply the pending admin transfer once its ETA has passed. Callable by anyone. |
+| `execute_admin_transfer()` | Pending admin | Apply the pending admin transfer once its ETA has passed. The pending admin must authorize it (acceptance step, Issue #1265), so a transfer can never install an address that cannot sign. |
 | `cancel_admin_transfer()` | admin | Cancel a pending admin transfer before it executes. |
 | `get_pending_coverage() -> Option<(i128, u64)>` | — | View the pending coverage proposal, if any. |
 | `get_pending_admin() -> Option<(Address, u64)>` | — | View the pending admin proposal, if any. |

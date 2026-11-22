@@ -4,6 +4,7 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { StrKey } from "@stellar/stellar-sdk";
 import {
   loadConfig,
   saveConfig,
@@ -11,6 +12,9 @@ import {
   getConfigValue,
   setConfigValue,
   DEFAULTS,
+  MAINNET_NETWORK,
+  TESTNET_NETWORK,
+  requireInvoiceContract,
 } from "../../src/config";
 
 let tmpDir: string;
@@ -24,6 +28,13 @@ afterEach(() => {
 });
 
 describe("config module (#245)", () => {
+  it("requires an explicit valid mainnet invoice contract before use", () => {
+    const address = StrKey.encodeContract(Buffer.alloc(32, 1));
+    expect(() => requireInvoiceContract(MAINNET_NETWORK, "")).toThrow(/ILN_MAINNET_INVOICE_CONTRACT_ID/);
+    expect(() => requireInvoiceContract(MAINNET_NETWORK, "C".repeat(56))).toThrow(/No valid/);
+    expect(requireInvoiceContract(MAINNET_NETWORK, address)).toBe(address);
+    expect(requireInvoiceContract(TESTNET_NETWORK, address)).toBe(TESTNET_NETWORK.contracts.invoiceLiquidity);
+  });
   it("loadConfig returns defaults when no config file exists", () => {
     const cfg = loadConfig(tmpDir);
     expect(cfg.network).toBe("testnet");

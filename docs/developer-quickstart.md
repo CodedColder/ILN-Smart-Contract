@@ -194,11 +194,18 @@ stellar contract invoke \
   -- initialize \
   --admin <ALICE_ADDRESS> \
   --usdc_token <USDC_SAC_ADDRESS> \
-  --xlm_sac   <XLM_SAC_ADDRESS>
+  --eurc_token <EURC_SAC_ADDRESS> \
+  --xlm_token  <XLM_SAC_ADDRESS>
 ```
 
-> XLM and USDC Stellar Asset Contract (SAC) addresses for testnet can be found
-> in the Stellar documentation or by querying the Horizon API.
+> XLM, USDC and EURC Stellar Asset Contract (SAC) addresses for testnet can be
+> found in the Stellar documentation or by querying the Horizon API.
+
+> **Authorization (Issue #1162):** `initialize` requires the supplied `admin`
+> to authorize the call, so `--admin` **must** be the identity that signs the
+> transaction (`--source alice`). A deployer/test key cannot authorize
+> initialization on behalf of a different administrator. See
+> [initialization-hardening.md](./initialization-hardening.md).
 
 ---
 

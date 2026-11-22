@@ -19,6 +19,25 @@ declare module "@iln/sdk" {
     premiumsPaid: bigint;
   }
 
+  interface Invoice {
+    id: bigint;
+    status: string;
+    freelancer: string;
+    payer: string;
+    funder?: string;
+    amount: bigint;
+    token: string;
+    effectiveYieldBps?: number;
+  }
+
+  export function listInvoicesBySubmitter(
+    server: unknown,
+    contractId: string,
+    submitter: string,
+    sourceAccount: import("@stellar/stellar-sdk").Account,
+    networkPassphrase: string,
+  ): Promise<Invoice[]>;
+
   export class ILNClient {
     rpc: unknown;
     networkPassphrase: string;
@@ -40,6 +59,7 @@ declare module "@iln/sdk" {
     }): ILNClient;
     getReputation(address: string): Promise<ReputationProfile>;
     getTopPayers(limit: number): Promise<TopPayer[]>;
+    getLpInvoices(address: string): Promise<Invoice[]>;
     getInsurancePoolInfo(
       insurancePoolContractId: string,
       lpAddress: string

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import type Database from 'better-sqlite3';
+import { parsePagination } from '../pagination.js';
 
 interface InvoiceRow {
   id: number;
@@ -137,9 +138,10 @@ export function createInvoicesRouter(db: Database.Database): Router {
     const token = req.query.token as string | undefined;
     const submitter = req.query.submitter as string | undefined;
 
-    const page = Math.max(1, parseInt(req.query.page as string || '1', 10));
-    const pageSize = Math.max(1, parseInt(req.query.pageSize as string || '20', 10));
-    const offset = (page - 1) * pageSize;
+    const { page, pageSize, offset } = parsePagination(
+      req.query.page,
+      req.query.pageSize
+    );
 
     const sortByParam = req.query.sortBy as string || 'createdAt';
     const sortOrderParam = (req.query.sortOrder as string || 'desc').toLowerCase();
@@ -176,10 +178,12 @@ export function createInvoicesRouter(db: Database.Database): Router {
     const totalRow = db.prepare(countQuery).get(...params) as { total: number };
     const total = totalRow ? totalRow.total : 0;
 
+    // `id` is the deterministic tie-breaker: without it, rows sharing the sort
+    // key can be reordered between pages and appear twice or be skipped.
     const selectQuery = `
       SELECT * FROM invoices
       ${whereClause}
-      ORDER BY ${orderBy} ${order}
+      ORDER BY ${orderBy} ${order}, id ${order}
       LIMIT ? OFFSET ?
     `;
     const rows = db.prepare(selectQuery).all(...params, pageSize, offset) as InvoiceRow[];

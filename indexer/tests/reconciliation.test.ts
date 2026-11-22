@@ -119,6 +119,10 @@ describe('indexer/chain consistency reconciliation', () => {
     expect(report.driftedInvoices).toBe(0);
     expect(report.countWithinTolerance).toBe(true);
     expect(report.driftDetected).toBe(false);
+    expect(report.chainReadFailures).toBe(0);
+    expect(report.chainCountReadFailed).toBe(false);
+    expect(report.healthy).toBe(true);
+    expect(report.checkedFields).toBe(10);
   });
 
   it('flags drift and dispatches an alert when indexed rows diverge beyond tolerance', async () => {
@@ -227,6 +231,96 @@ describe('indexer/chain consistency reconciliation', () => {
 
     expect(report.mismatches.every((m) => m.field === '__chain_read_error__')).toBe(true);
     expect(report.driftDetected).toBe(false);
+    expect(report.chainReadFailures).toBe(2);
+    expect(report.chainCountReadFailed).toBe(true);
+    expect(report.healthy).toBe(false);
+  });
+
+  it('flags funder drift between the index and chain', async () => {
+    seedInvoice(db, 1, { funder: 'G-INDEXED-FUNDER' });
+
+    const reader: ChainReader = {
+      async getInvoice(id) {
+        return chainInvoice({ id, funder: 'G-CHAIN-FUNDER' });
+      },
+      getInvoiceCount: () => Promise.resolve(1),
+    };
+
+    const report = await runReconciliation(db, reader, {
+      ...DEFAULT_RECONCILIATION_CONFIG,
+      sampleSize: 1,
+      tolerancePercent: 0,
+    });
+
+    expect(report.mismatches).toContainEqual({
+      invoiceId: 1,
+      field: 'funder',
+      indexedValue: 'G-INDEXED-FUNDER',
+      chainValue: 'G-CHAIN-FUNDER',
+    });
+    expect(report.driftDetected).toBe(true);
+    expect(report.healthy).toBe(false);
+  });
+
+  it('marks an unreadable chain as inconclusive, never healthy', async () => {
+    seedInvoice(db, 1);
+    seedInvoice(db, 2);
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const alert = vi.fn(async () => undefined);
+    const reader: ChainReader = {
+      getInvoice: () => Promise.reject(new Error('RPC unreachable')),
+      getInvoiceCount: () => Promise.reject(new Error('RPC unreachable')),
+    };
+
+    const scheduler = startReconciliationSchedule(db, reader, {
+      alert,
+      logger,
+      config: {
+        ...DEFAULT_RECONCILIATION_CONFIG,
+        sampleSize: 2,
+        intervalMs: 60_000,
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    scheduler.stop();
+
+    expect(alert).not.toHaveBeenCalled();
+    expect(logger.info).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('inconclusive')
+    );
+  });
+
+  it('keeps ticking when alert delivery rejects', async () => {
+    seedInvoice(db, 1);
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const reader: ChainReader = {
+      async getInvoice(id) {
+        return chainInvoice({ id, status: 'Paid' });
+      },
+      getInvoiceCount: () => Promise.resolve(1),
+    };
+
+    const scheduler = startReconciliationSchedule(db, reader, {
+      alert: async () => {
+        throw new Error('notifier down');
+      },
+      logger,
+      config: {
+        ...DEFAULT_RECONCILIATION_CONFIG,
+        sampleSize: 1,
+        tolerancePercent: 0,
+        intervalMs: 60_000,
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    scheduler.stop();
+
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('alert delivery failed')
+    );
   });
 
   it('webhook dispatcher POSTs the alert to the notifications service intake', async () => {
@@ -247,6 +341,9 @@ describe('indexer/chain consistency reconciliation', () => {
       chainInvoiceCount: 125,
       countWithinTolerance: false,
       driftDetected: true,
+      chainReadFailures: 0,
+      chainCountReadFailed: false,
+      healthy: false,
     }));
 
     expect(posted).toHaveLength(1);

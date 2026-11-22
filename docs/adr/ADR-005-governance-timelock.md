@@ -1,7 +1,7 @@
 # ADR-005: Governance Timelock Length (No Timelock in v1)
 
 **Date:** 2024-05-01  
-**Status:** Accepted
+**Status:** Accepted — amended by Issues #981 and #982 (see "Amendment" below)
 
 ## Context
 
@@ -87,31 +87,31 @@ Threat model: [`docs/timelock-threat-model.md`](../timelock-threat-model.md).
   governance upgrade before `disable_veto_power()` is called. Failure to do
   so leaves the protocol without any execution delay after full decentralisation.
 - The `TimelockNotExpired` error is reserved but unimplemented; contributors
-  must not assume it is enforced.
+  must not assume it is enforced. *(Superseded: `execute_proposal` now
+  enforces `eta_ledger` via the admin-configured `execution_delay`.)*
 
-## Addendum (#995, #999, #1002, #1005): implemented timelock invariants
+## Amendment (Issues #981, #982)
 
-The "reserved but unimplemented" wording above is superseded for the current
-`iln_governance` contract. `execute_proposal` is a two-step flow and
-`TimelockNotExpired` is enforced:
+The "Action required" above is now enforced on-chain rather than left to
+process:
 
-1. Call 1 (`Active -> Passed`) sets `eta_ledger = ledger.sequence + ExecutionDelay`
-   (`checked_add`; overflow returns `InvalidTimelock`). `ExecutionDelay`
-   defaults to `0`, so default behaviour is unchanged.
-2. Call 2 (`Passed -> Executed`) goes through `assert_executable`, which fails
-   closed unless status is `Passed`, the voting window has closed **and**
-   `ledger.sequence >= eta_ledger`.
+- **#981 — active timelock before veto disablement.** `disable_veto_power()`
+  returns `TimelockNotActive` unless `execution_delay >=
+  MIN_ACTIVE_TIMELOCK_LEDGERS` (17,280 ledgers ≈ 24 h). After the veto is
+  disabled, `set_execution_delay` rejects any value below that floor, so the
+  invariant "veto enabled OR active timelock" holds at every state.
+  `set_execution_delay` also now returns `NotInitialized` before
+  `initialize` instead of letting the first caller claim the admin slot.
+- **#982 — timelock policy version on proposals.** The contract keeps a
+  monotonically increasing `TimelockPolicyVersion` (bumped by an effective
+  `set_execution_delay` change and by `disable_veto_power`). Every proposal
+  persists a `ProposalTimelockPolicy` snapshot (creation version/delay/veto
+  state, queue version/ledger, applied delay). Queueing applies
+  `max(created_delay, current_delay)`; if the policy version changes after
+  queueing, execution requires `max(eta_ledger, queued_ledger +
+  current_delay)`. A policy change can lengthen but never shorten an
+  in-flight proposal's timelock — in particular, retiring the veto re-applies
+  the active timelock to proposals that were queued with a zero delay.
 
-Invariants (all covered by `contracts/iln_governance/src/test.rs`):
-
-| # | Invariant |
-|---|-----------|
-| I1 | A proposal is never `Executed` at a ledger below its `eta_ledger`. |
-| I2 | `eta_ledger` is frozen when the proposal becomes `Passed`; later `set_execution_delay` calls cannot shorten or extend it. |
-| I3 | Status only moves forward: `Active -> {Passed, Rejected, Vetoed}`, `Passed -> {Executed, Vetoed}`. `Rejected`, `Executed`, `Vetoed` are terminal. Enforced by the single writer `transition_status`. |
-| I4 | A vote receipt outlives the voting window (compile-time assertion), tallies are immutable once the window closes, and each deposit is settled exactly once (refund xor forfeit). |
-| I5 | `set_execution_delay` requires the stored admin's auth, fails with `NotInitialized` before `initialize()`, and rejects delays above 518,400 ledgers (~30 days). |
-
-Operational note: the delay is an admin-key parameter, not a governance-gated
-one. Moving it behind the ILN-contract authority is the remaining step before
-`disable_veto_power()` (see ADR-012).
+Rollout, recovery and upgrade notes:
+[docs/governance-timelock-policy.md](../governance-timelock-policy.md).

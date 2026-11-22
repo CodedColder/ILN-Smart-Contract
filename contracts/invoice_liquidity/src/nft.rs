@@ -284,7 +284,11 @@ pub fn sync_nft_state(env: &Env, invoice_id: u64) -> Result<(), ContractError> {
         None => {
             // If the invoice doesn't exist at all, we should ensure the NFT doesn't exist
             if invoice_nft_exists(env, invoice_id) {
-                let current_owner = get_invoice_nft_owner(env, invoice_id).unwrap();
+                // Issue #1167: resolve the owner through the checked path so a
+                // stale NFT-exists flag returns `InvoiceNotFound` rather than
+                // trapping the host.
+                let current_owner =
+                    get_invoice_nft_owner(env, invoice_id).ok_or(ContractError::InvoiceNotFound)?;
                 burn_invoice_nft(env, invoice_id, current_owner)?;
             }
             return Ok(());

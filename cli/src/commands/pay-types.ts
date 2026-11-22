@@ -21,6 +21,17 @@ export interface InvoicePayState {
   token: string;
   payer: string;
   lp?: string;
+  /**
+   * Face-value amount funded by `lp` (same units as `totalAmount`).
+   * Required, together with `feeRateBps`, to compute LP settlement with the
+   * on-chain formula. Source: `get_invoice_funders` on the invoice contract.
+   */
+  lpFundedAmount?: number;
+  /**
+   * Protocol fee rate in basis points that `mark_paid` will apply to the
+   * full invoice amount on settlement (`effective_fee_rate`).
+   */
+  feeRateBps?: number;
 }
 
 /** Result returned after a successful payment. */

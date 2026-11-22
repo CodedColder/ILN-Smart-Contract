@@ -29,6 +29,10 @@
 set -uo pipefail
 
 REGRESSION_THRESHOLD="${BENCHMARK_REGRESSION_THRESHOLD:-10}"
+# Issue #1262: set to 1 to fail (instead of warn) when a contract produces
+# no BENCHMARK lines at all, e.g. because its benchmark module is not compiled
+# into the test crate. An unmeasured baseline is not a passing baseline.
+REQUIRE_MEASUREMENTS="${BENCHMARK_REQUIRE_MEASUREMENTS:-0}"
 MAX_CPU_INSTRUCTIONS="${MAX_CPU_INSTRUCTIONS:-100000000}"
 MAX_MEMORY_BYTES="${MAX_MEMORY_BYTES:-41943040}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -64,6 +68,7 @@ for target in "${TARGETS[@]}"; do
   export MAX_CPU_INSTRUCTIONS
   export MAX_MEMORY_BYTES
   export CONTRACT_DIR
+  export REQUIRE_MEASUREMENTS
 
   python3 <<'PY'
 import json
@@ -76,6 +81,7 @@ baseline_path = os.environ["BASELINE_FILE"]
 threshold_pct = float(os.environ["REGRESSION_THRESHOLD"])
 max_cpu = int(os.environ["MAX_CPU_INSTRUCTIONS"])
 max_mem = int(os.environ["MAX_MEMORY_BYTES"])
+require_measurements = os.environ.get("REQUIRE_MEASUREMENTS", "0") == "1"
 output = os.environ.get("BENCHMARK_OUTPUT", "")
 
 with open(baseline_path) as f:
@@ -100,8 +106,9 @@ for m in near_limit_pattern.finditer(output):
     )
 
 if not measured:
-    print(f"::warning::No BENCHMARK lines found in test output for {contract_dir}")
-    raise SystemExit(0)
+    level = "error" if require_measurements else "warning"
+    print(f"::{level}::No BENCHMARK lines found in test output for {contract_dir}")
+    raise SystemExit(1 if require_measurements else 0)
 
 print(f"\n### {contract_dir}")
 print("| Function | CPU (measured) | CPU (baseline) | Mem (measured) | Mem (baseline) |")

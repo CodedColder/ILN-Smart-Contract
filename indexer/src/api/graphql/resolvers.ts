@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { getProtocolStats } from '../../services/statsService.js';
 import { getLeaderboard } from '../../services/leaderboardService.js';
+import { parsePagination } from '../pagination.js';
 
 // ---------------------------------------------------------------------------
 // Internal row types
@@ -119,9 +120,10 @@ export function createResolvers(db: Database.Database) {
       },
 
       invoices(_: unknown, { filter = {}, pagination = {} }: InvoicesArgs) {
-        const page = Math.max(1, pagination.page ?? 1);
-        const pageSize = Math.max(1, Math.min(pagination.pageSize ?? 20, 100));
-        const offset = (page - 1) * pageSize;
+        const { page, pageSize, offset } = parsePagination(
+          pagination.page,
+          pagination.pageSize
+        );
 
         const conditions: string[] = [];
         const params: unknown[] = [];
@@ -147,7 +149,7 @@ export function createResolvers(db: Database.Database) {
 
         const rows = db
           .prepare(
-            `SELECT * FROM invoices ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+            `SELECT * FROM invoices ${where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
           )
           .all(...params, pageSize, offset) as InvoiceRow[];
 

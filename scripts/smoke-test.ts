@@ -178,6 +178,10 @@ async function runSmokeTest() {
     console.log("Contract is already initialized.");
   } catch (e) {
     console.log("Contract not initialized. Initializing now...");
+    // Issue #1162: `initialize` requires the supplied admin to authorize the
+    // call, so the admin argument below MUST be the same key that signs the
+    // transaction (`freelancer`). A separate deployer/test key cannot authorize
+    // initialization on behalf of a different administrator.
     const initArgs = [
       Address.fromString(freelancer.publicKey()).toScVal(), // admin
       Address.fromString(NATIVE_XLM_SAC).toScVal(),         // usdc_token

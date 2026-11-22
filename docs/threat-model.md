@@ -277,6 +277,88 @@ let best_candidate = queue.iter()
   critical (funds custody, auth) depends on the outcome, only which of
   several already-eligible LPs is selected
 
+**Worst-case insertion cost & the maturity marker (Issue #1057):** At the queue
+bound (`MAX_FUND_QUEUE_LEN` = 50), a joiner that strictly outscores the tail is
+admitted (displacing the tail); a joiner at or below the tail score is rejected
+with `QueueFull`. The `benchmark_worst_case_queue_insertion` sweep shows the
+admission cost is near-flat across head/middle/tail positions — dominated by the
+serialized entry size at the bound, not the insertion index — so there is no
+position-dependent griefing vector *within* the bound; the bound itself is what
+CI must hold. The security-relevant invariant the issue pins is the MEV maturity
+marker: `FundQueueOpenedAt` (the #MEV-1 gate that delays `resolve_fund_queue`
+until the queue has been open long enough) is written on the **first** join only
+(`try_set_fund_queue_opened_at`), so a *displacing re-join* by a high-scoring
+latecomer cannot reset the open-at ledger and push the resolution gate back.
+`test_1057_displacing_insert_does_not_reset_queue_opened_at` guards this.
+
+**Queue-resolution cost bound (Issue #1058):** `resolve_fund_queue`'s cost is not
+O(1) — Issue #708's fair tie-break scans the contiguous top-score prefix
+(`queue[0..tied_count]`) before selecting, so resolution reads O(tied_count)
+entries. That loop is bounded by the queue length (worst case: every entry tied
+at the top score reads all `MAX_FUND_QUEUE_LEN` entries), and it is now declared
+as the `queue_resolution_tie_fanout` entry in `storage::RESOURCE_ENVELOPE` so the
+bound cannot silently drift. A caller cannot inflate the scan beyond the cap,
+because the cap is exactly what bounds the queue it scans; the two extremes
+(all-tied vs distinct scores) are measured in
+`benchmark_queue_resolution_cpu_cost_at_cap`.
+
+**Unresolved-request storage bound (Issue #1059):** an unresolved fund request
+retains `FundQueue(u64)` (up to `MAX_FUND_QUEUE_LEN` `LpFundRequest` records) plus
+`FundQueueOpenedAt(u64)` in persistent storage, and **no terminal path deletes
+them** — `resolve_fund_queue` writes a `QueueResolution` but leaves the queue,
+and `cancel_invoice`/`expire_invoice` only rewrite the invoice. The keys are
+reclaimed only by TTL expiry. The storage-growth vector is therefore bounded by
+the queue cap, not by how many times LPs join: a full queue rejects further joins
+(`QueueFull`) rather than growing, a duplicate re-join is rejected
+(`AlreadyInQueue`), and `require_lp`'s `lp.require_auth()` means an unauthorized
+caller cannot write the entry at all — so no one can inflate an unresolved
+request's retained footprint past `MAX_FUND_QUEUE_LEN`. That retention bound is
+declared as the `unresolved_queue_retained_entries` entry in
+`storage::RESOURCE_ENVELOPE` so it cannot silently drift, and the footprint cost
+at the bound is measured in `benchmark_unresolved_queue_storage_footprint`. Note
+this corrects a prior doc claim that unresolved queues "drain" on resolution:
+they do not, so storage sizing must assume the footprint is retained at the cap
+until TTL expiry.
+
+**Governance ledger-entry budget (Issue #1060):** the governance audit log
+(`AdminActionLog(u32)`, written by `access::record_admin_action` on every admin
+entry point and read by `get_recent_admin_actions`) is a ring buffer of fixed
+`ADMIN_ACTION_LOG_CAPACITY` (50) slots. Two per-invocation cost vectors were
+neither declared nor measured. First, the **write**: a governance action stays
+O(1) — the ring buffer overwrites slot `seq % CAPACITY` in place and only the
+monotonic `AdminActionCount` grows, so repeated actions cannot fan out the write
+budget. Second, the **read**: `get_recent_admin_actions(limit)` clamps the
+caller-supplied `limit` to the cap and to the retained total, so a caller passing
+`u32::MAX` cannot make the read scan more than the cap's worth of ledger entries.
+That read-loop bound is now declared as the `governance_log_read_fanout` entry in
+`storage::RESOURCE_ENVELOPE` (referencing the same constant as the stored-slots
+bound `admin_action_log_entries`), so it cannot silently drift, and both the
+per-action write and the oversized-`limit` read are measured in
+`benchmark_governance_ledger_entry_budget`. An unauthorized caller still fails at
+`require_admin`'s `require_auth` before any write, so it cannot spend the budget
+at all; `tests_storage.rs` (`test_1060_*`) pins the saturation, clamping,
+ordering, wrap-boundary, empty-log, and authorization cases.
+
+**Fee-tier configuration bound (Issue #1061):** `update_fee_tiers` stores a
+`Vec<(i128, u32)>` in `FeeTiers`, and `effective_fee_rate` walks the **whole**
+list (backwards) on every settlement (`mark_paid`) to find the applicable
+bracket. Because the list was unbounded, its length — not any fixed constant —
+set the per-invocation cost of the contract's highest-value entry point. A
+compromised admin key (or a mistaken configuration) could grow the list until
+`mark_paid` exceeded Soroban's per-transaction resource limits, denying
+settlement for *every* invoice — a governance-triggered denial of service on the
+settlement path. The vector is now bounded at the source: `update_fee_tiers`
+rejects a list larger than `MAX_FEE_TIERS` (20) with `TooManyFeeTiers` (81)
+*before* storing it, so the tier walk is bounded by a fixed constant. The guard
+runs after `require_admin` (an unauthorized caller still fails at
+`require_auth` before anything is written, so it cannot bypass the check or spend
+the rate-limit window) and before `check_rate_limit` (a rejected oversized config
+consumes no state). The bound is declared as the `fee_tiers_entries` entry in
+`storage::RESOURCE_ENVELOPE` so it cannot silently drift, and both the config
+write at the cap and the worst-case settlement tier walk are measured in
+`benchmark_fee_tier_budget`; `tests_storage.rs` (`test_1061_*`) pins the at-cap
+acceptance, cap+1 rejection, authorization precedence, and ledger-boundary cases.
+
 **Clarification — post-resolution transfer is NOT a fairness bypass (Issue #712):**
 `transfer_lp_position()` lets a funded invoice's LP hand their position to any
 other address, with no check against funding-queue history. This means a
@@ -481,6 +563,9 @@ The contract had no integration with external credit oracles. Payer reputation w
 - ✅ **Feeder-Authorized Oracle Updates (Issue #1046):** the oracle's `update_verification` write path — the single entry point that can flip a payer to verified, and therefore unlock `fund_invoice` — was documented as operator-only but not enforced by the reference oracle, so any caller could mint funding eligibility for any payer (reducing the oracle gate to fail-open). A conforming implementation must now persist a designated **feeder** (operator) address, require `feeder.require_auth()` before mutating verification state, and reject the call when no feeder is configured. The ILN never calls this path, so the enforcement lives inside the oracle contract the registry points at; the reference implementation and its tests (success / unconfigured / unauthorized-signer under real auth / feeder rotation) model it, and the `OracleInterface` trait contract states the MUST requirement.
 - ✅ **Safe Feeder Disagreement (Issue #1047):** even an authorized feeder is still a single point of both trust and failure — before #1047 the gate resolved **one** Identity oracle and trusted its boolean outright, and disagreement between feeders was neither consultable nor observable. Governance may now register several Identity feeders (`add_identity_oracle`, capped at `MAX_IDENTITY_ORACLES_PER_FEED` = 20) and require an `N`-of-`M` agreement (`set_identity_quorum`, `[1, 20]`, default 1); `fund_invoice` queries every registered feeder via the non-panicking `try_invoke_contract` and counts only responses that are `is_verified` **and** fresh. Fewer than `N` agreements fails **closed** (`PayerUnverified`) and emits an `oracle_feeder_disagreement` event. A feeder that reverts or returns stale/unverified data contributes **no** agreement, so it can never *force* verification through; an **empty** feeder list preserves the unchanged single-oracle path, and `OracleInterface` v1 is untouched (each feeder is an independent `get_payer_data` deployment).
 - ✅ **Feeder Outage Recovery (Issue #1048):** the per-feed circuit breaker that trips after `MAX_CONSECUTIVE_STALE_QUERIES` (3) consecutive stale responses was **sticky** — cleared only by the governance-gated `reset_oracle_circuit` — so a *transient* feeder outage jammed oracle-gated funding even after the feeder recovered, and the contract could not tell "still broken" from "recovered but still latched". The breaker is now **half-open**: the permissionless `check_oracle_health` keeper path auto-clears it once the **tripping** oracle serves `CIRCUIT_RECOVERY_HEALTHY_OBSERVATIONS` (3) consecutive healthy observations — fresh **and** timestamp-advancing, so frozen/replayed data never counts — spanning at least `CIRCUIT_RECOVERY_MIN_LEDGERS` (120) ledgers, emitting `oracle_circuit_recovered`. The anti-flapping guarantee is preserved (a single fresh query only advances the streak to 1 and never recovers; any stale/frozen observation resets it), only the tripping oracle can recover its own breaker, a missing recovery record fails safe (admin reset still required), and `reset_oracle_circuit` remains the admin fast path and also clears recovery progress.
+- ✅ **Compromised-Feeder Test Coverage (Issue #1054):** the adversary behind all of the above — an oracle that is still an *authorized* registry entry but whose `get_payer_data` payload is attacker-controlled — is now pinned by a focused, adversarial suite (`test_1054_*` in `tests_oracle_registry.rs`) that frames one compromised feeder against every defence: a lone rogue cannot reach the quorum (`PayerUnverified` / `QuorumDisagreement`), a silent or reverting feeder cannot jam an honest quorum, a stale replay / future-dated / regressed / frozen payload is rejected by the freshness (#1050), monotonicity (#1052) and duplicate (#1053) rules, a rejected `fund_invoice` cannot advance the breaker (its writes roll back) while the permissionless `check_oracle_verification` keeper path can (`OracleCircuitOpen`), and an imposter cannot join the quorum (`add_identity_oracle` / `set_identity_quorum` are admin-only → `Unauthorized`). The benchmark `benchmark_compromised_feeder_rejection_paths` records the cost of each rejection branch. The suite deliberately documents the one boundary no on-chain rule covers: a compromised **majority** genuinely meets the quorum, so containment there is a governance action (`remove_identity_oracle`).
+- ✅ **Oracle Health & Quorum Visibility (Issue #1055):** the registry's configuration and health state was readable only by fanning out across five entry points, and the **live** health of the multi-oracle Identity quorum (#1047) had **no reader at all** — the quorum path never writes the single-oracle `OracleHealth` key, so `get_oracle_health` returns `None` forever once a feeder list is registered. Because gating failures are otherwise only observable by the keeper diagnostic (above), a blind monitoring surface is itself a risk (a stuck breaker or a mis-configured quorum can go unnoticed). Two permissionless, read-only views close it: `get_oracle_status` (one-call aggregate of resolution, recorded health, breaker flag, half-open recovery, Identity feeders + threshold, and price sources — **local reads only**, no cross-contract calls or writes) and `check_identity_quorum_health` (live per-feeder `FeederHealth` — `Verified` / `Unverified` / `Stale` / `Unreachable` — plus `verified_count`, `required_quorum` and `quorum_met`). The quorum view classifies each feeder through the **same** predicate the funding gate uses, so the diagnostic can never disagree with the gate about why a feeder counted.
+- ✅ **Documented Fail-Closed Disposition (Issue #1056):** the nine defences above each landed separately, so the shared disposition they add up to was never stated or tested in one place — a reader could reasonably conclude the "fail-open when no oracle" default still applied in the presence of an oracle. The gate is now documented as **fail-closed once any oracle is configured for a `(feed type, token)`**: a payer funds only on a positive, fresh verification, and every other outcome of the shared `oracle_registry::evaluate_identity_verification` maps to a `ContractError` (`Stale → OracleDataStale`, `QuorumDisagreement`/`Unverified → PayerUnverified`, `TimestampRegression`, `DuplicateUpdate`, `CircuitOpen`), in the fixed precedence `CircuitOpen → TimestampRegression → DuplicateUpdate → Stale → Unverified`. The **only** fail-open path is the genuinely unconfigured feed (no per-token override, no feed-type default, no legacy `price_oracle`). Two consequences are pinned by the `test_1056_*` suite in `tests_oracle_registry.rs`: a rejected funding call is **atomic** (the invoice stays `Pending` and the health write rolls back, so the reason is only observable via the #1049 diagnostic), and oracle verification is a **precondition, never a substitute** for the funder's `require_auth`. The audit evidence pointer is corrected here too — the cited `lib.rs:3832-3847` is the dispute-resolution refund block, not oracle logic; the real path is `fund_invoice`'s `require_oracle_verification` block (`lib.rs:2656-2711`).
 
 **Attack Scenario:**
 ```
@@ -497,7 +582,10 @@ The contract had no integration with external credit oracles. Payer reputation w
 - ✅ **Oracle Health Checks:** New `check_oracle_health()` function verifies oracle liveness and circuit-breaker status
 - ✅ **Feeder Outage Recovery (Issue #1048):** a tripped circuit breaker no longer requires a governance action to clear — the permissionless `check_oracle_health` keeper path auto-recovers it once the tripping oracle proves 3 consecutive fresh, timestamp-advancing observations over ≥120 ledgers, restoring funding without an admin call (anti-flapping preserved; only the tripping oracle can recover; `reset_oracle_circuit` stays the admin fast path)
 - ✅ **Gate-Failure Observability (Issue #1049):** because a rejected `fund_invoice` returns `Err` and Soroban rolls its events back, the gate's failure reasons (stale data, feeder disagreement, regressed/duplicate timestamp, open breaker, unverified payer) were previously invisible on chain. The permissionless, never-erroring `check_oracle_verification` runs the *same* gate and returns a structured `IdentityVerificationOutcome`, so its `oracle_stale_data_rejected` (new) and `oracle_feeder_disagreement` events commit — making a failing gate diagnosable without granting any privilege
+- ✅ **Compromised-Feeder Containment (Issue #1054):** a hostile payload from a *registered, authorized* feeder is rejected end to end — quorum isolation, freshness/monotonicity/duplicate rejection, and breaker containment — with each branch covered by an explicit adversarial test. Because containment is only *committed* by the permissionless `check_oracle_verification` keeper path (a rejected `fund_invoice` rolls back), operators must run that diagnostic continuously for the breaker to trip on a compromised feeder. A compromised **majority** is not containable on chain — it genuinely satisfies the quorum — so it is explicitly a governance response (`remove_identity_oracle`)
 - ✅ **Price Oracle Separation:** Payer-verification oracles are distinct from price oracles (different circuit domains)
+- ✅ **Oracle Health & Quorum Visibility (Issue #1055):** an off-chain `/health` probe can now answer "is oracle gating healthy?" in one call — `get_oracle_status` aggregates the resolved oracle, recorded health, breaker flag, half-open recovery, Identity feeder list + threshold, and price sources (local reads only; safe while paused), and `check_identity_quorum_health` exposes the live per-feeder `FeederHealth` and the `quorum_met` verdict that had no reader before. Both are permissionless and read-only (no `require_auth`, no write side effect, no privilege), and the quorum view shares the gate's per-feeder predicate so it cannot misreport why a feeder counted
+- ✅ **Documented Fail-Closed Disposition (Issue #1056):** the gate is fail-closed once any oracle is configured — the disposition, the exact outcome-to-error mapping and its precedence, and the single fail-open exception (unconfigured feed) are documented in [`oracle-design.md`](oracle-design.md#fail-closed-semantics-issue-1056) and [`oracle-integration.md`](oracle-integration.md#failure-handling), and pinned by the `test_1056_*` suite (success, fail-open exception, unverified, quorum disagreement, the exact staleness ledger boundary, frozen/duplicate, rejection atomicity, gate/diagnostic agreement, and the authorization interaction)
 - ✅ **Fallback Behavior:** If oracle fails or is stale, `fund_invoice()` reverts (fail-safe)
 
 **Residual Risk:** ⚠️ **MEDIUM** (reduced from HIGH in v2.0)
@@ -508,7 +596,7 @@ The contract had no integration with external credit oracles. Payer reputation w
 
 **Recommendation:**
 - **Governance Policy:** Establish oracle vetting criteria (audited providers, multiple redundant oracles)
-- **Monitoring:** Dashboard for oracle health; alert on circuit-breaker trips or unusual denial rates. Since Issue #1048 also alert on `oracle_circuit_recovered` (a breaker closed) and poll `get_circuit_recovery_state` to detect a **stuck** recovery, which still requires the admin `reset_oracle_circuit`
+- **Monitoring:** Dashboard for oracle health; alert on circuit-breaker trips or unusual denial rates. Since Issue #1048 also alert on `oracle_circuit_recovered` (a breaker closed) and poll `get_circuit_recovery_state` to detect a **stuck** recovery, which still requires the admin `reset_oracle_circuit`. Since Issue #1055 poll `get_oracle_status` per `(feed, token)` as a cheap `/health` probe (alert on `circuit_tripped` / stale `health`) and, where a quorum is configured, `check_identity_quorum_health` (alert whenever `quorum_met` is `false` with a non-empty feeder list)
 - **Redundancy:** Implemented (Issue #1047) — register multiple Identity feeders and raise `set_identity_quorum` above 1 (e.g. `2-of-3`) to require n-of-m agreement; select a quorum that tolerates a single feeder being offline
 - **Keeper cadence:** run `check_oracle_health` on a regular schedule — it is the permissionless path that both tracks staleness and (Issue #1048) drives circuit-breaker auto-recovery, so an outage that a keeper never observes cannot auto-heal
 - **Documentation:** Publish oracle integration guide for third-party oracle providers

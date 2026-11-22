@@ -15,32 +15,48 @@ pub enum ReferralCode {
 // ----------------------------------------------------------------
 // FORMAL VERIFICATION INVARIANTS
 //
+// Full transition table (entrypoint, roles, accounting effect), invariant IDs
+// and the list of invariants NOT mechanically enforced:
+// docs/invoice-lifecycle-invariants.md (Issue #1159). Tests:
+// tests_lifecycle_invariants.rs, contracts/tests/cross_contract_invariants_test.rs.
+//
 // == State Machine Invariants ==
 // INVARIANT SM1: InvoiceStatus transitions are strictly validated.
 //   Valid paths:
 //     Pending -> {Funded, PartiallyFunded, Cancelled, Expired, Disputed}
 //     PartiallyFunded -> {Funded, Cancelled, Disputed}
-//     Funded -> {Paid, Defaulted, Disputed}
-//     Defaulted -> {Appealed}
+//     Funded -> {Funded (partial mark_paid / transfer_lp_position), Paid,
+//                Defaulted, Disputed}
+//     Defaulted -> {Appealed} (at most once per invoice)
 //     Appealed -> {Defaulted} (via resolve_appeal — admin only)
-//     Disputed -> {Cancelled, Funded, PartiallyFunded, Pending} (admin resolution)
+//     Disputed -> {Cancelled} (resolve_dispute(1), admin) or the status implied
+//                 by amount_funded: {Funded, PartiallyFunded, Pending}
+//                 (resolve_dispute(2), admin; or auto_resolve_dispute after timeout)
 //   Terminal states: {Paid, Expired, Cancelled}
 // INVARIANT SM2: No invalid transition is ever silently ignored — each
 //   returns a distinct ContractError variant.
 //
 // == Balance Invariants ==
-// INVARIANT B1: amount_funded <= amount  (enforced by OverfundingRejected)
-// INVARIANT B2: amount_paid <= amount    (enforced by OverpaymentRejected)
-// INVARIANT B3: amount_funded == amount  iff status == Funded
-// INVARIANT B4: amount_paid == amount    iff status == Paid
+// INVARIANT B1: 0 <= amount_funded <= amount (fund_amount > 0 guard,
+//   OverfundingRejected) [ACC-1]; contributions sum to amount_funded [ACC-3]
+// INVARIANT B2: 0 <= amount_paid <= amount (OverpaymentRejected) [ACC-2]
+// INVARIANT B3: PartiallyFunded => 0 < amount_funded < amount;
+//   Funded|Paid|Defaulted|Appealed => amount_funded == amount [ACC-5]
+// INVARIANT B4: amount_paid == amount iff status == Paid [ST-2]
+//   (amount_funded / amount_paid are cumulative history and are not reset by
+//   refunds on Cancelled — see NE-1 in the invariants doc)
 //
 // == Authorization Invariants ==
 // INVARIANT A1: cancel_invoice requires caller == invoice.freelancer
 // INVARIANT A2: mark_paid requires caller == invoice.payer
-// INVARIANT A3: claim_default requires caller in invoice funders list
+// INVARIANT A3: claim_default requires the caller's signature and that the
+//   caller is in the invoice funders list
 // INVARIANT A4: Admin-only functions call require_admin() at entry
 // INVARIANT A5: dispute_invoice requires caller == invoice.payer
 // INVARIANT A6: appeal_default requires caller == invoice.payer
+// INVARIANT A7: fund_invoice requires the funding LP's signature;
+//   transfer_lp_position / claim_yield require invoice.funder's signature
+// INVARIANT A8: initialize cannot be re-run once Admin is set
 //
 // == Storage Invariants ==
 // INVARIANT S1: Each invoice occupies an independent DataKey::Invoice(id).
@@ -268,6 +284,75 @@ pub struct DisputeRecord {
     pub reason_hash: BytesN<32>,
     /// Ledger sequence when the dispute was filed.
     pub disputed_at: u32,
+}
+
+// ----------------------------------------------------------------
+// Issue #1165: invoice evidence commitment + verification lifecycle
+// ----------------------------------------------------------------
+
+/// Verification status of an invoice's evidence commitment.
+///
+/// This maps onto the issue's auditable lifecycle states:
+///   * **submitted** — a record exists with [`EvidenceStatus::Unverified`],
+///   * **verified**  — an authorized verifier approved it,
+///   * **rejected**  — an authorized verifier rejected it,
+///   * **disputed**  — the *invoice* carries a [`DisputeRecord`]. This is a
+///     condition on the invoice rather than a state of the commitment, so it
+///     is surfaced by [`InvoiceEvidenceView::disputed`] instead of being
+///     stored here.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum EvidenceStatus {
+    Unverified,
+    Verified,
+    Rejected,
+}
+
+/// A *versioned content commitment* to off-chain evidence plus the
+/// verification metadata for an invoice (Issue #1165).
+///
+/// Only a cryptographic digest is stored on-chain — **never the document or
+/// any PII**. `version` identifies the commitment scheme so the digest's
+/// algorithm/encoding stays unambiguous as the scheme evolves.
+///
+/// Stored in its own storage entry (like [`AppealRecord`]/[`DisputeRecord`]),
+/// so introducing it does not alter the existing `Invoice`/`InvoiceCore`
+/// layout and therefore preserves compatibility with already-stored invoices.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceRecord {
+    /// Commitment scheme version the `digest` is encoded under.
+    pub version: u32,
+    /// SHA-256 digest of the off-chain evidence bundle.
+    pub digest: BytesN<32>,
+    /// Current verification status.
+    pub status: EvidenceStatus,
+    /// Address that attached the commitment (the invoice freelancer).
+    pub submitted_by: Address,
+    /// Ledger timestamp when the commitment was attached.
+    pub submitted_at: u64,
+    /// Verifier that recorded the decision, if any.
+    pub verified_by: Option<Address>,
+    /// Ledger timestamp of the verification/rejection decision, if any.
+    pub verified_at: Option<u64>,
+}
+
+/// Read view combining an invoice's evidence commitment, its verification
+/// metadata, and the invoice-level `disputed` condition, so a client can
+/// render the full lifecycle from a single call (Issue #1165).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InvoiceEvidenceView {
+    pub invoice_id: u64,
+    pub version: u32,
+    pub digest: BytesN<32>,
+    pub status: EvidenceStatus,
+    pub submitted_by: Address,
+    pub submitted_at: u64,
+    pub verified_by: Option<Address>,
+    pub verified_at: Option<u64>,
+    /// True when the invoice currently has a dispute on record.
+    pub disputed: bool,
 }
 
 #[contracttype]
@@ -563,6 +648,14 @@ pub fn get_payer_score(env: &Env, payer: &Address) -> u32 {
                         let mut profile = get_reputation(env, payer);
                         profile.score = new_score;
                         set_reputation(env, &profile);
+
+                        // Keep the top-payers ranking in step with the decayed
+                        // score. Without this the heap kept the pre-decay
+                        // score until the payer's next explicit score change,
+                        // so a long-idle payer stayed ranked at a stale value.
+                        crate::top_payers::update_top_payers_on_score_change(
+                            env, payer, new_score,
+                        );
                     }
                 }
             }
@@ -826,6 +919,50 @@ pub fn save_dispute(env: &Env, invoice_id: u64, record: &DisputeRecord) {
     env.storage()
         .persistent()
         .set(&StorageKey::Dispute(invoice_id), record);
+}
+
+// Issue #1165: evidence commitment storage helpers
+
+/// Load an invoice's evidence commitment record, if one has been attached.
+pub fn get_evidence(env: &Env, invoice_id: u64) -> Option<EvidenceRecord> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::Evidence(invoice_id))
+}
+
+pub fn save_evidence(env: &Env, invoice_id: u64, record: &EvidenceRecord) {
+    let key = StorageKey::Evidence(invoice_id);
+    env.storage().persistent().set(&key, record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 1_000_000, 2_000_000);
+}
+
+/// Invoice id that first committed `digest`, if any. Used to reject the same
+/// off-chain evidence being financed more than once (Issue #1165).
+pub fn get_evidence_commitment(env: &Env, digest: &BytesN<32>) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::EvidenceCommitment(digest.clone()))
+}
+
+/// Release the duplicate-financing marker for `digest`. Called when a
+/// freelancer corrects an *unreviewed* commitment: the superseded digest is no
+/// longer attached to any invoice, so it must not remain locked to this one
+/// (which would otherwise spuriously reject committing that same digest to its
+/// rightful invoice). No-op if no marker exists.
+pub fn remove_evidence_commitment(env: &Env, digest: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .remove(&StorageKey::EvidenceCommitment(digest.clone()));
+}
+
+pub fn save_evidence_commitment(env: &Env, digest: &BytesN<32>, invoice_id: u64) {
+    let key = StorageKey::EvidenceCommitment(digest.clone());
+    env.storage().persistent().set(&key, &invoice_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 1_000_000, 2_000_000);
 }
 
 // ----------------------------------------------------------------
@@ -1231,4 +1368,215 @@ pub fn set_queue_tie_score_margin(env: &Env, margin: u32) {
     env.storage()
         .instance()
         .set(&StorageKey::QueueTieScoreMargin, &margin);
+}
+
+#[cfg(test)]
+mod proof_obligation_tests {
+    //! Pure model for the maintained invoice lifecycle and accounting invariants.
+    //! The model uses lifecycle status, stored amount/funded/paid balances, role
+    //! identities, and deterministic storage keys. It defines illegal transitions,
+    //! terminal states, balance bounds, authorization rules, and key isolation;
+    //! repeated or unauthorized actions are rejected without state transition.
+
+    use super::InvoiceStatus;
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Transition {
+        Fund,
+        PartiallyFund,
+        Cancel,
+        Expire,
+        Dispute,
+        MarkPaid,
+        Default,
+        Appeal,
+        ResolveAppeal,
+        ResolveDispute,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Action {
+        Cancel,
+        MarkPaid,
+        ClaimDefault,
+        Admin,
+        Dispute,
+        Appeal,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct Roles {
+        payer: u64,
+        freelancer: u64,
+        funder: u64,
+        admin: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ModelInvoice {
+        amount: i128,
+        funded: i128,
+        paid: i128,
+        status: InvoiceStatus,
+        roles: Roles,
+    }
+
+    fn transition(from: InvoiceStatus, action: Transition) -> Option<InvoiceStatus> {
+        match (from, action) {
+            (InvoiceStatus::Pending, Transition::Fund) => Some(InvoiceStatus::Funded),
+            (InvoiceStatus::Pending, Transition::PartiallyFund) => {
+                Some(InvoiceStatus::PartiallyFunded)
+            }
+            (InvoiceStatus::Pending, Transition::Cancel) => Some(InvoiceStatus::Cancelled),
+            (InvoiceStatus::Pending, Transition::Expire) => Some(InvoiceStatus::Expired),
+            (InvoiceStatus::Pending, Transition::Dispute) => Some(InvoiceStatus::Disputed),
+            (InvoiceStatus::PartiallyFunded, Transition::Fund) => Some(InvoiceStatus::Funded),
+            (InvoiceStatus::PartiallyFunded, Transition::Cancel) => Some(InvoiceStatus::Cancelled),
+            (InvoiceStatus::PartiallyFunded, Transition::Dispute) => Some(InvoiceStatus::Disputed),
+            (InvoiceStatus::Funded, Transition::MarkPaid) => Some(InvoiceStatus::Paid),
+            (InvoiceStatus::Funded, Transition::Default) => Some(InvoiceStatus::Defaulted),
+            (InvoiceStatus::Funded, Transition::Dispute) => Some(InvoiceStatus::Disputed),
+            (InvoiceStatus::Defaulted, Transition::Appeal) => Some(InvoiceStatus::Appealed),
+            (InvoiceStatus::Appealed, Transition::ResolveAppeal) => Some(InvoiceStatus::Defaulted),
+            (InvoiceStatus::Disputed, Transition::ResolveDispute) => Some(InvoiceStatus::Pending),
+            (InvoiceStatus::Disputed, Transition::Cancel) => Some(InvoiceStatus::Cancelled),
+            (InvoiceStatus::Disputed, Transition::Fund) => Some(InvoiceStatus::Funded),
+            (InvoiceStatus::Disputed, Transition::PartiallyFund) => {
+                Some(InvoiceStatus::PartiallyFunded)
+            }
+            _ => None,
+        }
+    }
+
+    fn balances_valid(invoice: &ModelInvoice) -> bool {
+        invoice.amount > 0
+            && invoice.funded >= 0
+            && invoice.paid >= 0
+            && invoice.funded <= invoice.amount
+            && invoice.paid <= invoice.amount
+            && invoice.paid <= invoice.funded
+    }
+
+    fn status_balances_valid(invoice: &ModelInvoice) -> bool {
+        match invoice.status {
+            InvoiceStatus::Funded => invoice.funded == invoice.amount && invoice.paid == 0,
+            InvoiceStatus::Paid => invoice.paid == invoice.amount,
+            InvoiceStatus::PartiallyFunded => {
+                invoice.funded > 0 && invoice.funded < invoice.amount && invoice.paid == 0
+            }
+            InvoiceStatus::Pending | InvoiceStatus::Expired | InvoiceStatus::Cancelled => {
+                invoice.paid == 0
+            }
+            InvoiceStatus::Defaulted | InvoiceStatus::Appealed | InvoiceStatus::Disputed => {
+                invoice.funded > 0
+            }
+        }
+    }
+
+    fn authorized(action: Action, caller: u64, roles: Roles) -> bool {
+        match action {
+            Action::Cancel => caller == roles.freelancer,
+            Action::MarkPaid => caller == roles.payer,
+            Action::ClaimDefault => caller == roles.funder,
+            Action::Admin => caller == roles.admin,
+            Action::Dispute | Action::Appeal => caller == roles.payer,
+        }
+    }
+
+    fn storage_key(invoice_id: u64) -> u64 {
+        invoice_id
+    }
+
+    #[test]
+    fn sm1_accepts_documented_transitions() {
+        assert_eq!(
+            transition(InvoiceStatus::Pending, Transition::Fund),
+            Some(InvoiceStatus::Funded)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Funded, Transition::MarkPaid),
+            Some(InvoiceStatus::Paid)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Funded, Transition::Default),
+            Some(InvoiceStatus::Defaulted)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Defaulted, Transition::Appeal),
+            Some(InvoiceStatus::Appealed)
+        );
+        assert_eq!(
+            transition(InvoiceStatus::Appealed, Transition::ResolveAppeal),
+            Some(InvoiceStatus::Defaulted)
+        );
+    }
+
+    #[test]
+    fn sm2_rejects_invalid_or_terminal_transitions() {
+        assert_eq!(transition(InvoiceStatus::Paid, Transition::Fund), None);
+        assert_eq!(transition(InvoiceStatus::Expired, Transition::Cancel), None);
+        assert_eq!(
+            transition(InvoiceStatus::Cancelled, Transition::MarkPaid),
+            None
+        );
+        assert_eq!(
+            transition(InvoiceStatus::PartiallyFunded, Transition::MarkPaid),
+            None
+        );
+    }
+
+    #[test]
+    fn b1_to_b4_hold_for_valid_model_states() {
+        let roles = Roles {
+            payer: 1,
+            freelancer: 2,
+            funder: 3,
+            admin: 4,
+        };
+        let funded = ModelInvoice {
+            amount: 100,
+            funded: 100,
+            paid: 0,
+            status: InvoiceStatus::Funded,
+            roles,
+        };
+        let paid = ModelInvoice {
+            status: InvoiceStatus::Paid,
+            paid: 100,
+            ..funded.clone()
+        };
+        let invalid = ModelInvoice {
+            funded: 101,
+            ..funded
+        };
+
+        assert!(balances_valid(&funded) && status_balances_valid(&funded));
+        assert!(balances_valid(&paid) && status_balances_valid(&paid));
+        assert!(!balances_valid(&invalid));
+    }
+
+    #[test]
+    fn a1_to_a6_authorization_matrix_is_exact() {
+        let roles = Roles {
+            payer: 1,
+            freelancer: 2,
+            funder: 3,
+            admin: 4,
+        };
+        assert!(authorized(Action::Cancel, roles.freelancer, roles));
+        assert!(!authorized(Action::Cancel, roles.payer, roles));
+        assert!(authorized(Action::MarkPaid, roles.payer, roles));
+        assert!(!authorized(Action::MarkPaid, roles.funder, roles));
+        assert!(authorized(Action::ClaimDefault, roles.funder, roles));
+        assert!(authorized(Action::Admin, roles.admin, roles));
+        assert!(!authorized(Action::Admin, roles.payer, roles));
+        assert!(authorized(Action::Dispute, roles.payer, roles));
+        assert!(authorized(Action::Appeal, roles.payer, roles));
+    }
+
+    #[test]
+    fn s1_invoice_keys_are_independent() {
+        assert_ne!(storage_key(1), storage_key(2));
+        assert_eq!(storage_key(7), storage_key(7));
+    }
 }

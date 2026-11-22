@@ -1,0 +1,22 @@
+[package]
+name = "iln-fuzz-targets"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+iln_fuzz = { path = ".." }
+
+[[bin]]
+name = "lifecycle_arithmetic"
+path = "fuzz_targets/lifecycle_arithmetic.rs"
+test = false
+doc = false
+
+[workspace]
+members = ["."]

@@ -2,9 +2,9 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, Env, IntoVal,
 };
 
 struct Setup {
@@ -370,6 +370,76 @@ fn admin_transfer_can_be_cancelled() {
 
     let res = s.client.try_execute_admin_transfer();
     assert_eq!(res, Err(Ok(InsuranceError::NoPendingProposal)));
+}
+
+// ── Issue #1265: admin transfer acceptance and initialization ownership ──
+
+#[test]
+fn admin_transfer_execution_requires_pending_admin_auth() {
+    let s = setup();
+    let new_admin = Address::generate(&s.env);
+
+    let eta = s.client.propose_admin_transfer(&new_admin);
+    s.env.ledger().set_timestamp(eta);
+    s.client.execute_admin_transfer();
+
+    // The acceptance was authorized by the pending admin, not by an
+    // arbitrary caller.
+    assert!(s
+        .env
+        .auths()
+        .iter()
+        .any(|(addr, _)| *addr == new_admin));
+}
+
+#[test]
+fn admin_transfer_without_pending_admin_signature_keeps_current_admin() {
+    let s = setup();
+    let unreachable_admin = Address::generate(&s.env);
+
+    let eta = s.client.propose_admin_transfer(&unreachable_admin);
+    s.env.ledger().set_timestamp(eta);
+
+    // Nobody signs: the transfer must not happen.
+    s.env.set_auths(&[]);
+    assert!(s.client.try_execute_admin_transfer().is_err());
+
+    // The proposal is still pending and the current admin can still act
+    // (cancel), so the pool never ends up without an authorized owner.
+    assert_eq!(
+        s.client.get_pending_admin(),
+        Some((unreachable_admin.clone(), eta))
+    );
+    s.env.mock_all_auths();
+    s.client.cancel_admin_transfer();
+    assert_eq!(s.client.get_pending_admin(), None);
+}
+
+#[test]
+fn initialize_requires_admin_auth_and_rejects_reinitialization() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, InsurancePool);
+    let client = InsurancePoolClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    // No signature from `admin`: initialization fails and writes nothing.
+    assert!(client.try_initialize(&admin, &COVERAGE, &token).is_err());
+    assert_eq!(
+        client.try_get_token_address(),
+        Err(Ok(InsuranceError::NotInitialized))
+    );
+
+    env.mock_all_auths();
+    client.initialize(&admin, &COVERAGE, &token);
+
+    let other = Address::generate(&env);
+    assert_eq!(
+        client.try_initialize(&other, &COVERAGE, &token),
+        Err(Ok(InsuranceError::AlreadyInitialized))
+    );
 }
 
 // ── Governance-controlled parameter updates ────────────────────────────────
@@ -1511,4 +1581,373 @@ fn pair_collusion_heuristic_flags_concentration_then_relaxes() {
     assert_eq!(s.client.get_pair_default_count(&s.lp, &payer_b), 7);
     assert_eq!(s.client.get_default_count(&s.lp), 10);
     assert!(!s.client.get_pair_collusion_flag(&s.lp, &payer_a));
+}
+
+// ── Issue #1194: enrollment / premium / claim authorization ───────────
+//
+// Unlike `setup()`, these tests deliberately do NOT call `mock_all_auths()`,
+// so each entrypoint's `require_auth()` is evaluated for real. A test mocks
+// exactly one caller's authorization and asserts that a different caller is
+// rejected (or, for the positive path, that the required signer is accepted).
+
+struct NoMockSetup {
+    env: Env,
+    client: InsurancePoolClient<'static>,
+    admin: Address,
+    lp: Address,
+}
+
+/// Registers and initializes a pool with real auth enforcement. Only the
+/// admin's `initialize` authorization is mocked, so the pool can be brought
+/// up without enabling `mock_all_auths()` for the whole test.
+fn setup_no_mock_auths() -> NoMockSetup {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, InsurancePool);
+    let client = InsurancePoolClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let lp = Address::generate(&env);
+
+    let token_admin_addr = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin_addr)
+        .address();
+
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (admin.clone(), COVERAGE, token_address.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.initialize(&admin, &COVERAGE, &token_address);
+
+    NoMockSetup {
+        env,
+        client,
+        admin,
+        lp,
+    }
+}
+
+#[test]
+fn enroll_requires_lp_authorization() {
+    let s = setup_no_mock_auths();
+    let imposter = Address::generate(&s.env);
+
+    // Only the impostor authorizes the call; the LP's signature is absent.
+    s.env.mock_auths(&[MockAuth {
+        address: &imposter,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "enroll",
+            args: (s.lp.clone(),).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(s.client.try_enroll(&s.lp).is_err());
+    // The rejected call left no enrollment state behind.
+    assert!(!s.client.is_enrolled(&s.lp));
+}
+
+#[test]
+fn enroll_succeeds_with_lp_authorization() {
+    let s = setup_no_mock_auths();
+
+    s.env.mock_auths(&[MockAuth {
+        address: &s.lp,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "enroll",
+            args: (s.lp.clone(),).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    s.client.enroll(&s.lp);
+    assert!(s.client.is_enrolled(&s.lp));
+}
+
+#[test]
+fn enroll_is_idempotent_and_does_not_inflate_enrolled_count() {
+    let s = setup();
+
+    assert_eq!(s.client.get_pool_health().enrolled_lp_count, 0);
+    s.client.enroll(&s.lp);
+    s.client.enroll(&s.lp); // repeated enroll is a no-op
+    assert_eq!(s.client.get_pool_health().enrolled_lp_count, 1);
+}
+
+#[test]
+fn deposit_premium_requires_lp_authorization() {
+    let s = setup_no_mock_auths();
+    let imposter = Address::generate(&s.env);
+
+    // `deposit_premium` gates on `lp.require_auth()` before touching any
+    // state or the token, so no funded balance is needed to exercise it.
+    s.env.mock_auths(&[MockAuth {
+        address: &imposter,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "deposit_premium",
+            args: (s.lp.clone(), 250i128).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(s.client.try_deposit_premium(&s.lp, &250).is_err());
+    // No accounting movement happened.
+    assert_eq!(s.client.get_pool_balance(), 0);
+    assert_eq!(s.client.get_premiums_paid(&s.lp), 0);
+}
+
+#[test]
+fn claim_requires_admin_authorization() {
+    let s = setup_no_mock_auths();
+    let imposter = Address::generate(&s.env);
+
+    s.env.mock_auths(&[MockAuth {
+        address: &imposter,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "claim",
+            args: (1u64, s.lp.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(s.client.try_claim(&1, &s.lp).is_err());
+    // An unauthorized claim records no payout.
+    assert!(!s.client.is_claimed(&1));
+}
+
+#[test]
+fn enrolled_lp_cannot_claim_for_itself() {
+    let s = setup_no_mock_auths();
+
+    // The LP authorizes the call, but `claim` requires the *admin*'s auth; an
+    // LP's own signature does not satisfy it.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.lp,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "claim",
+            args: (5u64, s.lp.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(s.client.try_claim(&5, &s.lp).is_err());
+    assert!(!s.client.is_claimed(&5));
+}
+
+#[test]
+fn admin_authorized_claim_passes_gate_and_empty_pool_is_rejected() {
+    let s = setup_no_mock_auths();
+
+    s.env.mock_auths(&[MockAuth {
+        address: &s.admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "claim",
+            args: (2u64, s.lp.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    // With the admin's authorization present the call clears `require_admin`
+    // and is rejected only because the pool holds no reserve.
+    assert_eq!(
+        s.client.try_claim(&2, &s.lp),
+        Err(Ok(soroban_sdk::Error::from(InsuranceError::PoolEmpty)))
+    );
+}
+
+#[test]
+fn repeated_claim_moves_no_tokens() {
+    let s = setup();
+    s.token_admin.mint(&s.lp, &(COVERAGE * 2));
+    s.client.deposit_premium(&s.lp, &(COVERAGE * 2));
+
+    let first_payout = s.client.claim(&42, &s.lp);
+    assert!(first_payout > 0);
+    let lp_after_first = s.token_client.balance(&s.lp);
+    let pool_after_first = s.client.get_pool_balance();
+
+    // A second claim for the same invoice is rejected by the per-invoice
+    // idempotency key and moves no additional tokens.
+    assert!(s.client.try_claim(&42, &s.lp).is_err());
+    assert_eq!(s.token_client.balance(&s.lp), lp_after_first);
+    assert_eq!(s.client.get_pool_balance(), pool_after_first);
+}
+
+// ── Issue #1195: claim accounting conservation ────────────────────────
+//
+// These tests pin the *conservation* properties of `claim`: a payout can
+// never exceed the LP's allocated (tiered) coverage nor the pool's total
+// reserve (`Balance + BackstopBalance`), and a rejected payout leaves every
+// pool counter untouched. Assumptions, data sources, and the verified /
+// residual split are recorded in docs/insurance-pool-claim-accounting.md.
+
+/// Total reserve available to pay claims: liquid balance plus backstop.
+fn total_reserve(s: &Setup) -> i128 {
+    s.client.get_pool_balance() + s.client.get_backstop_balance()
+}
+
+#[test]
+fn claim_payout_is_capped_by_tiered_coverage_when_pool_is_larger() {
+    let s = setup();
+
+    // 10x the coverage cap funded -> tier-4 coverage = 150% of the cap, far
+    // below the pool reserve.
+    s.token_admin.mint(&s.lp, &(COVERAGE * 10));
+    s.client.deposit_premium(&s.lp, &(COVERAGE * 10));
+
+    let tiered = s.client.get_tiered_coverage(&s.lp);
+    assert_eq!(tiered, (COVERAGE * 150) / 100);
+
+    let reserve_before = total_reserve(&s);
+
+    let payout = s.client.claim(&1, &s.lp);
+
+    // Allocated coverage, not the larger reserve, bounds the payout.
+    assert_eq!(payout, tiered);
+    assert!(payout < reserve_before);
+    // Value conservation: the reserve drops by exactly the payout.
+    assert_eq!(total_reserve(&s), reserve_before - payout);
+    assert!(s.client.is_claimed(&1));
+}
+
+#[test]
+fn claim_payout_is_capped_by_total_reserve_when_coverage_exceeds_it() {
+    let s = setup();
+
+    // Tiny premium -> tier-1 coverage (50% of the cap) dwarfs the reserve.
+    s.token_admin.mint(&s.lp, &1000);
+    s.client.deposit_premium(&s.lp, &1000);
+
+    // Seed the backstop so the total reserve is still far below coverage.
+    let treasury = Address::generate(&s.env);
+    s.token_admin.mint(&treasury, &500);
+    s.client.top_up_backstop(&treasury, &500);
+
+    let reserve_before = total_reserve(&s);
+    let tiered = s.client.get_tiered_coverage(&s.lp);
+    assert!(tiered > reserve_before);
+
+    let payout = s.client.claim(&1, &s.lp);
+
+    // Coverage exceeds the pool -> payout is bounded by the reserve, never
+    // above it, and the pool is drained to zero (no over-draw).
+    assert_eq!(payout, reserve_before);
+    assert!(payout <= tiered);
+    assert_eq!(s.client.get_pool_balance(), 0);
+    assert_eq!(s.client.get_backstop_balance(), 0);
+    assert_eq!(s.token_client.balance(&s.client.address), 0);
+    assert_eq!(s.token_client.balance(&s.lp), reserve_before);
+    assert!(s.client.is_claimed(&1));
+}
+
+#[test]
+fn claim_draws_liquid_first_then_backstop_conserving_counters() {
+    let s = setup();
+
+    s.token_admin.mint(&s.lp, &1000);
+    s.client.deposit_premium(&s.lp, &1000); // liquid = 1000, backstop = 0
+    let treasury = Address::generate(&s.env);
+    s.token_admin.mint(&treasury, &2000);
+    s.client.top_up_backstop(&treasury, &2000); // backstop = 2000
+
+    let balance_before = s.client.get_pool_balance();
+    let backstop_before = s.client.get_backstop_balance();
+    let reserve_before = balance_before + backstop_before;
+
+    // Tier-1 coverage far exceeds the 3,000 reserve -> payout drains it all.
+    let payout = s.client.claim(&1, &s.lp);
+
+    let balance_after = s.client.get_pool_balance();
+    let backstop_after = s.client.get_backstop_balance();
+
+    // Counter conservation: no value is created or destroyed by the payout.
+    assert_eq!(balance_after + backstop_after + payout, reserve_before);
+    // Liquid reserve is drained before the backstop is touched, and the
+    // backstop only absorbs the shortfall.
+    assert_eq!(balance_after, 0);
+    assert_eq!(backstop_after, backstop_before - (payout - balance_before));
+    assert!(payout <= reserve_before);
+}
+
+#[test]
+fn already_claimed_rejection_leaves_counters_unchanged() {
+    let s = setup();
+    s.token_admin.mint(&s.lp, &(COVERAGE * 2));
+    s.client.deposit_premium(&s.lp, &(COVERAGE * 2));
+
+    let first = s.client.claim(&7, &s.lp);
+    assert!(first > 0);
+
+    let balance_after_first = s.client.get_pool_balance();
+    let backstop_after_first = s.client.get_backstop_balance();
+
+    // The rejection happens at the idempotency check, before any counter
+    // write, so nothing moves.
+    assert_eq!(
+        s.client.try_claim(&7, &s.lp),
+        Err(Ok(soroban_sdk::Error::from(InsuranceError::AlreadyClaimed)))
+    );
+    assert_eq!(s.client.get_pool_balance(), balance_after_first);
+    assert_eq!(s.client.get_backstop_balance(), backstop_after_first);
+}
+
+#[test]
+fn pool_empty_claim_rejection_leaves_counters_unchanged() {
+    let s = setup();
+
+    assert_eq!(s.client.get_pool_balance(), 0);
+    assert_eq!(s.client.get_backstop_balance(), 0);
+
+    assert_eq!(
+        s.client.try_claim(&1, &s.lp),
+        Err(Ok(soroban_sdk::Error::from(InsuranceError::PoolEmpty)))
+    );
+
+    // An empty pool rejects before any state write: counters stay at zero and
+    // the invoice is not consumed.
+    assert_eq!(s.client.get_pool_balance(), 0);
+    assert_eq!(s.client.get_backstop_balance(), 0);
+    assert!(!s.client.is_claimed(&1));
+}
+
+#[test]
+fn circuit_gated_claim_rejection_leaves_counters_unchanged() {
+    let s = setup();
+
+    // Trip the breaker with a first payout, then rebuild the reserve so a
+    // second (blocked) claim has something it *could* have paid out.
+    s.token_admin.mint(&s.lp, &100);
+    s.client.deposit_premium(&s.lp, &100);
+    s.client.set_min_reserve_ratio_bps(&5000);
+    let first = s.client.claim(&1, &s.lp);
+    assert!(first > 0);
+    assert!(s.client.is_solvency_circuit_open());
+
+    s.token_admin.mint(&s.lp, &500);
+    s.client.deposit_premium(&s.lp, &500);
+
+    let balance_before = s.client.get_pool_balance();
+    let backstop_before = s.client.get_backstop_balance();
+
+    // Gated by the open circuit: rejected before any payout accounting runs.
+    assert_eq!(
+        s.client.try_claim(&2, &s.lp),
+        Err(Ok(soroban_sdk::Error::from(
+            InsuranceError::SolvencyCircuitOpen
+        )))
+    );
+    assert_eq!(s.client.get_pool_balance(), balance_before);
+    assert_eq!(s.client.get_backstop_balance(), backstop_before);
+    assert!(!s.client.is_claimed(&2));
 }

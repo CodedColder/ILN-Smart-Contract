@@ -52,8 +52,12 @@ aligning with the pre-upgrade TTL guard in `storage::validate_ttl_fields_pre_upg
 
 **Queues already above 50.** Existing oversized queues are not truncated.
 New joins to such a queue are rejected unless they outscore the tail (then the
-tail is displaced and the length stays the same). Queues drain as invoices
-resolve, are funded or are cancelled.
+tail is displaced and the length stays the same). Queues are **not** drained by
+resolution, funding, or cancellation: `resolve_fund_queue` writes a
+`QueueResolution` but leaves `FundQueue`/`FundQueueOpenedAt` in place, and the
+terminal invoice paths only rewrite the invoice — the keys are reclaimed only
+when their TTL lapses (see §22 and
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)).
 
 **Recovery / rollback.** Reverting the Wasm restores prior behaviour with no
 data migration, because no state was rewritten.
@@ -532,3 +536,399 @@ code, or TTL constant, so **no data migration is required**. (See
 [`error-codes.md`](error-codes.md), [`access-control.md`](access-control.md),
 [`threat-model.md`](threat-model.md), [`upgrade-guide.md`](upgrade-guide.md) and
 [`benchmarks.md`](benchmarks.md) for the before/after detail.)
+
+## 17. Test compromised feeder data (Issue #1054)
+
+The Identity defences added across this Wave all share one adversary: a
+**compromised feeder** — an oracle that is still an *authorized* entry in the
+registry (so no allowlist or interface-version check stops it) but whose
+`get_payer_data` payload is attacker-controlled. Individually the defences
+(#1050 freshness, #1052 monotonicity, #1053 duplicate cap, #1047 quorum,
+#1048 circuit breaker, #1046 feeder authorization) were built and, for some of
+them, unit-tested — but there was no focused suite that framed them as *one*
+threat and proved, end to end, that a hostile payload from a registered feeder
+cannot open the funding gate. The `test_1046_*` / `test_1052_*` / `test_1053_*`
+cases also live only in `tests_oracle_freshness.rs`, which is **not declared** in
+`lib.rs` (`mod tests_oracle_freshness;` is absent), so those cases never compiled
+or ran (the #1046 write-path authorization separately has live coverage in the
+`contracts/tests/` integration suite).
+
+This PR adds a focused, adversarial suite in the **registered**
+`tests_oracle_registry.rs` module that drives each defence with a hostile
+payload and pins the expected outcome, plus a cost benchmark.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Compromised-feeder threat model | covered only implicitly, by separate feature tests | 9 focused tests in `tests_oracle_registry.rs` (`test_1054_*`) that frame one adversary against every defence |
+| Lone rogue feeder | untested | quorum 2-of-3 with one rogue claiming *verified* → `fund_invoice` returns `PayerUnverified`; diagnostic reports `QuorumDisagreement` |
+| Rogue feeder goes silent / reverts | untested | an honest quorum still funds (reverting feeder contributes "no opinion" via `try_invoke_contract`) — availability is not held hostage |
+| Compromised **majority** | untested | documented boundary: the quorum is legitimately satisfied, so funding *succeeds*; only governance `remove_identity_oracle` restores safety (both legs asserted) |
+| Stale replay | defence from #1050; no adversarial test | fresh → advance past the window → `OracleDataStale` |
+| Future-dated clock skew | defence from #1050; no adversarial test | a timestamp ahead of the current ledger is rejected as stale |
+| Timestamp regression | tested only in the orphaned `tests_oracle_freshness.rs` (never compiled) | regression → `OracleTimestampRegression` |
+| Frozen snapshot (duplicate) | tested only in the orphaned `tests_oracle_freshness.rs` (never compiled) | one identical timestamp over `MAX_CONSECUTIVE_DUPLICATE_UPDATES` → `OracleDuplicateUpdate` |
+| Quarantine / rollback | untested | repeated rejected `fund_invoice` calls cannot advance the breaker (they roll back); the permissionless `check_oracle_verification` keeper path commits the streak and trips it → `OracleCircuitOpen` |
+| Rogue feeder joining the quorum | untested | `add_identity_oracle` / `set_identity_quorum` are admin-only → `Unauthorized` for an imposter |
+| Coverage location | the `test_1046_*`/`test_1052_*`/`test_1053_*` cases sit in an **undeclared** module and never run | the #1054 suite is in the **declared** `tests_oracle_registry` module, so it is compiled and executed by `make test-invoice` |
+| Cost measured | unmeasured | `tests_benchmarks.rs` `benchmark_compromised_feeder_rejection_paths` — one budget-checked row per rejection branch (stale replay, clock skew, regression, frozen snapshot, quorum disagreement) against the honest baseline |
+
+**Behaviour.** No contract behaviour changes: this issue is test- and
+documentation-only. Every assertion exercises existing code — the shared
+`oracle_registry::evaluate_identity_verification` gate (and its
+`check_oracle_verification` diagnostic, #1049), `check_identity_quorum` (#1047),
+the freshness/monotonicity/duplicate predicates (#1050/#1052/#1053), the circuit
+breaker (#1048), and the admin-gated identity registry (#1047). The suite also
+records the one case no on-chain rule can cover: when a **majority** of
+registered feeders is compromised the quorum is genuinely met, so the gate
+correctly *cannot* distinguish it from honest agreement — recovery there is a
+governance action (`remove_identity_oracle`), and the test asserts exactly that
+boundary rather than pretending otherwise. Reusing the existing
+`MockRegistryOracle` / `MockRevertingOracle` fixtures keeps the change purely
+additive.
+
+**Migration.** Test- and documentation-only: no storage key, value encoding,
+error code, ABI, or TTL constant changed, so **no data migration is required**
+and no deployed state is affected. Operators should note the operational
+consequence surfaced by the quarantine test — a compromised feeder is only
+*contained* (by the breaker) via the permissionless `check_oracle_verification`
+keeper path, never by a rejected `fund_invoice` (whose writes roll back) — so
+keepers must run that diagnostic continuously. See
+[`oracle-design.md`](oracle-design.md),
+[`oracle-attack-economics.md`](oracle-attack-economics.md),
+[`oracle-provider-vetting.md`](oracle-provider-vetting.md),
+[`threat-model.md`](threat-model.md) and [`benchmarks.md`](benchmarks.md) for the
+before/after detail.
+
+## 18. Expose oracle health and quorum (Issue #1055)
+
+Answering the operational question "is oracle gating for this feed + token
+healthy?" required an off-chain probe to know and fan out across **five**
+separate read entry points — `get_oracle_health`, `is_oracle_circuit_tripped`,
+`get_circuit_recovery_state`, `get_identity_oracles`, `get_identity_quorum` —
+and, worse, the *live* health of a multi-oracle Identity quorum (the #1047 trust
+model) had **no reader at all**. `check_identity_quorum` deliberately never
+writes the single-oracle `OracleHealth` key (the quorum models *N* oracles per
+feed + token, not one), so once a quorum list is registered `get_oracle_health`
+reports `None` forever — the exact blind spot a monitoring page cannot afford,
+and the action item already recorded in
+[`game-day-exercise-execution.md`](game-day-exercise-execution.md) ("Add oracle
+state visibility to `/health` endpoint").
+
+The fix is additive and follows the ADR-010 "never-erroring diagnostic
+entrypoint" pattern established by `check_oracle_health` (#532) and extended by
+`check_oracle_verification` (#1049): expose the state through permissionless
+views that read (and, for the quorum, re-probe) rather than mutate.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Configuration + health reads | five separate entry points, each of which the probe must know and call | one aggregate `get_oracle_status(feed_type, token)` returns `OracleStatusView`: resolution, last recorded `OracleHealthStatus`, breaker flag, half-open `CircuitRecoveryState`, Identity feeder list + threshold, and price sources |
+| Live quorum health | **no reader** — in quorum mode `OracleHealth` is never written, so `get_oracle_health` is permanently `None` | permissionless `check_identity_quorum_health(feed_type, token, payer)` returns `IdentityQuorumHealth`: one `FeederHealth` observation per registered feeder (`Verified` / `Unverified` / `Stale` / `Unreachable`) plus `verified_count`, `required_quorum` and the resulting `quorum_met` verdict |
+| Gate / diagnostic agreement | n/a (no reader existed) | the funding gate `check_identity_quorum` and the new diagnostic both classify each feeder through one shared helper, `oracle_registry::classify_identity_feeder`, so they can never disagree about *why* a feeder did or didn't count |
+| Reverting / silent feeder | n/a | degrades to `FeederHealth::Unreachable` ("no opinion") via the non-panicking `try_invoke_contract`, mirroring the gate — the probe never aborts on one bad feeder |
+| Cross-contract calls / writes | n/a | `get_oracle_status` performs **none** (pure local reads — cheap, high-frequency, and safe while paused); `check_identity_quorum_health` performs the live fan-out, bounded by `MAX_IDENTITY_ORACLES_PER_FEED` (20) |
+| Authorization | funding is LP-only, sweep is admin-only | both views are **permissionless** (no `require_auth`), mirroring `check_oracle_health`; neither has a write side effect |
+| Regression coverage | none | `tests_oracle_registry.rs` `test_1055_*` (10 cases): unconfigured feed, recorded health, open breaker + recovery, quorum configuration round-trip, per-feeder observations, unreachable feeder, the `age == max_age` ledger boundary, empty-list legacy fallback, read-only proof, and pause-safe / no-auth |
+| Cost measured | unmeasured | `tests_benchmarks.rs` `benchmark_oracle_status_and_quorum_exposure` — the three `get_oracle_status` states plus `check_identity_quorum_health` at 1 / 5 / 20 feeders, every row budget-checked |
+
+**Behaviour.** `oracle_registry::get_oracle_status` composes already-recorded
+local state into one `#[contracttype]` view; it calls no oracle and writes
+nothing, so it is safe to poll at any frequency and while the contract is
+paused. `oracle_registry::check_identity_quorum_health` reads the registered
+feeders and threshold, classifies each feeder with
+`classify_identity_feeder` — the *same* predicate the funding gate's
+`check_identity_quorum` now calls — and returns the per-feeder observations plus
+`quorum_met` (`active && verified_count >= required_quorum`, always `false` when
+the feeder list is empty so the single-oracle chain governs). Existing funding
+behaviour is byte-for-byte unchanged: the only edit to a live path is the
+quorum loop's internally-extracted call to the shared predicate, which produces
+the identical count. The change is additive — two new entry points and two new
+`#[contracttype]` views — with **no new storage key** and no change to any
+existing key, value encoding, error code, or TTL constant, so **no data
+migration is required**.
+
+**Migration.** None required. Operators gain a one-call `/health` probe
+(`get_oracle_status`) and a live quorum-health probe
+(`check_identity_quorum_health`); neither needs a keeper/reconfiguration step and
+neither changes funding, the breaker, or any recorded state. See
+[`oracle-design.md`](oracle-design.md),
+[`oracle-integration.md`](oracle-integration.md),
+[`access-control.md`](access-control.md),
+[`threat-model.md`](threat-model.md), [`upgrade-guide.md`](upgrade-guide.md) and
+[`benchmarks.md`](benchmarks.md) for the before/after detail.
+
+## 19. Document fail-closed oracle behavior (Issue #1056)
+
+Earlier wave-9 oracle entries each landed one defence — freshness (#1050),
+monotonicity (#1052), duplicate bounding (#1053), feeder authorization (#1046),
+quorum agreement (#1047), breaker recovery (#1048), failure observability
+(#1049), compromised-feeder coverage (#1054), and health/quorum exposure
+(#1055) — but the **overall disposition they share was never stated in one
+place**: once an Identity oracle is configured, the gate is *fail-closed*, and
+every way of failing to positively verify a payer rejects funding instead of
+falling through to the historical fail-open default. This section documents that
+contract explicitly and pins it with regression tests, so the guarantee is a
+specified, tested behaviour rather than an emergent property of nine separate
+fixes.
+
+**Corrected evidence pointer.** The audit evidence cites
+`lib.rs:3832-3847` as the fail-closed oracle code path. Those lines are the
+dispute-resolution ("Upheld") refund loop — they contain **no oracle logic**.
+The real fail-closed path is `fund_invoice`'s `require_oracle_verification`
+block (`lib.rs:2656-2711`), which delegates the entire decision to
+`oracle_registry::evaluate_identity_verification`
+(`oracle_registry.rs:1305`). This section is grounded in that path; no code fix
+is implied by the citation, only the corrected reference.
+
+| | Baseline (`origin/dev` / pre-#1056 docs) | This PR |
+|---|---|---|
+| Where fail-closed is described | scattered across nine per-issue notes; the end-to-end disposition (fail-closed once configured; fail-open only when unconfigured) is never stated together | one explicit statement of the disposition in [`oracle-design.md`](oracle-design.md) + this section, with the exact outcome → error mapping |
+| Audit evidence pointer | `lib.rs:3832-3847` cited as the oracle path (it is dispute resolution) | corrected to `fund_invoice`'s `require_oracle_verification` block (`lib.rs:2656-2711`) → `evaluate_identity_verification` (`oracle_registry.rs:1305`) |
+| Outcome → error mapping | implicit in `fund_invoice`'s `match` | documented as a table: `Stale → OracleDataStale`, `QuorumDisagreement → PayerUnverified`, `TimestampRegression → OracleTimestampRegression`, `DuplicateUpdate → OracleDuplicateUpdate`, `CircuitOpen → OracleCircuitOpen`, `Unverified → PayerUnverified`, `Verified → Ok` (funds) |
+| Fail-open exception | "no oracle → all pass" noted, but not tied to the gate's `Unconfigured` branch | documented as the **only** fail-open path: no per-token override, no feed-type default, no legacy `price_oracle` (`IdentityQuorumOutcome::NotConfigured` + `OracleResolution::Unconfigured → Verified`) |
+| Error precedence | documented per issue | documented as the fixed order `CircuitOpen → TimestampRegression → DuplicateUpdate → Stale → Unverified`, reached by the shared helper and therefore identical for the gate and the diagnostic |
+| Rejection atomicity | implied by Soroban rollback semantics | tested: a rejected `fund_invoice` leaves the invoice `Pending` **and** rolls back the health snapshot it wrote (the reason the #1049 diagnostic must be the never-erroring path) |
+| Authorization interaction | not stated together | tested: oracle verification is a *precondition*, never a substitute for the funder's `require_auth` — with authorizations stripped, `fund_invoice` still fails |
+| Regression coverage | per-issue suites only (`test_1049_*`, `test_1050_*`, `test_1052_*`, `test_1053_*`, `test_1054_*`, `test_1055_*`) | `tests_oracle_registry.rs` `test_1056_*` (9 cases) covering success, the fail-open exception, unverified, quorum disagreement, the exact staleness ledger boundary, frozen/duplicate, rejection atomicity, gate/diagnostic agreement, and the authorization interaction |
+| Cost measured | unchanged code path | no new branch — the gate and its per-branch cost are already measured by `benchmark_compromised_feeder_rejection_paths` (#1054) and `benchmark_oracle_verification_diagnostic_events` (#1049); see §17/§16 and [`benchmarks.md`](benchmarks.md) |
+
+**Behaviour.** This issue adds **no new contract behaviour** — it documents and
+pins what the gate already does. The disposition is: (1) if nothing is
+configured for the `(feed type, token)`, the gate is fail-open (`Verified`), the
+historical default, preserved byte-for-byte; (2) if anything is configured, a
+payer funds only on a positive, fresh verification, and every non-positive
+outcome of `evaluate_identity_verification` maps to a `ContractError` on
+`fund_invoice` exactly as it did before. The mapping and its precedence
+(`CircuitOpen` before `TimestampRegression` before `DuplicateUpdate` before
+`Stale` before `Unverified`) live in the one shared helper, so the funding gate
+and the permissionless `check_oracle_verification` diagnostic can never
+disagree. Because a rejected `fund_invoice` returns `Err`, its writes and events
+roll back — a rejection is atomic and leaves no invoice or health trace, which
+is precisely why the diagnostic exists (#1049). Oracle verification is a
+precondition on top of, never a replacement for, the funder's `require_auth`.
+No storage key, value encoding, error code, event, entry-point signature, or TTL
+constant is touched, so **existing funding behaviour and integrations are
+unchanged**.
+
+**Migration.** None required. The change is documentation plus regression tests;
+no operator action, keeper step, reconfiguration, or data backfill is needed.
+See [`oracle-design.md`](oracle-design.md),
+[`oracle-integration.md`](oracle-integration.md) and
+[`threat-model.md`](threat-model.md) for the added fail-closed documentation, and
+[`benchmarks.md`](benchmarks.md) (§ Compromised-feeder rejection-path cost) for
+the measured per-branch baseline this section relies on.
+
+## 20. Benchmark worst-case queue insertion (Issue #1057)
+
+Follow-up to §5 (Issue #1062): the max-size *retention* cost was measured, but
+`join_fund_queue`'s **admission** cost at the bound was not measured across
+positions. #1062's reproduction filled the queue with *equal* scores, so every
+admitted joiner was forced to `insert_pos = 0` — a single point that cannot
+distinguish a head insert from a tail insert, cannot aim at the middle, and
+cannot exercise the `QueueFull` rejection branch. The audit asks for the
+*worst case* explicitly, and equal scores cannot demonstrate where it is.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Admission cost at `MAX_FUND_QUEUE_LEN` | one point only (equal-score, forced index 0) | position sweep: head (index 0), middle (index 25), tail (index 49) |
+| `QueueFull` rejection branch measured | no | `join_fund_queue_rejected_at_max` (tail-score joiner, `try_*` → `QueueFull`) |
+| Duplicate-scan vs. insert-scan vs. re-serialize separated | not distinguished | sweep makes the row deltas attributable (same O(n) scans, differing shift + write position) |
+| Where the worst case actually is | assumed to be the head | measured: rows are near-flat; cost is dominated by the serialized entry size at the bound, not the insertion index; head insert is marginally the worst *admitted* case |
+| Behavioural coverage of positioning/displacement | equal-score only (`test_max_queue_size_*`) | `tests_storage.rs` `test_1057_*` (6 cases): head displacement, middle placement, tail+1 admission boundary, exact-tail-score rejection with queue-unchanged, stripped-auth rejection, and `FundQueueOpenedAt` non-reset on a displacing re-join |
+
+**Behaviour.** Unchanged — this issue adds **no new contract behaviour**. The
+change is a benchmark plus regression tests over the existing
+`join_fund_queue` path. The measured disposition is: at the bound, a joiner
+that strictly outscores the tail is admitted (displacing the tail and emitting
+`fund_queue_displaced`), and a joiner at or below the tail score is rejected
+with `QueueFull`; the insertion index does not materially change cost because
+the host-native `Vec::insert` shift is negligible beside the full-queue
+re-serialize (`save_fund_queue`) and the `extend_ttl` host call. The
+`FundQueueOpenedAt` MEV marker (#MEV-1) is set on the first join only
+(`try_set_fund_queue_opened_at`), so a displacing re-join never resets the
+resolution maturity gate. No storage key, value encoding, error code, event,
+entry-point signature, or TTL constant is touched, so **existing admission
+behaviour and integrations are unchanged**.
+
+**Migration.** None required. The change is measurement plus regression tests;
+no operator action, keeper step, reconfiguration, or data backfill is needed.
+See [`benchmarks.md`](benchmarks.md) (§ Worst-case queue insertion) for the
+run command and the head/middle/tail/reject table, and §5 above for the
+retention-cost baseline this section complements.
+
+## 21. Bound queue resolution CPU cost (Issue #1058)
+
+Follow-up to §5 (Issue #1062) and companion to §20 (#1057): the *insertion*
+side of the queue is now bounded and swept, but the *resolution* side's cost had
+a stale claim and an undeclared bound. `resolve_fund_queue`'s doc comment still
+advertised it as O(1); Issue #708's fairness fix had already added a scan of the
+contiguous top-score tie prefix (`queue[0..tied_count]`) to pick uniformly among
+ties, making it O(tied_count) — worst case, every entry tied, the whole queue.
+That loop's bound was neither declared in the #1065 resource envelope (which
+covered stored collections, not this per-invocation loop) nor measured as a
+worst case: the #1062 resolve benchmark ran an all-tied full queue only
+incidentally (its LPs share the default score) and never isolated the scan.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| `resolve_fund_queue` complexity claim | doc comment says O(1) — stale since #708 | corrected on the code path: O(tied_count), bounded by the queue length |
+| Tie-scan bound declared | no — the #1065 envelope covered stored collections only | `storage::RESOURCE_ENVELOPE` entry `queue_resolution_tie_fanout` → `constants::MAX_FUND_QUEUE_LEN` |
+| Worst case isolated | all-tied queue resolved incidentally by #1062, unlabelled | `benchmark_queue_resolution_cpu_cost_at_cap` measures both extremes at the cap: all-tied (fan-out = 50) vs distinct (fan-out = 1) |
+| Resolution outcomes pinned | adjacency to other suites only | `tests_storage.rs` `test_1058_*` (7 cases): all-tied winner is a tied member, distinct → unique top score, idempotent re-resolve, empty queue → `NotFunded`, exact maturity boundary (`QueueNotMature` at delay−1, resolves at delay), permissionless invocation (auth stripped), and the declared-cap ↔ max-fan-out equality |
+
+**Behaviour.** Unchanged — this issue adds **no new contract behaviour**. The
+change is a corrected doc comment, one declarative envelope entry (a `(name,
+cap)` pair referencing the enforcing constant, never a literal), a benchmark,
+and regression tests. Resolution still: rejects an empty queue with `NotFunded`;
+fails closed with `QueueNotMature` until `QUEUE_DELAY_LEDGERS` have elapsed since
+the first join (#MEV-1); scans the contiguous top-score prefix and picks
+uniformly among ties (#708); records the winner and is idempotent on re-call; and
+requires no authorization. The measured disposition is that the tie scan's two
+extremes are close — it is cheap in-memory `Vec` reads beside the queue load and
+the resolution write + TTL extension — and its cost can never exceed reading the
+whole queue, which the declared cap bounds. No storage key, value encoding, error
+code, event, entry-point signature, or TTL constant is touched, so **existing
+resolution behaviour and integrations are unchanged**.
+
+**Migration.** None required. The change is a declarative bound, a benchmark,
+and regression tests; no operator action, keeper step, reconfiguration, or data
+backfill is needed. See [`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+for the envelope entry and [`benchmarks.md`](benchmarks.md) (§ Queue resolution
+CPU cost) for the run command and the all-tied/distinct table.
+
+## 22. Bound unresolved request storage growth (Issue #1059)
+
+Companion to §20 (#1057) and §21 (#1058): the queue's *live* length is bounded
+(`MAX_FUND_QUEUE_LEN` = 50) and both its insert and resolve *costs* are now
+declared and measured. What remained undeclared is that the bound is also a
+*retention* bound. An unresolved request keeps `DataKey::FundQueue(u64)` (up to
+50 `LpFundRequest` records) plus `DataKey::FundQueueOpenedAt(u64)` in persistent
+storage, and **nothing removes them on the terminal paths** —
+`resolve_fund_queue` writes a `QueueResolution` but does not delete the queue,
+and `cancel_invoice`/`expire_invoice` only rewrite the invoice. The footprint is
+therefore reclaimed only by TTL expiry, and §3's claim that "queues drain as
+invoices resolve, are funded or are cancelled" was inaccurate.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Retained-footprint bound declared | no — `fund_queue_entries` declared the *live* length only | `storage::RESOURCE_ENVELOPE` entry `unresolved_queue_retained_entries` → `constants::MAX_FUND_QUEUE_LEN` |
+| Retention behaviour pinned | not tested; §3 asserted queues "drain" on resolve/fund/cancel | `tests_storage.rs` `test_1059_*` (7 cases): footprint sits at the cap, does not grow under churn, resolution does **not** drain it, cancellation does **not** drain it, a full queue rejects beyond the bound without growth, an existing LP cannot re-join to inflate it, an unauthorized join cannot create storage, and retention survives the maturity ledger boundary |
+| Footprint cost measured | not measured at all | `benchmark_unresolved_queue_storage_footprint` churns a full unresolved queue (repeated displacing joins) and resolves it, asserting each step against the absolute ceilings |
+| §3 "queues drain" claim | inaccurate (no key is ever removed) | corrected: reclaimed by TTL only |
+
+**Behaviour.** Unchanged — this issue adds **no new contract behaviour**. The
+change is one declarative envelope entry (a `(name, cap)` pair referencing the
+enforcing constant, never a literal), a benchmark, regression tests, and a doc
+correction. Resolution, cancellation, and expiry still leave the retained queue
+in place; joins and re-joins are still bounded by `MAX_FUND_QUEUE_LEN` and fail
+with `QueueFull`/`AlreadyInQueue` past the bound; an unauthorized join still
+fails before any write. No storage key, value encoding, error code, event,
+entry-point signature, or TTL constant is touched, so **existing queue
+behaviour and integrations are unchanged**.
+
+**Migration.** None required. The change is a declarative bound, a benchmark,
+regression tests, and a documentation correction; no operator action, keeper
+step, reconfiguration, or data backfill is needed. Operators sizing storage
+should note that an unresolved request's footprint is retained at the cap until
+TTL expiry, not freed on resolution — see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+for the envelope entry and [`benchmarks.md`](benchmarks.md) (§ Retained
+unresolved-queue footprint) for the run command and table.
+
+## 23. Test governance ledger-entry budget (Issue #1060)
+
+Companion to §21 (#1058) and §22 (#1059), one layer up in the admin surface.
+Every governance entry point appends to the `AdminActionLog(u32)` ring buffer
+through `access::record_admin_action`, and `get_recent_admin_actions(limit)`
+reads it back. The *stored* slots were already bounded by
+`ADMIN_ACTION_LOG_CAPACITY` (50) and declared as `admin_action_log_entries`, but
+two *per-invocation* figures were neither declared nor measured: the **write**
+budget of a single governance action, and the **read** fan-out when a caller
+passes an oversized `limit`. Nothing pinned the read cost to the cap, so the
+bound rested on an implementation detail (the `limit.min(CAPACITY).min(total)`
+clamp) that no test asserted.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Read-loop bound declared | no — `admin_action_log_entries` declared the *stored slots* only | `storage::RESOURCE_ENVELOPE` entry `governance_log_read_fanout` → `access::ADMIN_ACTION_LOG_CAPACITY` |
+| Per-action write budget | unmeasured | `benchmark_governance_ledger_entry_budget` measures a governance action appending to an empty vs. a full ring buffer — flat O(1) in both cases |
+| Read fan-out at oversized `limit` | unmeasured; clamped in code but untested | `benchmark_governance_ledger_entry_budget` measures `get_recent_admin_actions(u32::MAX)` against the absolute ceilings |
+| Budget behaviour pinned | adjacency to the #1065/#645 suites only | `tests_storage.rs` `test_1060_*` (8 cases): one action spends exactly one slot, retained slots saturate at the declared budget, newest-first order within the budget, records capture the ledger sequence across a boundary, an oversized `limit` is clamped, the wrap-boundary window is correct, an empty log reads nothing and spends no budget, and an unauthorized governance action consumes no budget |
+
+**Behaviour.** Unchanged — this issue adds **no new contract behaviour**. The
+change is one declarative envelope entry (a `(name, cap)` pair referencing the
+enforcing constant, never a literal), a benchmark, and regression tests.
+`record_admin_action` still writes slot `seq % CAPACITY` and bumps the monotonic
+`AdminActionCount`; `get_recent_admin_actions` still clamps the caller's `limit`
+to the cap and the retained total and reads newest-first; an unauthorized caller
+still fails before any write. The measured disposition is that the write is flat
+(O(1)) whether the log is empty or full — the ring buffer overwrites in place
+rather than growing — and the read with `limit = u32::MAX` costs the same as one
+at the cap, so the ledger-entry budget is bounded by `ADMIN_ACTION_LOG_CAPACITY`,
+not by the caller. No storage key, value encoding, error code, event, entry-point
+signature, or TTL constant is touched, so **existing governance behaviour and
+integrations are unchanged**.
+
+**Migration.** None required. The change is a declarative bound, a benchmark,
+and regression tests; no operator action, keeper step, reconfiguration, or data
+backfill is needed. Operators reasoning about governance-read cost should note
+that a single `get_recent_admin_actions` consumes at most
+`ADMIN_ACTION_LOG_CAPACITY` ledger entries regardless of the `limit` supplied —
+see
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065)
+for the envelope entry and [`benchmarks.md`](benchmarks.md) (§ Governance
+ledger-entry budget) for the run command and table.
+
+## 24. Reject operations exceeding resource budgets (Issue #1061)
+
+Companion to §7 (#1064) and §14 (#1047): all three bound a governance-supplied
+list whose length a *hot unrelated entry point* walks. Here the list is
+`FeeTiers`, the `Vec<(i128, u32)>` that `update_fee_tiers` stores and
+`effective_fee_rate` walks **in full** (backwards, to find the applicable
+bracket) on every settlement (`mark_paid`). The list was unbounded, so the
+per-invocation cost of the settlement path — the contract's highest-value entry
+point — was set by whatever governance stored rather than by any fixed constant.
+A compromised admin key (or a mistaken configuration) could grow `FeeTiers`
+until `mark_paid` exceeded Soroban's per-transaction resource limits and
+settlement failed for *every* invoice. Neither the bound nor its cost was
+declared or measured.
+
+| | Baseline (`origin/dev`) | This PR |
+|---|---|---|
+| Tier-list length bound | unbounded — `update_fee_tiers` stored any `Vec` length | `MAX_FEE_TIERS` (20); `update_fee_tiers` rejects a larger list with `TooManyFeeTiers` (81) before storing it |
+| Bound declared | no | `storage::RESOURCE_ENVELOPE` entry `fee_tiers_entries` → `constants::MAX_FEE_TIERS` |
+| Settlement tier-walk cost | unmeasured; scales with the stored list | `benchmark_fee_tier_budget` measures `mark_paid` with no schedule vs. a cap-sized schedule — both against the absolute ceilings |
+| Budget behaviour pinned | none | `tests_storage.rs` `test_1061_*` (6 cases): a cap-sized list is accepted, a cap+1 list is rejected and leaves the stored list unchanged, an unauthorized write consumes no config, the length check precedes the rate limit, the rate limit re-opens across the ledger boundary, and a funded invoice settles with a cap-sized schedule |
+
+**Before/after.** *Before:* `update_fee_tiers` accepted an arbitrary-length tier
+list; the per-settlement tier walk, and therefore `mark_paid`'s per-invocation
+cost, grew with it; nothing declared or measured the bound. *After:*
+`update_fee_tiers` rejects a list larger than `MAX_FEE_TIERS` (20) with
+`TooManyFeeTiers` (81) *before* storing it, so the settlement tier walk is bounded
+by a fixed constant; the bound is declared in `RESOURCE_ENVELOPE` and both the
+config write and the worst-case settlement walk are measured.
+
+**Behaviour.** Adds one rejection path: `update_fee_tiers` now returns
+`TooManyFeeTiers` (81) for a list larger than `MAX_FEE_TIERS`. The length check
+runs **after** `require_admin` (so authorization precedence is preserved) and
+**before** `check_rate_limit` (so a rejected oversized config neither consumes the
+rate-limit window nor writes state). Every other tier behaviour is unchanged:
+`effective_fee_rate` still walks the stored list backwards and applies the first
+bracket whose `min_amount <= invoice_amount`; the default schedule is unchanged;
+`FeeTiers` encoding, the `ECONOMIC_PARAM_COOLDOWN_LEDGERS` rate limit, and
+`record_admin_action` are untouched. No practical configuration is affected — a
+piecewise fee schedule needs only a handful of brackets, and the cap of 20 sits
+well above that while mirroring `MAX_PRICE_SOURCES_PER_FEED` and
+`MAX_IDENTITY_ORACLES_PER_FEED`.
+
+**Migration.** None required. The change adds a constant, an error code, one
+guard, an envelope entry, tests, and a benchmark; it does not change storage
+keys, value encodings, or existing schedules, and no data backfill or
+reconfiguration is needed. A deployment that already holds a `FeeTiers` list
+within the cap behaves identically; one that somehow holds a larger list (only
+reachable by an admin before this change) keeps working for settlement but cannot
+*extend* the list until it is reduced to the cap. Operators should note the new
+code `TooManyFeeTiers` (81) — see [`error-codes.md`](error-codes.md) — and the
+`fee_tiers_entries` envelope entry in
+[`storage-layout.md`](storage-layout.md#the-safe-resource-envelope-issue-1065);
+the run command and table are in [`benchmarks.md`](benchmarks.md) (§ Fee-tier
+budget).

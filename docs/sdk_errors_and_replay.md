@@ -22,7 +22,9 @@ All SDK errors inherit from the base `ILNError` class:
         *   `DueDateTooFar`
         *   `SelfInvoice`
         *   `AmountTooSmall`
-        *   `InvalidAddress`
+        *   `MaxInvoiceAmountExceeded`
+        *   `InvalidTwapWindow`
+        *   `InvalidAddress` *(client-side only, no on-chain code)*
         *   `BatchTooLarge`
     *   **`AuthorizationError`** — Raised when the caller does not have sufficient permissions.
         *   `Unauthorized`
@@ -49,15 +51,41 @@ All SDK errors inherit from the base `ILNError` class:
         *   `InvoiceDisputed`
         *   `OverpaymentRejected`
         *   `PayerReputationTooLow`
-        *   `InvoiceNotCancellable`
+        *   `InvoiceNotCancellable` *(client-side only, no on-chain code)*
+        *   `QueueFull`
     *   **`ContractExecutionError`** — Raised during contract execution failures.
         *   `ContractPaused`
         *   `ArithmeticOverflow`
         *   `FeeOnTransferToken`
         *   `OracleDataStale`
-        *   `InvalidTransfer`
-        *   `InsufficientAmount`
+        *   `Reentrancy`
+        *   `RateLimited` *(retry recommended)*
+        *   `QueueNotMature` *(retry recommended)*
+        *   `QueueNotStalled` *(retry recommended)*
+        *   `IncompatibleInterfaceVersion`
+        *   `OracleCircuitOpen`
+        *   `NoPriceSource`
+        *   `AllPriceSourcesRejected`
+        *   `GlobalVolumeCapExceeded`
+        *   `InvalidTransfer` *(client-side only, no on-chain code)*
+        *   `InsufficientAmount` *(client-side only, sentinel code 999)*
     *   **`NetworkError`** — Raised during transient network, RPC connectivity, or connection abort failures.
+
+### Contract error code mapping
+
+`ILNError.fromError` extracts the code from `Error(Contract, #N)` (the format Soroban emits)
+or the legacy `Error(Contract, N)` and maps it by the table in `contracts/invoice_liquidity/src/errors.rs`
+(codes 1-48; `errors.test.ts` asserts every variant). Behaviour for the remaining cases:
+
+*   **Unknown code** (contract newer than the SDK): a `ContractExecutionError` whose `originalCode` is the
+    code and whose message tells the caller to upgrade `@iln/sdk`. It is never silently downgraded to a
+    code-less error.
+*   **Not a contract error** (and not transient): a base `ILNError` carrying the original message.
+*   **Other contracts** (`reputation_bonus`, `iln_distribution`, ... ) have their own `ContractError`
+    numbering; their codes are **not** interpreted by this mapping and a clash such as `Error(Contract, #2)`
+    from another contract would be mislabelled. Use `context.contractId` to tell them apart.
+*   Client-side-only errors (`InvalidAddress`, `InvalidTransfer`, `InvoiceNotCancellable`) are thrown by
+    SDK pre-checks and have `code === undefined`; before this audit they reused on-chain codes 37-39 by mistake.
 
 ### Context Metadata
 

@@ -18,3 +18,8 @@ SECURITY.md              @Keengfk/security-lead
 # Mainnet admin/multisig signer mapping — must stay in sync with the
 # on-chain signer set (see scripts/verify-admin-signers.ts, Issue #647)
 .github/mainnet-admin-signers.json  @Keengfk/contracts-team @Keengfk/security-lead
+
+# Malware indicator guard: changes need maintainer review
+.github/workflows/malware-indicators.yml        @Keengfk/maintainers
+.github/malware-indicators-allowlist.json       @Keengfk/maintainers
+scripts/check-malware-indicators.mjs            @Keengfk/maintainers

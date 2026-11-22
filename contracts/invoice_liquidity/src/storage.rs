@@ -54,10 +54,12 @@ pub enum DataKey {
     QueueResolvedAt(u64),
     /// Issue #645: ring-buffer slot for the admin action audit log, indexed
     /// by `seq % ADMIN_ACTION_LOG_CAPACITY`.
+    ///
+    /// NOTE: `AdminActionCount` is declared once, in the Instance Storage
+    /// block above. A second declaration previously existed here and made the
+    /// enum fail to compile (E0428); removing it restores the append-only
+    /// discriminant order used by the deployed layout.
     AdminActionLog(u32),
-    /// Issue #645: monotonically increasing sequence counter for the admin
-    /// action audit log (instance storage).
-    AdminActionCount,
 
     // Stats (Persistent)
     TotalInvoices,
@@ -197,6 +199,30 @@ pub enum DataKey {
     /// `best_score + margin` or higher, raising the economic barrier to
     /// equal-score manipulation.  Stored as a `u32` in instance storage.
     QueueTieScoreMargin,
+
+    // ── Issue #1162: initialization hardening ───────────────────────
+    /// Authoritative one-shot initialization marker. Written by `initialize`
+    /// *before* any other state is touched, so an exposed-but-uninitialized
+    /// instance fails deterministically once setup starts or completes and a
+    /// competing first caller cannot claim the admin role.
+    ///
+    /// Appended last on purpose: `#[contracttype]` encodes variants by
+    /// position, so inserting earlier would renumber every following key and
+    /// break existing storage (see `docs/storage-layout.md`).
+    Initialized,
+
+    // ── Issue #1165: invoice evidence commitment lifecycle ──────────
+    /// Versioned content commitment + verification metadata for an invoice.
+    ///
+    /// Stored separately from `Invoice`/`InvoiceCore` (like `Appeal`/
+    /// `Dispute`) so adding it does **not** change the existing invoice layout
+    /// and therefore preserves compatibility with already-stored invoices.
+    /// Appended after `Initialized` (Issue #1162) to keep the append-only
+    /// discriminant order `#[contracttype]` relies on.
+    Evidence(u64),
+    /// Maps a content-commitment digest to the invoice that first committed
+    /// it, so the same off-chain evidence cannot be financed more than once.
+    EvidenceCommitment(BytesN<32>),
 }
 
 // ----------------------------------------------------------------
@@ -243,6 +269,29 @@ pub const RESOURCE_ENVELOPE: &[(&str, u32)] = &[
     // Fund queue entries per invoice — `DataKey::FundQueue(u64)`, bounded by
     // `constants::MAX_FUND_QUEUE_LEN` (Issue #1091/#1095).
     ("fund_queue_entries", crate::constants::MAX_FUND_QUEUE_LEN),
+    // Queue-resolution tie fan-out — `resolve_fund_queue`'s top-score tie scan
+    // is a per-invocation loop over a contiguous prefix of `FundQueue(u64)`
+    // (Issue #708), so its worst case (every entry tied at the top score) is
+    // bounded by the same `constants::MAX_FUND_QUEUE_LEN` cap. Declared
+    // separately from the collection itself because it is a *loop* bound, not a
+    // stored-length bound (Issue #1058).
+    (
+        "queue_resolution_tie_fanout",
+        crate::constants::MAX_FUND_QUEUE_LEN,
+    ),
+    // Retained unresolved-queue footprint — an *unresolved* invoice keeps its
+    // `DataKey::FundQueue(u64)` (up to `MAX_FUND_QUEUE_LEN` `LpFundRequest`
+    // records) and `DataKey::FundQueueOpenedAt(u64)` in persistent storage
+    // until TTL expiry. Neither `resolve_fund_queue` nor `cancel_invoice`/
+    // `expire_invoice` removes these keys (Issue #1059), so the *retained*
+    // footprint of an unresolved request is bounded by the same
+    // `constants::MAX_FUND_QUEUE_LEN` cap — not by any drain. Declared
+    // separately from `fund_queue_entries` because this is a *retention*
+    // bound (what survives resolution), not a live-length bound.
+    (
+        "unresolved_queue_retained_entries",
+        crate::constants::MAX_FUND_QUEUE_LEN,
+    ),
     // Price sources per feed — `DataKey::PriceSources(OracleFeedType)`,
     // bounded by `constants::MAX_PRICE_SOURCES_PER_FEED` (Issue #1064).
     (
@@ -255,10 +304,27 @@ pub const RESOURCE_ENVELOPE: &[(&str, u32)] = &[
         "identity_oracles_per_feed",
         crate::constants::MAX_IDENTITY_ORACLES_PER_FEED,
     ),
+    // Fee tiers — `DataKey::FeeTiers`, a single `Vec<(i128, u32)>` bounded by
+    // `constants::MAX_FEE_TIERS` (Issue #1061). `effective_fee_rate` walks the
+    // whole list on every settlement, so the cap bounds `mark_paid`'s
+    // tier-walk cost; `update_fee_tiers` rejects an oversized list with
+    // `TooManyFeeTiers`.
+    ("fee_tiers_entries", crate::constants::MAX_FEE_TIERS),
     // Admin action audit log slots — `DataKey::AdminActionLog(u32)`, a ring
     // buffer bounded by `access::ADMIN_ACTION_LOG_CAPACITY` (Issue #645).
     (
         "admin_action_log_entries",
+        crate::access::ADMIN_ACTION_LOG_CAPACITY,
+    ),
+    // Governance audit-log read fan-out — `access::get_recent_admin_actions`
+    // loops over at most `access::ADMIN_ACTION_LOG_CAPACITY` `AdminActionLog(u32)`
+    // slots per invocation (the caller-supplied `limit` is clamped), so a single
+    // governance-log read consumes at most that many ledger entries however large
+    // a `limit` the caller passes. Declared separately from
+    // `admin_action_log_entries` because it is a *per-invocation loop* bound, not
+    // a stored-slots bound (Issue #1060).
+    (
+        "governance_log_read_fanout",
         crate::access::ADMIN_ACTION_LOG_CAPACITY,
     ),
     // Top-payers min-heap — `DataKey::TopPayersHeap`, bounded by
@@ -294,6 +360,123 @@ pub fn get_admin(env: &Env) -> Option<Address> {
 
 pub fn set_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
+}
+
+/// Issue #1162: whether the contract has already been initialized.
+///
+/// The dedicated [`DataKey::Initialized`] marker is authoritative and is
+/// written by `initialize` before any other state. We additionally treat
+/// *any* legacy initialization signal as "already initialized" so that an
+/// upgrade of a deployment created before #1162 can never re-open
+/// `initialize` and hand the admin role to a newcomer:
+///
+/// - `Admin` / `Config` / `NextInvoiceId` are all written by the historical
+///   `initialize`, so their presence in instance storage means setup ran.
+/// - `InvoiceCount` is the field the previous (buggy) idempotency guard
+///   keyed on; keeping it here preserves that signal too.
+///
+/// This is deliberately conservative — a false positive only makes a
+/// duplicate `initialize` fail closed, which is the safe direction.
+pub fn is_initialized(env: &Env) -> bool {
+    let instance = env.storage().instance();
+    instance.has(&DataKey::Initialized)
+        || instance.has(&DataKey::Admin)
+        || instance.has(&DataKey::Config)
+        || instance.has(&DataKey::NextInvoiceId)
+        || instance.has(&DataKey::InvoiceCount)
+}
+
+// ----------------------------------------------------------------
+// Initialization write-sequence snapshot (Issue #1166)
+// ----------------------------------------------------------------
+
+/// Issue #1166: a read-only snapshot of the initialization signals, so
+/// operators and indexers can *verify* that an instance is not left in a
+/// partial state (authority present without token state, or vice versa).
+///
+/// Cheap and O(1): it inspects instance keys plus the three bootstrap tokens
+/// named by `Config` — it never iterates the (unbounded) approved-token list.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitializationState {
+    /// True when *any* initialization signal is present (see [`is_initialized`]).
+    pub initialized: bool,
+    /// True when the authoritative `Initialized` marker is present.
+    pub marker_set: bool,
+    /// True when an `Admin` is recorded.
+    pub admin_set: bool,
+    /// True when a `Config` is recorded.
+    pub config_set: bool,
+    /// Number of tokens registered in the `TokenList` (`0` = none).
+    pub token_list_len: u32,
+    /// True only when the instance is fully and consistently initialized:
+    /// authority (marker + admin + config) is present *and* each of the three
+    /// bootstrap tokens is approved with decimals registered. A `false` value
+    /// on an `initialized == true` instance means a partial setup to investigate.
+    pub consistent: bool,
+}
+
+/// Whether `token` has both an approval flag and registered decimals — the two
+/// persistent writes `initialize` makes per bootstrap token.
+fn token_fully_registered(env: &Env, token: &Address) -> bool {
+    let persistent = env.storage().persistent();
+    persistent
+        .get::<DataKey, bool>(&DataKey::ApprovedToken(token.clone()))
+        .unwrap_or(false)
+        && persistent.has(&DataKey::TokenDecimals(token.clone()))
+}
+
+/// Issue #1166: whether the instance holds complete, mutually-consistent
+/// authority and bootstrap-token state. This is the post-condition of
+/// `initialize`: because a returned `Err` rolls the whole call back, a
+/// mismatch here means no partial state is ever committed.
+pub fn initialization_is_consistent(env: &Env) -> bool {
+    let instance = env.storage().instance();
+    if !(instance.has(&DataKey::Initialized)
+        && instance.has(&DataKey::Admin)
+        && instance.has(&DataKey::Config))
+    {
+        return false;
+    }
+    let has_tokens = env
+        .storage()
+        .persistent()
+        .get::<DataKey, soroban_sdk::Vec<Address>>(&DataKey::TokenList)
+        .map(|list| !list.is_empty())
+        .unwrap_or(false);
+    if !has_tokens {
+        return false;
+    }
+    match get_config(env) {
+        Some(config) => {
+            token_fully_registered(env, &config.usdc_sac_address)
+                && token_fully_registered(env, &config.eurc_sac_address)
+                && token_fully_registered(env, &config.xlm_sac_address)
+        }
+        None => false,
+    }
+}
+
+/// Build the current [`InitializationState`] snapshot (Issue #1166).
+pub fn get_initialization_state(env: &Env) -> InitializationState {
+    let instance = env.storage().instance();
+    let marker_set = instance.has(&DataKey::Initialized);
+    let admin_set = instance.has(&DataKey::Admin);
+    let config_set = instance.has(&DataKey::Config);
+    let token_list_len = env
+        .storage()
+        .persistent()
+        .get::<DataKey, soroban_sdk::Vec<Address>>(&DataKey::TokenList)
+        .map(|list| list.len())
+        .unwrap_or(0);
+    InitializationState {
+        initialized: is_initialized(env),
+        marker_set,
+        admin_set,
+        config_set,
+        token_list_len,
+        consistent: initialization_is_consistent(env),
+    }
 }
 
 pub fn get_config(env: &Env) -> Option<Config> {

@@ -195,6 +195,7 @@ describe('indexer reorg rollback-and-replay recovery', () => {
         source: createStaticLedgerHeaderSource(canonicalHeaders()),
         fetchImpl: failingFetch,
         logger: silentLogger,
+        retry: { maxAttempts: 2, initialBackoffMs: 0, maxBackoffMs: 0 },
       })
     ).rejects.toThrow('Horizon unreachable');
 

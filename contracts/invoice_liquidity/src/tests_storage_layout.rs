@@ -277,6 +277,9 @@ mod tests {
 
         let contract_id = env.register(InvoiceLiquidityContract, ());
         let client = InvoiceLiquidityContractClient::new(&env, &contract_id);
+        // Issue #1162: `initialize` now requires the admin to authorize, so
+        // satisfy that call before switching to the imposter-only mock below.
+        env.mock_all_auths();
         client.initialize(&admin, &usdc, &eurc, &xlm);
 
         let imposter = Address::generate(&env);

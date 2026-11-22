@@ -12,7 +12,7 @@
 import fs from "fs";
 import { Command } from "commander";
 import { formatError, isJsonMode } from "../format.js";
-import { loadConfig } from "../config.js";
+import { BUILTIN_NETWORKS, loadConfig, requireInvoiceContract } from "../config.js";
 
 export interface InvoiceRow {
   id: string;
@@ -87,23 +87,20 @@ async function defaultFetcher(opts: {
 }): Promise<InvoiceRow[]> {
   // Lazy-import the SDK so the CLI doesn't fail if the SDK package
   // isn't installed (e.g. in isolated unit tests of the CLI itself).
-  const { ILNClient, TESTNET_RPC_URL } = await import("@iln/sdk");
-  const { SorobanRpc } = await import("@stellar/stellar-sdk");
-
   const config = loadConfig();
-  const networkPassphrase =
-    config.network === "mainnet"
-      ? "Public Global Stellar Network ; September 2015"
-      : "Test SDF Network ; September 2015";
+  const profile = BUILTIN_NETWORKS[config.network];
+  const contractId = requireInvoiceContract(profile);
+  const { ILNClient } = await import("@iln/sdk");
+  const { Account } = await import("@stellar/stellar-sdk");
 
   const client = ILNClient.custom({
-    rpcUrl: config.rpcUrl || TESTNET_RPC_URL,
-    networkPassphrase,
-    contractId: "", // resolved from registry or config in production
+    rpcUrl: config.rpcUrl || profile.rpcUrl,
+    networkPassphrase: profile.passphrase,
+    contractId,
   });
 
   // Use a dummy source account for read-only simulations
-  const sourceAccount = new SorobanRpc.Api.Account(
+  const sourceAccount = new Account(
     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
     "0"
   );
@@ -126,18 +123,18 @@ async function defaultFetcher(opts: {
   return invoices.map((inv) => ({
     id: String(inv.id),
     state: inv.status,
-    submitter: inv.submitter,
+    submitter: inv.freelancer,
     payer: inv.payer,
-    lp: inv.lp,
+    lp: inv.funder ?? "",
     amount: String(inv.amount),
     token: inv.token,
-    yieldPct: String(inv.yieldPct ?? "0"),
-    settlementDate: inv.settlementDate ?? "",
+    yieldPct: String((inv.effectiveYieldBps ?? 0) / 100),
+    settlementDate: "",
   }));
 }
 
 export function makeExportCommand(
-  fetchInvoices: InvoiceFetcher = sdkFetcher
+  fetchInvoices: InvoiceFetcher = defaultFetcher
 ): Command {
   const cmd = new Command("export").description(
     "Export invoice data to CSV or JSON"

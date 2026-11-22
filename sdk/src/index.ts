@@ -72,6 +72,11 @@ export {
   getVetoDisableRecord,
   setMinQuorumBps,
   setMinProposalBalance,
+  pauseGovernance,
+  unpauseGovernance,
+  isGovernancePaused,
+  isProposalExecuted,
+  getExecutionNonce,
   GovernanceContractError,
 } from "./methods/governance.js";
 export {

@@ -50,6 +50,8 @@ interface HorizonContractEvent {
 
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 
+const invalidScVal = Symbol("invalid ScVal");
+
 /**
  * Decode a base-64 XDR ScVal and convert it to a plain JS value via
  * `scValToNative` from the Stellar SDK.
@@ -59,7 +61,7 @@ function decodeScVal(base64Xdr: string): unknown {
     const scVal = xdr.ScVal.fromXDR(base64Xdr, "base64");
     return scValToNative(scVal);
   } catch {
-    return null;
+    return invalidScVal;
   }
 }
 
@@ -101,7 +103,9 @@ function parseContractEventInternal(
   // Decode the topics (beyond the first which is the type) and the value
   const topics = (raw.topic || []).slice(1).map(decodeScVal);
   const value = decodeScVal(raw.value || "");
-  const body = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  if (topics.includes(invalidScVal) || value === invalidScVal) return null;
+  if (value != null && (typeof value !== "object" || Array.isArray(value))) return null;
+  const body = (value ?? {}) as Record<string, unknown>;
 
   const big = (v: unknown): bigint => {
     try { return BigInt(String(v)); } catch { return 0n; }
@@ -464,7 +468,7 @@ export function subscribe(
               try {
                 const replayStartLedger = lastProcessedLedger + 1;
                 await replay(horizon, contractId, filter, replayStartLedger, (replayEv) => {
-                  if (replayEv.pagingToken && processedTokens.has(replayEv.pagingToken)) {
+                  if (stopped || (replayEv.pagingToken && processedTokens.has(replayEv.pagingToken))) {
                     return;
                   }
                   if (matchesFilter(replayEv, filter)) {
@@ -473,12 +477,12 @@ export function subscribe(
                   trackEvent(replayEv);
                 });
               } catch (replayErr) {
-                onError?.(replayErr);
+                if (!stopped) onError?.(replayErr);
               }
             }
 
             // Final deduplication check after potential replay catch-up
-            if (event.pagingToken && processedTokens.has(event.pagingToken)) {
+            if (stopped || (event.pagingToken && processedTokens.has(event.pagingToken))) {
               return;
             }
 
@@ -520,7 +524,7 @@ export function subscribe(
   // Handle optional initial event replay
   if (filter.fromLedger !== undefined) {
     replay(horizon, contractId, filter, filter.fromLedger, (replayEv) => {
-      if (replayEv.pagingToken && processedTokens.has(replayEv.pagingToken)) {
+      if (stopped || (replayEv.pagingToken && processedTokens.has(replayEv.pagingToken))) {
         return;
       }
       if (matchesFilter(replayEv, filter)) {
@@ -536,8 +540,8 @@ export function subscribe(
         connect();
       })
       .catch((err) => {
-        onError?.(err);
         if (!stopped) {
+          onError?.(err);
           connect();
         }
       });

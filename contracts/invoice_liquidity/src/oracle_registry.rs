@@ -19,6 +19,124 @@
 //! `add_token` are: gated by `require_admin`, with governance driving it via
 //! a cross-contract proposal execution where the ILN contract's stored admin
 //! is the governance contract's own address.
+//!
+//! ─────────────────────────────────────────────────────────────────────────
+//! Registration, removal & feeder-removal invariants (Issue #1190)
+//! ─────────────────────────────────────────────────────────────────────────
+//!
+//! This section is the canonical statement of what registration
+//! (`register_oracle`, `register_token_oracle`, `add_price_source`,
+//! `add_identity_oracle`), removal (`remove_oracle`, `remove_token_oracle`,
+//! `remove_price_source`, `remove_identity_oracle`), quorum configuration
+//! (`set_identity_quorum`) and the health/staleness machinery MUST preserve
+//! about *verified prices* (`get_verified_price`) and the funding gate. It
+//! documents *observed* behaviour of this implementation (each claim is backed
+//! by a code path or a compiled test) and separates it from residual risk that
+//! is not (and cannot be) enforced on-chain. Any change to these entry points
+//! MUST keep this list true or update it deliberately.
+//!
+//! ## List separation (why registration/removal of feeders cannot alter prices)
+//!
+//! * Three independent registries live on three distinct `DataKey`s and never
+//!   alias: the single-oracle resolution chain
+//!   `OracleRegistry(feed)` / `TokenOracle(feed, token)` (the boolean Identity
+//!   gate), the multi-source `PriceSources(feed)` list (the **only** input to
+//!   `get_verified_price`), and the `IdentityOracles(feed)` quorum list (the
+//!   **only** input to `check_identity_quorum`).
+//! * `register_oracle` / `remove_oracle` / `register_token_oracle` /
+//!   `remove_token_oracle` / `add_identity_oracle` / `remove_identity_oracle` /
+//!   `set_identity_quorum` therefore cannot add, remove or reorder a price
+//!   source: `get_price_sources` and `get_verified_price` are a pure function
+//!   of `PriceSources(feed)` alone. Only `add_price_source` /
+//!   `remove_price_source` change verified prices, and both are admin-gated.
+//! * Symmetrically, `add_price_source` / `remove_price_source` /
+//!   `set_max_price_deviation_bps` do not touch any Identity feeder list, so
+//!   they cannot change the funding gate's quorum decision.
+//!
+//! ## Registration (a rogue feeder cannot join without admin)
+//!
+//! * Every mutating entry point begins with `require_admin()` and fails
+//!   `Unauthorized` before any write, and is further gated by
+//!   `check_rate_limit(.., DEFAULT_RATE_LIMIT_LEDGERS)`. In production the
+//!   stored admin is the governance contract, so each change is a proposal.
+//! * `register_oracle` / `register_token_oracle` additionally perform an
+//!   interface-version handshake (`verify_oracle_interface_version`), rejecting
+//!   an incompatible/absent implementation with `IncompatibleInterfaceVersion`.
+//! * `add_price_source` / `add_identity_oracle` deliberately do **not**
+//!   handshake — sources and feeders are queried dynamically and
+//!   non-panicking, so an incompatible/inert member can only *fail to
+//!   contribute*, never force a result. Both are idempotent (re-adding an
+//!   existing member is a no-op) and bounded per feed
+//!   (`MAX_PRICE_SOURCES_PER_FEED` → `TooManyPriceSources`;
+//!   `MAX_IDENTITY_ORACLES_PER_FEED` → `TooManyIdentityOracles`).
+//!
+//! ## Removal (cannot silently weaken a gate)
+//!
+//! * Removal entry points are unconditional: removing an address that isn't
+//!   registered is a successful no-op (the list/registration is rewritten
+//!   without it) and still emits the `*_removed` event.
+//! * `remove_oracle` / `remove_token_oracle` clear a resolution-chain entry, so
+//!   resolution falls through to the next priority level — or to *unconfigured*
+//!   (the legacy fail-open path) if nothing remains.
+//! * `remove_identity_oracle` **does not re-validate the configured quorum**
+//!   against the remaining list, so removal can leave
+//!   `get_identity_quorum() > get_identity_oracles().len()` — an unreachable
+//!   threshold. This is **fail-closed**, not a bypass: the gate can never reach
+//!   the threshold, so funding fails `PayerUnverified` until governance removes
+//!   feeders down to a reachable set or lowers the quorum. The condition is
+//!   observable via `OracleStatusView.identity_quorum` vs `identity_oracles.len()`
+//!   and via `check_identity_quorum_health`.
+//! * `remove_price_source` shrinks the sample `get_verified_price` reads: a feed
+//!   dropped to zero sources returns `NoPriceSource` (fail-closed), and to one
+//!   source returns that source unchecked (the documented single-source risk).
+//!   Removing sources can never make a price *more* authoritative.
+//!
+//! ## Stale data (cannot set a verified price)
+//!
+//! * `get_verified_price` passes `require_healthy_price_feed` first: an open
+//!   circuit breaker → `OracleCircuitOpen`; a recorded stale snapshot →
+//!   `OracleDataStale`. Both fail closed before any source is read.
+//! * Freshness is the single shared predicate `is_oracle_data_stale`
+//!   (`age >= max_age`, with future-dated timestamps treated as stale and
+//!   `max_age == 0` disabling the check), also used by `record_oracle_health`
+//!   and the quorum gate, so the recorded snapshot and a gate decision cannot
+//!   disagree about freshness.
+//!
+//! ## Rogue feeders (cannot alter verified prices)
+//!
+//! * A rogue Identity feeder can be added only by admin; once present it
+//!   affects only the Identity gate, never `get_verified_price` (separate list).
+//! * In the quorum gate, a feeder that reverts/traps/returns an undecodable
+//!   payload degrades to `FeederHealth::Unreachable` via the non-panicking
+//!   `try_invoke_contract` — "no opinion", which can never *satisfy* the
+//!   quorum. Disagreement (fewer than `N` agree) fails closed
+//!   `PayerUnverified` and emits `OracleFeederDisagreement`.
+//! * A rogue *price* source (admin-registered) is bounded by the median +
+//!   `get_max_price_deviation_bps()` outlier filter, and its exclusion emits
+//!   `PriceOutlierRejected`; with only one source it is trusted unchecked (the
+//!   documented accepted risk).
+//!
+//! ## Residual risk (verified vs. not enforced on-chain)
+//!
+//! * Single-source price feeds are trusted unchecked — cross-source protection
+//!   needs ≥2 independent sources (≥3 to single out one outlier). Not
+//!   enforceable in this module.
+//! * A compromised **majority** of Identity feeders satisfies the quorum and is
+//!   indistinguishable on-chain from honest agreement; remediation is the
+//!   admin-governance `remove_identity_oracle` action, not an on-chain rule.
+//! * After removal, a stale `OracleCircuitTripped` flag can persist if a tripped
+//!   oracle is replaced without `reset_oracle_circuit`; funding behaviour is
+//!   still correct (the replacement is never the excluded address), only the
+//!   flag is stale — see `resolve_oracle_for_verification`.
+//! * `DataKey::MinPriceQuorum` is declared in `storage.rs` but no entry point in
+//!   this module reads or writes it (out of scope for #1190) — it has no effect
+//!   on `get_verified_price` today.
+//!
+//! Verified (compiled) by: `tests_oracle_registry.rs` (the `test_1190_*` and
+//! `test_1054_*` suites) and `tests_price_deviation.rs` (the `test_1190_*`
+//! suite and the price-source CRUD suite). See `docs/oracle-design.md`
+//! § "Registration, Removal & Feeder-Removal Invariants (Issue #1190)".
+//! ─────────────────────────────────────────────────────────────────────────
 
 use soroban_sdk::{contracttype, vec, Address, Env, IntoVal, Symbol};
 
@@ -1206,21 +1324,13 @@ pub fn check_identity_quorum(
     let mut verified_count: u32 = 0;
 
     for oracle in oracles.iter() {
-        // A feeder that reverts/traps/returns an undecodable payload degrades to
-        // "no opinion" via the non-panicking `try_invoke_contract` (mirroring
-        // `query_price`) rather than aborting the whole funding call — but it
-        // still cannot contribute an agreement.
-        let result = env.try_invoke_contract::<OracleVerificationResponse, soroban_sdk::Error>(
-            &oracle,
-            &Symbol::new(env, "get_payer_data"),
-            vec![env, payer.clone().into_val(env)],
-        );
-        if let Ok(Ok(response)) = result {
-            let fresh =
-                !is_oracle_data_stale(current_ledger, response.timestamp, max_age_ledgers);
-            if response.is_verified && fresh {
-                verified_count += 1;
-            }
+        // Issue #1055: the per-feeder predicate lives in one shared helper so
+        // the gate below and the `check_identity_quorum_health` diagnostic can
+        // never disagree about *why* a feeder did or didn't count.
+        if classify_identity_feeder(env, &oracle, payer, current_ledger, max_age_ledgers)
+            == FeederHealth::Verified
+        {
+            verified_count += 1;
         }
     }
 
@@ -1415,6 +1525,236 @@ pub fn check_oracle_verification(
         .map(|c| c.max_oracle_age_ledgers)
         .unwrap_or(crate::DEFAULT_MAX_ORACLE_AGE_LEDGERS);
     evaluate_identity_verification(&env, feed_type, &token, &payer, max_age)
+}
+
+// ── Issue #1055: exposing oracle health & quorum ────────────────────────────
+//
+// Before: the answer to "is oracle gating for this feed + token healthy?" was
+// spread across five separate read entrypoints — `get_oracle_health`,
+// `is_oracle_circuit_tripped`, `get_circuit_recovery_state`,
+// `get_identity_oracles`, `get_identity_quorum` — so an off-chain `/health`
+// probe (the game-day exercise's action item) had to fan out several calls and
+// know which five to ask for. Worse, the *live* health of a multi-oracle
+// Identity quorum had no reader at all: `check_identity_quorum` deliberately
+// never writes `OracleHealth` (that key models a single oracle per feed +
+// token), so in quorum mode `get_oracle_health` reports `None` forever and a
+// silently degraded quorum was indistinguishable from an unqueried one.
+//
+// After: two additive, permissionless, never-erroring views —
+//   * `get_oracle_status` — one cheap call (no cross-contract calls, no
+//     writes) returning the whole recorded health + configuration state, and
+//   * `check_identity_quorum_health` — the missing live per-feeder health +
+//     quorum outcome, sharing `classify_identity_feeder` with the funding gate
+//     so the two can never disagree.
+//
+// Neither changes any existing entrypoint, storage key, or event, so funding
+// behaviour and every existing integration are untouched.
+
+/// Issue #1055: per-feeder health classification observed by
+/// [`check_identity_quorum_health`].
+///
+/// Mirrors exactly the predicate the funding gate applies — `check_identity_quorum`
+/// counts a feeder only when it classifies as [`FeederHealth::Verified`] — so
+/// the diagnostic can never disagree with the gate about which feeders agreed.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeederHealth {
+    /// Fresh data **and** `is_verified = true` — counts toward the quorum.
+    Verified,
+    /// Fresh data, `is_verified = false` — responded, but disagrees.
+    Unverified,
+    /// Responded, but the data is stale (or future-dated) — cannot agree.
+    Stale,
+    /// Reverted, trapped, or returned an undecodable payload — "no opinion".
+    Unreachable,
+}
+
+/// Issue #1055: live health of the registered Identity quorum for a feed +
+/// token — one entry per registered feeder, plus the resulting quorum verdict.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdentityQuorumHealth {
+    pub feed_type: OracleFeedType,
+    pub token: Address,
+    /// Registered feeders, in registration order. Empty means the multi-oracle
+    /// quorum is **not in use** and the single-oracle resolution chain governs
+    /// (mirroring [`IdentityQuorumOutcome::NotConfigured`]).
+    pub feeders: soroban_sdk::Vec<Address>,
+    /// Per-feeder observation, index-aligned with `feeders`.
+    pub observations: soroban_sdk::Vec<FeederHealth>,
+    /// Feeders that agreed (classified [`FeederHealth::Verified`]).
+    pub verified_count: u32,
+    /// Configured threshold — the `N` of `N`-of-`M`.
+    pub required_quorum: u32,
+    /// `verified_count >= required_quorum`. Always `false` when `feeders` is
+    /// empty (no quorum is in use), so a caller can treat this as "the quorum
+    /// is active *and* currently satisfied".
+    pub quorum_met: bool,
+}
+
+/// Issue #1055: one-call, permissionless snapshot of a feed + token's oracle
+/// configuration **and** its recorded health state.
+///
+/// Health and configuration were previously spread across five separate read
+/// entrypoints (`get_oracle_health`, `is_oracle_circuit_tripped`,
+/// `get_circuit_recovery_state`, `get_identity_oracles`, `get_identity_quorum`),
+/// so an off-chain `/health` probe had to know and fan out all five to answer
+/// "is this feed's oracle gating healthy?".
+///
+/// This performs **no cross-contract calls and no writes** — every field is a
+/// local read of already-recorded state — so it is cheap enough for a
+/// high-frequency health probe and safe to call at any time, including while
+/// the contract is paused. Use [`check_identity_quorum_health`] when you need
+/// the *live* per-feeder health, which necessarily queries the feeders.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleStatusView {
+    pub feed_type: OracleFeedType,
+    pub token: Address,
+    /// The oracle the circuit-agnostic priority chain currently resolves to:
+    /// per-token override → feed-type default → legacy `price_oracle`
+    /// (`Identity` only). `None` = nothing registered.
+    pub resolved_oracle: Option<Address>,
+    /// Last recorded single-oracle health snapshot, or `None` if this feed +
+    /// token has never been queried.
+    ///
+    /// Caveat: the multi-oracle Identity quorum path deliberately does not
+    /// write this key (it models one oracle per feed + token), so while a
+    /// quorum list is registered this stays `None` no matter how often
+    /// verification runs. That blind spot is exactly what
+    /// [`check_identity_quorum_health`] fills.
+    pub health: Option<OracleHealthStatus>,
+    /// Whether the circuit breaker is currently open for this feed + token.
+    pub circuit_tripped: bool,
+    /// In-progress half-open recovery of an open breaker (Issue #1048), or
+    /// `None` when nothing is recovering.
+    pub recovery: Option<CircuitRecoveryState>,
+    /// Registered Identity quorum feeders, in registration order. Empty for
+    /// non-`Identity` feeds and when the multi-oracle quorum is not in use (in
+    /// which case the single-oracle chain above governs).
+    pub identity_oracles: soroban_sdk::Vec<Address>,
+    /// Configured Identity quorum threshold — the `N` of `N`-of-`M`. A single
+    /// protocol-wide setting, reported for every feed, so only meaningful
+    /// alongside `identity_oracles` when that list is non-empty. Note
+    /// `remove_identity_oracle` does not re-validate the threshold, so removing
+    /// feeders can leave a quorum too few feeders remain to reach — comparing
+    /// this against `identity_oracles.len()` is how that state is caught.
+    pub identity_quorum: u32,
+    /// Registered price sources for this feed (cross-source deviation
+    /// checking). Empty for non-`Price` feeds.
+    pub price_sources: soroban_sdk::Vec<Address>,
+}
+
+/// Issue #1055: read the whole recorded oracle configuration + health state for
+/// `feed_type` + `token` in a single call. Permissionless; performs no
+/// cross-contract calls and writes nothing.
+pub fn get_oracle_status(env: Env, feed_type: OracleFeedType, token: Address) -> OracleStatusView {
+    OracleStatusView {
+        feed_type,
+        token: token.clone(),
+        resolved_oracle: resolve_oracle(&env, feed_type, &token),
+        health: env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleHealth(feed_type, token.clone())),
+        circuit_tripped: is_oracle_circuit_tripped(&env, feed_type, &token),
+        recovery: env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleCircuitRecovery(feed_type, token.clone())),
+        identity_oracles: get_identity_oracles(env.clone(), feed_type),
+        identity_quorum: get_identity_quorum(env.clone()),
+        price_sources: get_price_sources(env, feed_type),
+    }
+}
+
+/// Issue #1055: the single per-feeder predicate shared by the funding gate
+/// ([`check_identity_quorum`]) and the [`check_identity_quorum_health`]
+/// diagnostic, so the two can never disagree.
+///
+/// A feeder that reverts/traps/returns an undecodable payload degrades to
+/// "no opinion" via the non-panicking `try_invoke_contract` (mirroring
+/// [`query_price`](crate::oracle_registry)) rather than aborting the whole
+/// call — but it still cannot contribute an agreement.
+fn classify_identity_feeder(
+    env: &Env,
+    oracle: &Address,
+    payer: &Address,
+    current_ledger: u32,
+    max_age_ledgers: u64,
+) -> FeederHealth {
+    let result = env.try_invoke_contract::<OracleVerificationResponse, soroban_sdk::Error>(
+        oracle,
+        &Symbol::new(env, "get_payer_data"),
+        vec![env, payer.clone().into_val(env)],
+    );
+    match result {
+        // Issue #1050: the same shared freshness rule the gate and the
+        // recorded health snapshot use, so "fresh" means one thing everywhere.
+        Ok(Ok(response)) => {
+            if is_oracle_data_stale(current_ledger, response.timestamp, max_age_ledgers) {
+                FeederHealth::Stale
+            } else if response.is_verified {
+                FeederHealth::Verified
+            } else {
+                FeederHealth::Unverified
+            }
+        }
+        _ => FeederHealth::Unreachable,
+    }
+}
+
+/// Issue #1055: live per-feeder health for the Identity quorum on `feed_type` +
+/// `token`, plus the resulting quorum verdict.
+///
+/// This is the missing reader for quorum-mode health: the funding gate
+/// ([`check_identity_quorum`]) never writes the single-oracle `OracleHealth`
+/// key, so before this the *only* way to learn that one of several feeders had
+/// gone stale, unverified, or unreachable was to observe funding failing closed
+/// (which rolls its events back). The classification is produced by the same
+/// [`classify_identity_feeder`] helper the gate uses, so `verified_count` /
+/// `quorum_met` here always match what the gate decided, and `quorum_met` in
+/// turn tracks `IdentityVerificationOutcome::Verified` from
+/// [`check_oracle_verification`] (when the list is non-empty).
+///
+/// Permissionless and never-erroring: a feeder that reverts is reported as
+/// [`FeederHealth::Unreachable`] rather than propagating an error. Like
+/// [`check_oracle_health`] it writes nothing and emits nothing — the fan-out is
+/// bounded by [`MAX_IDENTITY_ORACLES_PER_FEED`], so its cost is bounded even
+/// with a full feeder list.
+pub fn check_identity_quorum_health(
+    env: Env,
+    feed_type: OracleFeedType,
+    token: Address,
+    payer: Address,
+) -> IdentityQuorumHealth {
+    let feeders = get_identity_oracles(env.clone(), feed_type);
+    let active = !feeders.is_empty();
+    let required_quorum = get_identity_quorum(env.clone());
+    let current_ledger = env.ledger().sequence();
+    let max_age = crate::storage::get_config(&env)
+        .map(|c| c.max_oracle_age_ledgers)
+        .unwrap_or(crate::DEFAULT_MAX_ORACLE_AGE_LEDGERS);
+
+    let mut observations = soroban_sdk::Vec::new(&env);
+    let mut verified_count: u32 = 0;
+    for feeder in feeders.iter() {
+        let health = classify_identity_feeder(&env, &feeder, &payer, current_ledger, max_age);
+        if health == FeederHealth::Verified {
+            verified_count += 1;
+        }
+        observations.push_back(health);
+    }
+
+    IdentityQuorumHealth {
+        feed_type,
+        token,
+        feeders,
+        observations,
+        verified_count,
+        required_quorum,
+        quorum_met: active && verified_count >= required_quorum,
+    }
 }
 
 /// Issue #860: circuit/health gate every price read must pass before it

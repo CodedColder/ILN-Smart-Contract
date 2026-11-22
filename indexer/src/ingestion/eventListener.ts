@@ -1,6 +1,7 @@
 import { humanizeEvents, xdr } from '@stellar/stellar-sdk';
 import type {
   EventRepository,
+  EventPosition,
   InvoiceRecord,
   IngestedEventRecord,
   ReputationUpdateRecord,
@@ -47,6 +48,20 @@ export interface EventListenerOptions {
    * divergence — the halt latch stays set until something clears it.
    */
   onReorgDetected?: (divergence: ReorgDivergence) => Promise<void>;
+  /**
+   * Rethrow when a transaction cannot be decoded instead of logging and
+   * moving on. Live streaming keeps the default (a poison transaction must
+   * not wedge the stream); historical catch-up and replay set it so a range
+   * is never reported complete with a transaction silently missing.
+   */
+  failOnTransactionError?: boolean;
+  /**
+   * Advance the live stream cursor with each transaction (default true).
+   * Historical catch-up turns this off: it keeps its own range checkpoint,
+   * and moving the live cursor back to a backfilled ledger would make the
+   * stream re-read everything after it.
+   */
+  persistLiveCursor?: boolean;
 }
 
 const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
@@ -77,6 +92,8 @@ export class EventListener {
   private readonly maxBackoffMs: number;
   private readonly reorgDetector: LedgerReorgDetector | undefined;
   private readonly onReorgDetected: ((divergence: ReorgDivergence) => Promise<void>) | undefined;
+  private readonly failOnTransactionError: boolean;
+  private readonly persistLiveCursor: boolean;
   private stopped = false;
   /**
    * Set whenever a record was skipped because ingestion was halted for a
@@ -99,6 +116,8 @@ export class EventListener {
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.reorgDetector = options.reorgDetector;
     this.onReorgDetected = options.onReorgDetected;
+    this.failOnTransactionError = options.failOnTransactionError ?? false;
+    this.persistLiveCursor = options.persistLiveCursor ?? true;
   }
 
   stop(): void {
@@ -249,70 +268,155 @@ export class EventListener {
       }
     }
 
-    let processedSuccessfully = false;
-
+    let decodedEvents: DecodedContractEvent[];
     try {
-      const decodedEvents = this.decodeTransactionEvents(record).filter(
+      decodedEvents = this.decodeTransactionEvents(record).filter(
         (event) => event.contractId === this.contractAddress
       );
-
-      for (let index = 0; index < decodedEvents.length; index += 1) {
-        const event = decodedEvents[index];
-        const payload = toRecordPayload(normalizeJsonValue(event.data));
-        const invoiceId = coerceNullableNumber(payload.invoice_id);
-        const existingInvoice = invoiceId === null ? undefined : this.repository.getInvoice(invoiceId);
-        const processed = normalizeProcessedEvent(event, record, index, existingInvoice, payload);
-
-        // Upsert the parent invoice row BEFORE the child event row so the
-        // events.invoice_id -> invoices(id) foreign key holds when foreign
-        // keys are enforced (production enables them via getDb()).
-        if (processed.invoiceRow) {
-          this.repository.upsertInvoice(processed.invoiceRow);
-        }
-
-        if (processed.reputationUpdateRow) {
-          this.repository.insertReputationUpdate(processed.reputationUpdateRow);
-        }
-
-        if (processed.insuranceEnrollmentRow) {
-          this.repository.insertInsuranceEnrollment(processed.insuranceEnrollmentRow);
-        }
-
-        if (processed.insurancePremiumRow) {
-          this.repository.insertInsurancePremium(processed.insurancePremiumRow);
-        }
-
-        if (processed.insuranceClaimRow) {
-          this.repository.insertInsuranceClaim(processed.insuranceClaimRow);
-        }
-
-        this.repository.insertEvent(processed.rawEvent);
-
-        this.logger.info(
-          `processed ${processed.rawEvent.contract_event_type ?? processed.rawEvent.event_type} at ledger ${processed.rawEvent.ledger} (tx ${record.hash})`
-        );
-      }
-
-      processedSuccessfully = true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`failed to process transaction ${record.hash}: ${message}`);
+      if (this.failOnTransactionError) {
+        throw error instanceof Error ? error : new Error(message);
+      }
+      return;
     }
 
-    if (processedSuccessfully) {
-      this.repository.setState(LAST_CURSOR_STATE_KEY, record.paging_token);
-      this.repository.setState(LAST_LEDGER_STATE_KEY, String(record.ledger));
+    // Every row derived from this transaction and the cursor that covers it
+    // commit together: a crash or database error between them can never
+    // leave rows without a cursor or a cursor without rows. Persistence
+    // errors always propagate — the stream reconnects from the last
+    // committed cursor (live) or the range is reported failed (replay).
+    this.atomically(() => {
+      for (let index = 0; index < decodedEvents.length; index += 1) {
+        this.persistEvent(decodedEvents[index]!, record, index);
+      }
+      if (this.persistLiveCursor) {
+        this.repository.setState(LAST_CURSOR_STATE_KEY, record.paging_token);
+        this.repository.setState(LAST_LEDGER_STATE_KEY, String(record.ledger));
+      }
+    });
 
-      // Records skipped while halted were dropped from this connection;
-      // recovery re-derived them, so reopen the stream from the checkpoint
-      // rather than trusting a connection that skipped ahead. Gated on
-      // owning recovery: replay runs the same code without a recovery hook
-      // and must not be interrupted mid-replay.
-      if (this.resyncPending && this.onReorgDetected) {
-        this.resyncPending = false;
-        throw new StreamResyncSignal();
+    // Records skipped while halted were dropped from this connection;
+    // recovery re-derived them, so reopen the stream from the checkpoint
+    // rather than trusting a connection that skipped ahead. Gated on
+    // owning recovery: replay runs the same code without a recovery hook
+    // and must not be interrupted mid-replay.
+    if (this.resyncPending && this.onReorgDetected) {
+      this.resyncPending = false;
+      throw new StreamResyncSignal();
+    }
+  }
+
+  private atomically(fn: () => void): void {
+    if (this.repository.transaction) {
+      this.repository.transaction(fn);
+    } else {
+      fn();
+    }
+  }
+
+  private persistEvent(
+    event: DecodedContractEvent,
+    record: HorizonTransactionRecord,
+    index: number
+  ): void {
+    const payload = toRecordPayload(normalizeJsonValue(event.data));
+    const invoiceId = coerceNullableNumber(payload.invoice_id);
+    const existingInvoice = invoiceId === null ? undefined : this.repository.getInvoice(invoiceId);
+    const processed = normalizeProcessedEvent(event, record, index, existingInvoice, payload);
+
+    // Historical catch-up and overlapping replays can deliver an event
+    // *older* than ones already stored for the same invoice. Upserting its
+    // row would roll the invoice back in time, so store the event and then
+    // re-derive the invoice from its full history in chain order instead.
+    const position: EventPosition = {
+      ledger: record.ledger,
+      transaction_paging_token: record.paging_token,
+      event_index: index,
+    };
+    const outOfOrder =
+      processed.invoiceRow !== undefined &&
+      this.repository.hasLaterInvoiceEvent?.(processed.invoiceRow.id, position) === true;
+
+    // Upsert the parent invoice row BEFORE the child event row so the
+    // events.invoice_id -> invoices(id) foreign key holds when foreign
+    // keys are enforced (production enables them via getDb()). An
+    // out-of-order event's invoice row already exists (later events
+    // reference it), so it is re-derived after the insert instead.
+    if (processed.invoiceRow && !outOfOrder) {
+      this.repository.upsertInvoice(processed.invoiceRow);
+    }
+
+    if (processed.reputationUpdateRow) {
+      this.repository.insertReputationUpdate(processed.reputationUpdateRow);
+    }
+
+    if (processed.insuranceEnrollmentRow) {
+      this.repository.insertInsuranceEnrollment(processed.insuranceEnrollmentRow);
+    }
+
+    if (processed.insurancePremiumRow) {
+      this.repository.insertInsurancePremium(processed.insurancePremiumRow);
+    }
+
+    if (processed.insuranceClaimRow) {
+      this.repository.insertInsuranceClaim(processed.insuranceClaimRow);
+    }
+
+    this.repository.insertEvent(processed.rawEvent);
+
+    if (processed.invoiceRow && outOfOrder) {
+      const rebuilt = this.rebuildInvoiceFromHistory(processed.invoiceRow.id);
+      if (rebuilt) {
+        this.repository.upsertInvoice(rebuilt);
       }
     }
+
+    this.logger.info(
+      `processed ${processed.rawEvent.contract_event_type ?? processed.rawEvent.event_type} at ledger ${processed.rawEvent.ledger} (tx ${record.hash})`
+    );
+  }
+
+  /**
+   * Fold every stored event of an invoice, oldest first, through the same
+   * normalization live ingestion uses. The stored event timestamp stands in
+   * for the transaction's `created_at`, which is only consulted as a
+   * fallback when the contract payload omits a time field.
+   */
+  private rebuildInvoiceFromHistory(invoiceId: number): InvoiceRecord | undefined {
+    const history = this.repository.listInvoiceEvents?.(invoiceId);
+    if (!history) {
+      return undefined;
+    }
+
+    let invoice: InvoiceRecord | undefined;
+    for (const stored of history) {
+      const data = parseJson(stored.data, {});
+      const event: DecodedContractEvent = {
+        contractId: stored.contract_id,
+        rawEventType: stored.event_type,
+        contractEventType: stored.contract_event_type ?? canonicalEventType(stored.event_type),
+        topics: parseJson(stored.topics_json, []) as unknown[],
+        data,
+      };
+      const record: HorizonTransactionRecord = {
+        hash: stored.transaction_hash ?? '',
+        ledger: stored.ledger,
+        created_at: new Date(stored.timestamp * 1000).toISOString(),
+        paging_token: stored.transaction_paging_token ?? '',
+        result_meta_xdr: '',
+      };
+      const processed = normalizeProcessedEvent(
+        event,
+        record,
+        stored.event_index ?? 0,
+        invoice,
+        toRecordPayload(data)
+      );
+      invoice = processed.invoiceRow ?? invoice;
+    }
+    return invoice;
   }
 
   /**
@@ -686,6 +790,14 @@ function normalizeJsonValue(value: unknown): unknown {
   return value;
 }
 
+function parseJson(text: string, fallback: unknown): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return fallback;
+  }
+}
+
 function toRecordPayload(value: unknown): Record<string, unknown> {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     return value as Record<string, unknown>;
@@ -837,6 +949,13 @@ function canonicalEventType(rawEventType: string): string {
       return 'TwapWindowUpdated';
     case 'twap_insufficient_data':
       return 'TwapInsufficientData';
+    // Invoice evidence commitment lifecycle (Issue #1165)
+    case 'evidence_submitted':
+      return 'EvidenceSubmitted';
+    case 'evidence_verified':
+      return 'EvidenceVerified';
+    case 'evidence_rejected':
+      return 'EvidenceRejected';
     default:
       return normalized
         .split('_')
@@ -844,7 +963,7 @@ function canonicalEventType(rawEventType: string): string {
           if (part.toLowerCase() === 'lp') {
             return 'LP';
           }
-          return part ? part[0].toUpperCase() + part.slice(1) : '';
+          return part ? part.charAt(0).toUpperCase() + part.slice(1) : '';
         })
         .join('');
   }
@@ -885,6 +1004,10 @@ function inferRawEventType(contractEventType: string): string {
     TwapEnabledForFeed: 'twap_enabled',
     TwapWindowUpdated: 'twap_window_updated',
     TwapInsufficientData: 'twap_insufficient_data',
+    // Invoice evidence commitment lifecycle (Issue #1165)
+    EvidenceSubmitted: 'evidence_submitted',
+    EvidenceVerified: 'evidence_verified',
+    EvidenceRejected: 'evidence_rejected',
   };
 
   return mapping[contractEventType] ?? contractEventType.toLowerCase();

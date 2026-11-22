@@ -219,4 +219,43 @@ describe('GET /invoices', () => {
     expect(res.body.page).toBe(2);
     expect(res.body.pageSize).toBe(2);
   });
+
+  it('should cap pageSize at 100 to match GraphQL', async () => {
+    seedInvoice(db, { id: 1 });
+
+    const res = await request(app).get('/invoices?pageSize=9999');
+    expect(res.status).toBe(200);
+    expect(res.body.pageSize).toBe(100);
+  });
+
+  it('should fall back to defaults for invalid page parameters', async () => {
+    seedInvoice(db, { id: 1 });
+
+    const res = await request(app).get('/invoices?page=abc&pageSize=nope');
+    expect(res.status).toBe(200);
+    expect(res.body.page).toBe(1);
+    expect(res.body.pageSize).toBe(20);
+    expect(res.body.invoices).toHaveLength(1);
+  });
+
+  it('should not duplicate or skip rows across pages when sort keys tie', async () => {
+    seedInvoice(db, { id: 1, created_at: 1000 });
+    seedInvoice(db, { id: 2, created_at: 1000 });
+    seedInvoice(db, { id: 3, created_at: 1000 });
+    seedInvoice(db, { id: 4, created_at: 1000 });
+
+    const page1 = await request(app).get(
+      '/invoices?sortBy=createdAt&sortOrder=desc&page=1&pageSize=2'
+    );
+    const page2 = await request(app).get(
+      '/invoices?sortBy=createdAt&sortOrder=desc&page=2&pageSize=2'
+    );
+
+    const ids = [
+      ...page1.body.invoices.map((invoice: { id: number }) => invoice.id),
+      ...page2.body.invoices.map((invoice: { id: number }) => invoice.id),
+    ];
+    expect(new Set(ids).size).toBe(4);
+    expect(ids).toEqual([4, 3, 2, 1]);
+  });
 });

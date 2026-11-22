@@ -146,6 +146,61 @@ NETWORK=${NETWORK}
 SOURCE=${SOURCE}
 EOF
 
+# ── Initialize invoice_liquidity (Issue #1162) ────────────────────────────────
+# `stellar contract deploy` only installs the instance; initialization is a
+# separate, *authenticated* transaction. Leaving it to a later public window
+# would let an arbitrary first caller become admin (and thereby control fees,
+# tokens, oracle settings, pause state, upgrades and migrations), so we
+# initialize here, signed by the deployer.
+#
+#   INVOICE_LIQUIDITY_ADMIN  admin address (default: the deployer)
+#   TESTNET_XLM_SAC          native XLM SAC (default: known testnet SAC)
+#   TESTNET_USDC_SAC         USDC SAC   (default: native XLM SAC)
+#   TESTNET_EURC_SAC         EURC SAC   (default: native XLM SAC)
+#
+# If INVOICE_LIQUIDITY_ADMIN is an identity other than the deployer, the
+# deployer cannot authorize on its behalf: run the `initialize` step yourself
+# with `--source <admin-key>` (see docs/initialization-hardening.md).
+INVOICE_LIQUIDITY_ID="${CONTRACT_IDS[invoice_liquidity]}"
+DEPLOYER_ADDRESS="$(stellar keys address "${SOURCE}")"
+INIT_ADMIN="${INVOICE_LIQUIDITY_ADMIN:-${DEPLOYER_ADDRESS}}"
+XLM_SAC="${TESTNET_XLM_SAC:-CDLZ472EC4UB7SA74XCHWYVEGERSIJU224RLUXEDCXTCW6U537BC7D37}"
+USDC_SAC="${TESTNET_USDC_SAC:-$XLM_SAC}"
+EURC_SAC="${TESTNET_EURC_SAC:-$XLM_SAC}"
+
+if [[ "${INIT_ADMIN}" != "${DEPLOYER_ADDRESS}" ]]; then
+  echo "⚠️  INVOICE_LIQUIDITY_ADMIN (${INIT_ADMIN}) differs from the deployer."
+  echo "   The deployer cannot authorize on its behalf — run the initializer with"
+  echo "   the admin key instead:"
+  echo "     stellar contract invoke --network ${NETWORK} --source <admin-key> \\"
+  echo "       --id ${INVOICE_LIQUIDITY_ID} -- initialize \\"
+  echo "       --admin ${INIT_ADMIN} --usdc_token ${USDC_SAC} \\"
+  echo "       --eurc_token ${EURC_SAC} --xlm_token ${XLM_SAC}"
+else
+  echo "Initializing invoice_liquidity (${INVOICE_LIQUIDITY_ID})..."
+  set +e
+  init_output=$(stellar contract invoke \
+    --network "${NETWORK}" \
+    --source "${SOURCE}" \
+    --id "${INVOICE_LIQUIDITY_ID}" \
+    -- initialize \
+    --admin "${INIT_ADMIN}" \
+    --usdc_token "${USDC_SAC}" \
+    --eurc_token "${EURC_SAC}" \
+    --xlm_token "${XLM_SAC}" 2>&1)
+  init_status=$?
+  set -e
+  if [[ ${init_status} -ne 0 ]]; then
+    if echo "${init_output}" | grep -qiE 'AlreadyInitialized|already initialized'; then
+      echo "invoice_liquidity already initialized — skipping."
+    else
+      echo "invoice_liquidity initialization failed:" >&2
+      echo "${init_output}" >&2
+      exit 1
+    fi
+  fi
+fi
+
 cat > "${SUMMARY_FILE}" <<EOF
 {
   "network": "${NETWORK}",

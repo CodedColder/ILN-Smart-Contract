@@ -9,6 +9,7 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { StrKey } from "@stellar/stellar-sdk";
 import { encrypt, decrypt } from "./crypto.js";
 
 // ── Network profile type ─────────────────────────────────────────────────────
@@ -22,7 +23,7 @@ export interface NetworkProfile {
   rpcUrl: string;
   /** Deployed contract addresses for this network */
   contracts: {
-    invoiceLiquidity: string;
+    invoiceLiquidity?: string;
     insurancePool?: string;
     distribution?: string;
     governance?: string;
@@ -44,10 +45,7 @@ export const MAINNET_NETWORK: NetworkProfile = {
   name: "mainnet",
   passphrase: "Public Global Stellar Network ; September 2015",
   rpcUrl: "https://soroban.stellar.org",
-  contracts: {
-    // TODO: replace with actual mainnet contract IDs after deployment
-    invoiceLiquidity: "",
-  },
+  contracts: {},
 };
 
 export const FUTURENET_NETWORK: NetworkProfile = {
@@ -281,6 +279,25 @@ export function getActiveNetwork(baseDir?: string): NetworkProfile {
   const networks = getNetworks(cfg);
   const name = cfg.activeNetwork ?? "testnet";
   return networks[name] ?? TESTNET_NETWORK;
+}
+
+/** Resolve a contract address before constructing a client or making an RPC call. */
+export function requireInvoiceContract(
+  profile: NetworkProfile,
+  mainnetContractId = process.env.ILN_MAINNET_INVOICE_CONTRACT_ID,
+): string {
+  const isMainnet = profile.passphrase === MAINNET_NETWORK.passphrase;
+  const contractId = isMainnet
+    ? mainnetContractId ?? profile.contracts.invoiceLiquidity
+    : profile.contracts.invoiceLiquidity;
+
+  if (typeof contractId !== "string" || !StrKey.isValidContract(contractId)) {
+    const guidance = isMainnet
+      ? " Set ILN_MAINNET_INVOICE_CONTRACT_ID to the verified deployment address."
+      : "";
+    throw new Error(`No valid invoice liquidity contract configured for ${profile.name}.${guidance}`);
+  }
+  return contractId;
 }
 
 /**

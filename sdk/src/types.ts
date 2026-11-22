@@ -70,6 +70,12 @@ export interface InvoiceView {
   discountRate: number;
   /** Current lifecycle status string. */
   status: string;
+  /**
+   * Face amount already funded (token base units). Used by `fundInvoice` to
+   * fund only the remaining amount of a PartiallyFunded invoice. Absent
+   * means 0.
+   */
+  amountFunded?: bigint;
 }
 
 /** Allowance query parameters. */

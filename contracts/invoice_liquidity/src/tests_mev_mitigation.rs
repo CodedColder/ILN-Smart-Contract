@@ -6,14 +6,25 @@
 //!  - Second LP joining does not reset the maturity timer
 //!  - Event emitted on rejected resolution attempt (success=false)
 //!  - Event emitted on successful resolution attempt (success=true)
+//!
+//! Ledger-placement audit (bottom of file) — documented model:
+//!  - Ordering inside one ledger is irrelevant: the winner depends only on
+//!    *current* LP scores at resolution time, never on join position/ledger.
+//!  - `resolve_fund_queue` is the cut-off: joins are accepted up to (and
+//!    including) the ledger before it, even after the maturity delay elapsed.
+//!  - Once resolved, only the winner may fund, in the very same ledger.
+//!  - Before resolution there is NO exclusivity: a direct `fund_invoice` is
+//!    first-come-first-served (residual risk, pinned by a test below).
+//!  - A failed (rejected) resolve leaves no state behind.
+//!  - Pause freezes the queue but not the ledger clock.
 
 #![cfg(test)]
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger},
+    testutils::{Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, Env, IntoVal,
 };
 
 const INVOICE_AMOUNT: i128 = 1_000_000_000;
@@ -358,4 +369,330 @@ pub(crate) fn test_queue_winner_can_transfer_position_to_queue_loser() {
         Some(loser),
         "the transferred-to address must now be the recorded funder"
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Ledger-placement audit: same-ledger and delayed-transaction ordering
+// ════════════════════════════════════════════════════════════════════════════
+
+const HIGH_SCORE: u32 = 90;
+const LOW_SCORE: u32 = 20;
+
+fn set_score(t: &MevTestEnv, lp: &Address, score: u32) {
+    t.env.as_contract(&t.contract.address, || {
+        crate::storage::set_lp_score(&t.env, lp, score);
+    });
+}
+
+fn queue_lps(t: &MevTestEnv, id: u64) -> soroban_sdk::Vec<Address> {
+    t.env.as_contract(&t.contract.address, || {
+        let q = crate::storage::get_fund_queue(&t.env, id);
+        let mut out = soroban_sdk::Vec::new(&t.env);
+        for e in q.iter() {
+            out.push_back(e.lp);
+        }
+        out
+    })
+}
+
+fn advance_time(env: &Env, secs: u64) {
+    let mut info = env.ledger().get();
+    info.timestamp += secs;
+    env.ledger().set(info);
+}
+
+// ── Same-ledger ordering ─────────────────────────────────────────────────────
+
+#[test]
+fn test_same_ledger_join_order_does_not_beat_score() {
+    // lp_low joins first, lp_high joins second, both in the same ledger.
+    // Priority is by score, not by position in the ledger.
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    set_score(&t, &t.lp_a, LOW_SCORE);
+    set_score(&t, &t.lp_b, HIGH_SCORE);
+
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.join_fund_queue(&t.lp_b, &id);
+
+    let q = queue_lps(&t, id);
+    assert_eq!(q.get(0).unwrap(), t.lp_b, "higher score is placed first");
+    assert_eq!(q.get(1).unwrap(), t.lp_a);
+
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_b);
+}
+
+#[test]
+fn test_same_ledger_resolve_then_non_winner_fund_is_rejected() {
+    // Resolution and a competing fund attempt land in the same ledger: the
+    // non-winner is rejected immediately, the winner succeeds.
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    set_score(&t, &t.lp_a, HIGH_SCORE);
+    set_score(&t, &t.lp_b, LOW_SCORE);
+
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.join_fund_queue(&t.lp_b, &id);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
+
+    let sniped = t
+        .contract
+        .try_fund_invoice(&t.lp_b, &id, &INVOICE_AMOUNT, &false);
+    assert_eq!(sniped, Err(Ok(ContractError::NotApprovedFunder)));
+    assert_eq!(t.contract.get_invoice(&id).amount_funded, 0);
+
+    t.contract
+        .fund_invoice(&t.lp_a, &id, &INVOICE_AMOUNT, &false);
+    assert_eq!(t.contract.get_invoice(&id).status, InvoiceStatus::Funded);
+}
+
+#[test]
+fn test_resolve_is_not_possible_in_the_join_ledger() {
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.join_fund_queue(&t.lp_b, &id);
+    // A single-ledger join+resolve ("sandwich") is impossible.
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotMature))
+    );
+}
+
+// ── Delayed transactions ─────────────────────────────────────────────────────
+
+#[test]
+fn test_late_join_after_maturity_but_before_resolve_still_competes() {
+    // Matured != resolved. A join that lands after the delay elapsed but before
+    // anyone calls resolve is still counted; resolve is the cut-off.
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    set_score(&t, &t.lp_a, LOW_SCORE);
+    set_score(&t, &t.lp_b, HIGH_SCORE);
+
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS + 5);
+    t.contract.join_fund_queue(&t.lp_b, &id);
+
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_b);
+}
+
+#[test]
+fn test_join_delayed_past_resolution_is_rejected_and_winner_unchanged() {
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    set_score(&t, &t.lp_a, LOW_SCORE);
+    set_score(&t, &t.lp_b, HIGH_SCORE);
+
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
+
+    // lp_b's join was delayed one ledger too long.
+    advance_ledgers(&t.env, 1);
+    assert_eq!(
+        t.contract.try_join_fund_queue(&t.lp_b, &id),
+        Err(Ok(ContractError::NotApprovedFunder))
+    );
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
+    assert_eq!(queue_lps(&t, id).len(), 1);
+}
+
+#[test]
+fn test_rejected_resolve_leaves_no_state_and_later_resolve_works() {
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS - 1);
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotMature))
+    );
+    // No winner was locked in, so joining is still open ...
+    t.contract.join_fund_queue(&t.lp_b, &id);
+    // ... and the *original* timer still applies (one more ledger suffices).
+    advance_ledgers(&t.env, 1);
+    assert!(t.contract.try_resolve_fund_queue(&id).is_ok());
+}
+
+#[test]
+fn test_stale_score_snapshot_does_not_win_after_delay() {
+    // lp_a joins with a high score, then its score drops during the delay.
+    // Resolution uses *current* scores (Issue #1019), so lp_b wins.
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    set_score(&t, &t.lp_a, HIGH_SCORE);
+    set_score(&t, &t.lp_b, 60);
+
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.join_fund_queue(&t.lp_b, &id);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    set_score(&t, &t.lp_a, LOW_SCORE);
+
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_b);
+}
+
+#[test]
+fn test_resolution_is_final_even_if_scores_change_afterwards() {
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    set_score(&t, &t.lp_a, HIGH_SCORE);
+    set_score(&t, &t.lp_b, LOW_SCORE);
+
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.join_fund_queue(&t.lp_b, &id);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
+
+    set_score(&t, &t.lp_a, 1);
+    set_score(&t, &t.lp_b, 100);
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
+}
+
+// ── Residual risk: no exclusivity before resolution ──────────────────────────
+
+#[test]
+fn test_unresolved_queue_does_not_block_direct_funding() {
+    // Documented residual risk: joining the queue only *registers intent*.
+    // Until resolve_fund_queue locks a winner, any LP may fund directly
+    // (first-come-first-served), including an LP that never joined.
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    set_score(&t, &t.lp_a, HIGH_SCORE);
+
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    // lp_b (never queued) funds in the same ledger.
+    t.contract
+        .fund_invoice(&t.lp_b, &id, &INVOICE_AMOUNT, &false);
+
+    let invoice = t.contract.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Funded);
+    // The queue can no longer be resolved for a funded invoice.
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::AlreadyFunded))
+    );
+}
+
+// ── Stalled winner: recovery timing and restart of the delay ─────────────────
+
+#[test]
+fn test_recover_stalled_winner_restarts_maturity_for_remaining_lps() {
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    set_score(&t, &t.lp_a, HIGH_SCORE);
+    set_score(&t, &t.lp_b, LOW_SCORE);
+
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    t.contract.join_fund_queue(&t.lp_b, &id);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
+
+    // One ledger before the resolution TTL: not stalled yet.
+    advance_ledgers(&t.env, crate::constants::QUEUE_RESOLUTION_TTL_LEDGERS - 1);
+    assert_eq!(
+        t.contract.try_recover_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotStalled))
+    );
+
+    // At the TTL: the stalled winner is evicted.
+    advance_ledgers(&t.env, 1);
+    assert_eq!(t.contract.recover_fund_queue(&id), Some(t.lp_a.clone()));
+
+    // The delay restarts for lp_b: immediate resolve is rejected ...
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::QueueNotMature))
+    );
+    // ... and succeeds exactly after QUEUE_DELAY_LEDGERS.
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_b);
+}
+
+// ── Pause and expiry interplay ───────────────────────────────────────────────
+
+#[test]
+fn test_pause_freezes_queue_but_ledger_clock_keeps_running() {
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+
+    t.contract.pause();
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::ContractPaused))
+    );
+    assert_eq!(
+        t.contract.try_join_fund_queue(&t.lp_b, &id),
+        Err(Ok(ContractError::ContractPaused))
+    );
+
+    // Maturity is measured in ledgers, so it elapsed while paused.
+    t.contract.unpause();
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
+}
+
+#[test]
+fn test_invoice_expiring_while_queued_cannot_be_resolved() {
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+    t.contract.join_fund_queue(&t.lp_a, &id);
+
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS);
+    advance_time(&t.env, DUE_DATE_OFFSET + 1);
+
+    assert_eq!(
+        t.contract.try_resolve_fund_queue(&id),
+        Err(Ok(ContractError::InvoiceExpired))
+    );
+    assert_eq!(
+        t.contract.try_join_fund_queue(&t.lp_b, &id),
+        Err(Ok(ContractError::InvoiceExpired))
+    );
+}
+
+// ── Unauthorized / repeated ──────────────────────────────────────────────────
+
+#[test]
+fn test_join_without_lp_authorization_is_rejected_and_queue_untouched() {
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+
+    // Only lp_b authorizes; the call names lp_a.
+    t.env.mock_auths(&[MockAuth {
+        address: &t.lp_b,
+        invoke: &MockAuthInvoke {
+            contract: &t.contract.address,
+            fn_name: "join_fund_queue",
+            args: (t.lp_a.clone(), id).into_val(&t.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(t.contract.try_join_fund_queue(&t.lp_a, &id).is_err());
+    assert_eq!(queue_lps(&t, id).len(), 0);
+}
+
+#[test]
+fn test_repeated_join_by_same_lp_is_rejected_and_keeps_position_and_timer() {
+    let t = setup_mev();
+    let id = submit_invoice_mev(&t);
+
+    t.contract.join_fund_queue(&t.lp_a, &id);
+    advance_ledgers(&t.env, QUEUE_DELAY_LEDGERS - 1);
+    assert_eq!(
+        t.contract.try_join_fund_queue(&t.lp_a, &id),
+        Err(Ok(ContractError::AlreadyInQueue))
+    );
+    assert_eq!(queue_lps(&t, id).len(), 1);
+
+    // The rejected duplicate must not have restarted the timer.
+    advance_ledgers(&t.env, 1);
+    assert_eq!(t.contract.resolve_fund_queue(&id), t.lp_a);
 }

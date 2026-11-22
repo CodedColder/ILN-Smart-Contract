@@ -1,7 +1,29 @@
 /**
  * Tests for `iln export` command logic (#244, #247).
  */
-import { toCsv, toJson, filterByDate, InvoiceRow } from "../../src/commands/export";
+import { it, expect, vi } from "vitest";
+import { toCsv, toJson, filterByDate, makeExportCommand, InvoiceRow } from "../../src/commands/export";
+import * as config from "../../src/config";
+
+it("rejects an unconfigured mainnet contract through the default export command", async () => {
+  const configMock = vi.spyOn(config, "loadConfig").mockReturnValue({
+    network: "mainnet",
+    rpcUrl: config.MAINNET_NETWORK.rpcUrl,
+  });
+  vi.stubEnv("ILN_MAINNET_INVOICE_CONTRACT_ID", "");
+  const output = vi.spyOn(console, "error").mockImplementation(() => {});
+  const exit = vi.spyOn(process, "exit").mockImplementation(() => { throw new Error("exit"); });
+
+  try {
+    await expect(makeExportCommand().parseAsync(["node", "iln", "invoices", "--submitter", "GABC"])).rejects.toThrow("exit");
+    expect(output).toHaveBeenCalledWith(expect.stringContaining("ILN_MAINNET_INVOICE_CONTRACT_ID"));
+  } finally {
+    configMock.mockRestore();
+    exit.mockRestore();
+    output.mockRestore();
+    vi.unstubAllEnvs();
+  }
+});
 
 const ROWS: InvoiceRow[] = [
   {

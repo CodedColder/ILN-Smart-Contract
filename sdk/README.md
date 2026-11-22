@@ -164,8 +164,8 @@ try {
 } catch (error) {
   if (error instanceof ILNError.InvalidAmount) {
     console.error("The amount provided was zero or negative.");
-  } else if (error instanceof ILNError.InvoiceNotCancellable) {
-    console.error("This invoice has already been funded or paid.");
+  } else if (error instanceof ILNError.AlreadyFunded) {
+    console.error("This invoice has already been funded.");
   } else if (error instanceof ILNError) {
     console.error("An ILN protocol error occurred:", error.message, error.code);
   } else {

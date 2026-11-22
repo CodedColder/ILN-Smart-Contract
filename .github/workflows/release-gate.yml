@@ -1,0 +1,70 @@
+name: Contract Release Gate
+
+# Issue #1263 / #1262.
+# - Pull requests touching the gate, the Makefile or the benchmark fixtures
+#   run the toolchain-free script tests.
+# - Version tags and manual runs execute the full release gate.
+
+on:
+  pull_request:
+    paths:
+      - "Makefile"
+      - "scripts/release-gate.sh"
+      - "scripts/check_benchmark_regression.sh"
+      - "scripts/__tests__/release-gate.test.mjs"
+      - "scripts/__tests__/benchmark-baseline.test.mjs"
+      - "contracts/invoice_liquidity/benchmarks/**"
+      - "contracts/invoice_liquidity/src/tests_benchmarks.rs"
+      - "docs/benchmarks.md"
+      - ".github/workflows/release-gate.yml"
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  script-tests:
+    name: Release gate + benchmark fixture tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run script tests
+        run: node --test scripts/__tests__/release-gate.test.mjs scripts/__tests__/benchmark-baseline.test.mjs
+
+  release-gate:
+    name: Full release gate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32v1-none, x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run release gate
+        env:
+          RELEASE_GATE_FORCE: "1"
+        run: make release-gate

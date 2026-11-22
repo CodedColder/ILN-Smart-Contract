@@ -10,6 +10,41 @@ To regenerate: `cd sdk && git-cliff --config .cliff.toml`
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- `ILNError.fromError` now maps every `ContractError` variant of the invoice contract (codes 1-48).
+  Codes 37-39 were previously reported as `InvoiceNotCancellable`, `InvalidAddress` and `InvalidTransfer`
+  although on-chain they are `Reentrancy`, `RateLimited` and `QueueNotMature`; codes 40-48 were unmapped.
+- Contract errors are now recognised in Soroban's real `Error(Contract, #N)` format (the `#` form was
+  not matched before, so real failures fell through to a generic error).
+- An unknown contract code now yields a `ContractExecutionError` that keeps `originalCode` and tells the
+  caller to upgrade the SDK, instead of a code-less generic `ILNError`.
+
+- `fundInvoice` now calls `fund_invoice` with the contract's full argument list
+  (`funder, invoice_id, fund_amount, require_oracle_verification`); the oracle flag was never sent before.
+- `fundInvoice` funds only the unfunded remainder of a PartiallyFunded invoice (it previously always sent the
+  full amount, which the contract rejects with `OverfundingRejected`) and sizes the allowance check to it.
+- `fundInvoice` checks the LP's token balance against the discounted cost (`computeFundingCost`) and throws
+  `ILNError.InsufficientAmount` before signing anything, simulates `fund_invoice` before submitting an
+  `approve` (contract rejections surface as typed `ILNError`s without costing an approve fee), and treats
+  `TRY_AGAIN_LATER` as a failure instead of returning a hash. `getAllowance` accepts an optional
+  `networkPassphrase` (it was hard-coded to testnet); `getTokenBalance` is new.
+- `ILNClient.submitBatchTransaction` now refuses, before the network check or any signing, to include a call
+  whose `contractId` is not one of the client's configured contracts (`contractId`, `contracts`, or the new
+  `additionalContractIds` option) and throws a `ValidationError` naming the call. It also refuses to sign when
+  the signer declares a network passphrase (e.g. `FreighterSigner`) different from the client's. The RPC
+  passphrase check (`verifyNetwork`) already failed closed; its doc wrongly said the factories ran it.
+
+### Changed
+- **Behavior change:** batches that target contracts outside the client's configuration (typically a token
+  contract bundled with `fund_invoice`) must now list them in `additionalContractIds`.
+- Client-side-only errors `InvalidAddress`, `InvalidTransfer` and `InvoiceNotCancellable` no longer carry
+  codes 37/38/39 (`code` is `undefined`), so they cannot be confused with on-chain codes.
+  `fromError` no longer maps `Error(Contract, 999)` to `InsufficientAmount` (the contract never emits 999).
+
+---
+
 ## [0.1.0] - 2024
 
 ### Added

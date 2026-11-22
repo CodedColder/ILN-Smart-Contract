@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import type Database from 'better-sqlite3';
+import { parsePagination } from '../pagination.js';
 
 interface EventRow {
   id: number;
@@ -19,9 +20,10 @@ export function createEventsRouter(db: Database.Database): Router {
   router.get('/events', (req, res) => {
     const address = req.query.address as string;
     const typesStr = req.query.types as string | undefined;
-    const page = Math.max(1, parseInt(req.query.page as string || '1', 10));
-    const pageSize = Math.max(1, parseInt(req.query.pageSize as string || '20', 10));
-    const offset = (page - 1) * pageSize;
+    const { page, pageSize, offset } = parsePagination(
+      req.query.page,
+      req.query.pageSize
+    );
 
     if (!address) {
       res.status(400).json({ error: 'Address parameter is required' });

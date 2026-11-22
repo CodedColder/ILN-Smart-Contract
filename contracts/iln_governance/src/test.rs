@@ -1278,6 +1278,8 @@ fn test_veto_power_enabled_after_init() {
 #[test]
 fn test_disable_veto_power_succeeds() {
     let t = setup();
+    // Issue #981: an active timelock is a precondition for disabling the veto.
+    t.contract.set_execution_delay(&t.admin, &MIN_ACTIVE_TIMELOCK_LEDGERS);
     t.contract.disable_veto_power();
     assert!(!t.contract.is_veto_power_enabled());
 }
@@ -1289,7 +1291,8 @@ fn test_veto_after_disable_returns_error() {
     setup_veto_multisig(&t);
     let id = create_fee_proposal(&t);
 
-    // Governance disables veto power.
+    // Governance disables veto power (Issue #981: timelock must be active).
+    t.contract.set_execution_delay(&t.admin, &MIN_ACTIVE_TIMELOCK_LEDGERS);
     t.contract.disable_veto_power();
 
     // Admin tries to veto — must fail.
@@ -2961,6 +2964,256 @@ fn test_pre_init_calls_return_not_initialized() {
         contract.try_disable_veto_power(),
         Err(Ok(GovernanceError::NotInitialized))
     );
+    assert_eq!(
+        contract.try_pause(&Address::generate(&env)),
+        Err(Ok(GovernanceError::NotInitialized))
+    );
+    assert_eq!(
+        contract.try_unpause(&Address::generate(&env)),
+        Err(Ok(GovernanceError::NotInitialized))
+    );
+}
+
+// ── Issue #983: Prevent delay reduction from bypassing scheduled proposals ──
+
+#[test]
+fn test_delay_reduction_blocked_while_proposals_scheduled() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+
+    let mut ledger = t.env.ledger().get();
+    let voting_end = t.contract.get_proposal(&id).voting_end;
+    ledger.timestamp = voting_end + 1;
+    t.env.ledger().set(ledger);
+
+    // Schedule proposal (transitions Active -> Passed, eta_ledger = initial + 100)
+    t.contract.execute_proposal(&id);
+    let p = t.contract.get_proposal(&id);
+    assert_eq!(p.status, ProposalStatus::Passed);
+
+    // Attempting to reduce delay to 50 while current_ledger < max_scheduled_eta must fail
+    let res = t.contract.try_set_execution_delay(&t.admin, &50);
+    assert_eq!(res, Err(Ok(GovernanceError::DelayReductionBypassesScheduled)));
+
+    // Increasing delay is always safe and permitted
+    let res_inc = t.contract.try_set_execution_delay(&t.admin, &150);
+    assert!(res_inc.is_ok());
+}
+
+#[test]
+fn test_delay_reduction_allowed_after_timelock_elapsed() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+
+    let mut ledger = t.env.ledger().get();
+    let voting_end = t.contract.get_proposal(&id).voting_end;
+    ledger.timestamp = voting_end + 1;
+    t.env.ledger().set(ledger);
+
+    t.contract.execute_proposal(&id);
+
+    // Advance ledger past the timelock
+    let mut ledger = t.env.ledger().get();
+    ledger.sequence_number += 101;
+    t.env.ledger().set(ledger);
+
+    // Now delay reduction is allowed because current_ledger >= max_scheduled_eta
+    let res = t.contract.try_set_execution_delay(&t.admin, &50);
+    assert!(res.is_ok());
+    assert_eq!(t.contract.get_execution_delay(), 50);
+}
+
+#[test]
+fn test_scheduled_eta_cannot_bypass_earlier_scheduled_proposals() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+
+    let id1 = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.proposer, &id1, &true);
+    t.contract.cast_vote(&t.voter_a, &id1, &true);
+
+    let mut ledger = t.env.ledger().get();
+    let voting_end = t.contract.get_proposal(&id1).voting_end;
+    ledger.timestamp = voting_end + 1;
+    t.env.ledger().set(ledger);
+
+    t.contract.execute_proposal(&id1);
+    let p1 = t.contract.get_proposal(&id1);
+    let eta1 = p1.eta_ledger;
+
+    // Second proposal created and scheduled
+    let id2 = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.proposer, &id2, &true);
+    t.contract.cast_vote(&t.voter_a, &id2, &true);
+
+    let mut ledger = t.env.ledger().get();
+    let voting_end2 = t.contract.get_proposal(&id2).voting_end;
+    ledger.timestamp = voting_end2 + 1;
+    t.env.ledger().set(ledger);
+
+    t.contract.execute_proposal(&id2);
+    let p2 = t.contract.get_proposal(&id2);
+    // eta2 must be >= eta1, preventing bypass
+    assert!(p2.eta_ledger >= eta1);
+}
+
+// ── Issue #984: Add emergency pause semantics that cannot skip timelock ──────
+
+#[test]
+fn test_emergency_pause_blocks_execution() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &10);
+
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp += VOTING_PERIOD_SECS + 1;
+    t.env.ledger().set(ledger);
+
+    // Pause contract
+    t.contract.pause(&t.admin);
+    assert!(t.contract.is_paused());
+
+    // Execution is blocked while paused
+    let res = t.contract.try_execute_proposal(&id);
+    assert_eq!(res, Err(Ok(GovernanceError::ContractPaused)));
+}
+
+#[test]
+fn test_emergency_pause_cannot_skip_timelock_on_unpause() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp += VOTING_PERIOD_SECS + 1;
+    t.env.ledger().set(ledger);
+
+    // Schedule proposal
+    t.contract.execute_proposal(&id);
+
+    // Admin emergency pauses
+    t.contract.pause(&t.admin);
+
+    // While paused, execution fails with ContractPaused
+    let res = t.contract.try_execute_proposal(&id);
+    assert_eq!(res, Err(Ok(GovernanceError::ContractPaused)));
+
+    // Admin unpauses — but timelock has NOT elapsed yet!
+    t.contract.unpause(&t.admin);
+    assert!(!t.contract.is_paused());
+
+    // Execution MUST NOT skip timelock: returns TimelockNotExpired
+    let res_unpaused = t.contract.try_execute_proposal(&id);
+    assert_eq!(res_unpaused, Err(Ok(GovernanceError::TimelockNotExpired)));
+
+    // Advance sequence past timelock
+    let mut ledger = t.env.ledger().get();
+    ledger.sequence_number += 101;
+    t.env.ledger().set(ledger);
+
+    // Now execution succeeds
+    let res_final = t.contract.try_execute_proposal(&id);
+    assert!(res_final.is_ok());
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+#[test]
+fn test_non_admin_cannot_pause() {
+    let t = setup();
+    let non_admin = Address::generate(&t.env);
+    let res = t.contract.try_pause(&non_admin);
+    assert_eq!(res, Err(Ok(GovernanceError::Unauthorized)));
+}
+
+// ── Issue #986: Add replay protection for delayed executions ────────────────
+
+#[test]
+fn test_delayed_execution_replay_protection() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &50);
+
+    let id = create_fee_proposal(&t);
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp += VOTING_PERIOD_SECS + 1;
+    t.env.ledger().set(ledger);
+
+    t.contract.execute_proposal(&id);
+
+    let mut ledger = t.env.ledger().get();
+    ledger.sequence_number += 51;
+    t.env.ledger().set(ledger);
+
+    assert_eq!(t.contract.get_execution_nonce(), 0);
+    assert!(!t.contract.is_proposal_executed(&id));
+
+    // First execution succeeds
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+    assert!(t.contract.is_proposal_executed(&id));
+    assert_eq!(t.contract.get_execution_nonce(), 1);
+
+    // Replay attempt fails with ProposalAlreadyExecuted
+    let res = t.contract.try_execute_proposal(&id);
+    assert_eq!(res, Err(Ok(GovernanceError::ProposalAlreadyExecuted)));
+}
+
+// ── Issue #988: Require explicit consent for veto transitions ───────────────
+
+#[test]
+fn test_veto_empty_reason_hash_fails_consent() {
+    let t = setup();
+    setup_veto_multisig(&t);
+    let id = create_fee_proposal(&t);
+
+    let empty_hash = BytesN::from_array(&t.env, &[0u8; 32]);
+    let res = t.contract.try_veto_proposal(&t.admin, &id, &empty_hash);
+    assert_eq!(res, Err(Ok(GovernanceError::ConsentRequired)));
+}
+
+#[test]
+fn test_veto_reason_hash_mismatch_fails() {
+    let t = setup();
+    let signer1 = Address::generate(&t.env);
+    let signer2 = Address::generate(&t.env);
+    let signers = vec![&t.env, signer1.clone(), signer2.clone()];
+    t.contract.configure_veto_multisig(&signers, &2);
+
+    let id = create_fee_proposal(&t);
+
+    let hash_a = BytesN::from_array(&t.env, &[0xAAu8; 32]);
+    let hash_b = BytesN::from_array(&t.env, &[0xBBu8; 32]);
+
+    // Signer 1 consents with hash_a
+    t.contract.veto_proposal(&signer1, &id, &hash_a);
+    assert_eq!(t.contract.get_veto_approvals(&id).len(), 1);
+    assert_eq!(t.contract.get_veto_reason_hash(&id), Some(hash_a.clone()));
+
+    // Signer 2 tries to approve with different hash_b — fails explicit consent
+    let res = t.contract.try_veto_proposal(&signer2, &id, &hash_b);
+    assert_eq!(res, Err(Ok(GovernanceError::VetoReasonMismatch)));
+
+    // Signer 2 consents with matching hash_a — succeeds and executes veto
+    let res_ok = t.contract.try_veto_proposal(&signer2, &id, &hash_a);
+    assert!(res_ok.is_ok());
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Vetoed);
+    assert_eq!(t.contract.get_veto_reason_hash(&id), None);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3471,4 +3724,342 @@ fn test_veto_requires_configured_signer_and_signer_auth() {
         .try_veto_proposal(&t.admin, &id, &reason_hash(&t.env))
         .is_err());
     assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Active);
+}
+
+// ── Issue #981: active timelock required before veto disablement ─────────────
+
+fn pass_and_queue(t: &GovTestEnv) -> u64 {
+    let id = create_fee_proposal(t);
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp = t.contract.get_proposal(&id).voting_end + 1;
+    t.env.ledger().set(ledger);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Passed);
+    id
+}
+
+fn advance_ledgers(env: &Env, n: u32) {
+    let mut ledger = env.ledger().get();
+    ledger.sequence_number += n;
+    env.ledger().set(ledger);
+}
+
+#[test]
+fn test_disable_veto_power_rejected_without_timelock() {
+    let t = setup();
+    assert_eq!(t.contract.get_execution_delay(), 0);
+    assert_eq!(
+        t.contract.try_disable_veto_power(),
+        Err(Ok(GovernanceError::TimelockNotActive))
+    );
+    assert!(t.contract.is_veto_power_enabled());
+}
+
+#[test]
+fn test_disable_veto_power_rejected_one_ledger_below_floor() {
+    let t = setup();
+    t.contract
+        .set_execution_delay(&t.admin, &(MIN_ACTIVE_TIMELOCK_LEDGERS - 1));
+    assert_eq!(
+        t.contract.try_disable_veto_power(),
+        Err(Ok(GovernanceError::TimelockNotActive))
+    );
+    assert!(t.contract.is_veto_power_enabled());
+}
+
+#[test]
+fn test_disable_veto_power_succeeds_exactly_at_floor() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &MIN_ACTIVE_TIMELOCK_LEDGERS);
+    assert_eq!(t.contract.try_disable_veto_power(), Ok(Ok(())));
+    assert!(!t.contract.is_veto_power_enabled());
+}
+
+#[test]
+fn test_disable_veto_power_requires_iln_contract_auth() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &MIN_ACTIVE_TIMELOCK_LEDGERS);
+    // Drop the blanket auth mock: an unauthorized caller must not succeed.
+    t.env.set_auths(&[]);
+    assert!(t.contract.try_disable_veto_power().is_err());
+    assert!(t.contract.is_veto_power_enabled());
+}
+
+#[test]
+fn test_execution_delay_cannot_drop_below_floor_after_veto_disabled() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &MIN_ACTIVE_TIMELOCK_LEDGERS);
+    t.contract.disable_veto_power();
+
+    assert_eq!(
+        t.contract.try_set_execution_delay(&t.admin, &0),
+        Err(Ok(GovernanceError::TimelockNotActive))
+    );
+    assert_eq!(
+        t.contract
+            .try_set_execution_delay(&t.admin, &(MIN_ACTIVE_TIMELOCK_LEDGERS - 1)),
+        Err(Ok(GovernanceError::TimelockNotActive))
+    );
+    assert_eq!(t.contract.get_execution_delay(), MIN_ACTIVE_TIMELOCK_LEDGERS);
+
+    // Raising the delay is still allowed.
+    t.contract
+        .set_execution_delay(&t.admin, &(MIN_ACTIVE_TIMELOCK_LEDGERS * 2));
+    assert_eq!(t.contract.get_execution_delay(), MIN_ACTIVE_TIMELOCK_LEDGERS * 2);
+}
+
+#[test]
+fn test_execution_delay_can_be_lowered_while_veto_enabled() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &MIN_ACTIVE_TIMELOCK_LEDGERS);
+    t.contract.set_execution_delay(&t.admin, &0);
+    assert_eq!(t.contract.get_execution_delay(), 0);
+}
+
+#[test]
+fn test_set_execution_delay_rejects_non_admin() {
+    let t = setup();
+    let stranger = Address::generate(&t.env);
+    assert_eq!(
+        t.contract.try_set_execution_delay(&stranger, &100),
+        Err(Ok(GovernanceError::Unauthorized))
+    );
+    assert_eq!(t.contract.get_execution_delay(), 0);
+}
+
+#[test]
+fn test_set_execution_delay_before_initialize_fails_closed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract = GovContractClient::new(&env, &env.register_contract(None, GovContract));
+    let would_be_admin = Address::generate(&env);
+    assert_eq!(
+        contract.try_set_execution_delay(&would_be_admin, &0),
+        Err(Ok(GovernanceError::NotInitialized))
+    );
+}
+
+// ── Issue #982: timelock policy version persisted on proposals ───────────────
+
+#[test]
+fn test_policy_version_starts_at_one_and_bumps_on_change() {
+    let t = setup();
+    assert_eq!(t.contract.get_timelock_policy_version(), 1);
+
+    t.contract.set_execution_delay(&t.admin, &100);
+    assert_eq!(t.contract.get_timelock_policy_version(), 2);
+
+    // Re-setting the same value is not a policy change.
+    t.contract.set_execution_delay(&t.admin, &100);
+    assert_eq!(t.contract.get_timelock_policy_version(), 2);
+
+    t.contract.set_execution_delay(&t.admin, &MIN_ACTIVE_TIMELOCK_LEDGERS);
+    t.contract.disable_veto_power();
+    assert_eq!(t.contract.get_timelock_policy_version(), 4);
+}
+
+#[test]
+fn test_rejected_policy_change_does_not_bump_version() {
+    let t = setup();
+    let stranger = Address::generate(&t.env);
+    let _ = t.contract.try_set_execution_delay(&stranger, &100);
+    let _ = t.contract.try_disable_veto_power();
+    assert_eq!(t.contract.get_timelock_policy_version(), 1);
+}
+
+#[test]
+fn test_proposal_persists_creation_policy() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+    let id = create_fee_proposal(&t);
+
+    let p = t.contract.get_proposal_timelock_policy(&id).unwrap();
+    assert_eq!(p.created_version, 2);
+    assert_eq!(p.created_delay, 100);
+    assert!(p.created_veto_enabled);
+    assert!(!p.queued);
+    assert_eq!(p.applied_delay, 0);
+}
+
+#[test]
+fn test_queue_records_policy_and_eta() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+    let id = pass_and_queue(&t);
+
+    let seq = t.env.ledger().sequence();
+    let p = t.contract.get_proposal_timelock_policy(&id).unwrap();
+    assert!(p.queued);
+    assert_eq!(p.queued_version, 2);
+    assert_eq!(p.queued_ledger, seq);
+    assert_eq!(p.applied_delay, 100);
+    assert_eq!(t.contract.get_proposal(&id).eta_ledger, seq + 100);
+}
+
+/// Adversarial: lowering the delay while a proposal is still voting must not
+/// shorten its timelock — the creation-time delay is honored.
+#[test]
+fn test_delay_reduction_during_voting_does_not_shorten_timelock() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+    let id = create_fee_proposal(&t);
+    t.contract.set_execution_delay(&t.admin, &0);
+
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp = t.contract.get_proposal(&id).voting_end + 1;
+    t.env.ledger().set(ledger);
+    t.contract.execute_proposal(&id);
+
+    let seq = t.env.ledger().sequence();
+    let p = t.contract.get_proposal_timelock_policy(&id).unwrap();
+    assert_eq!(p.created_version, 2);
+    assert_eq!(p.queued_version, 3);
+    assert_eq!(p.applied_delay, 100);
+    assert_eq!(t.contract.get_proposal(&id).eta_ledger, seq + 100);
+
+    advance_ledgers(&t.env, 99);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t.env, 1);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+/// Adversarial: lowering the delay after a proposal is queued must not let it
+/// execute before its recorded eta.
+#[test]
+fn test_delay_reduction_after_queue_does_not_shorten_timelock() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+    let id = pass_and_queue(&t);
+    t.contract.set_execution_delay(&t.admin, &0);
+
+    advance_ledgers(&t.env, 99);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t.env, 1);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+/// A proposal queued under a zero delay while the veto was live must not
+/// execute instantly once the veto is retired: the policy change re-applies
+/// the active timelock from the queue ledger.
+#[test]
+fn test_veto_disablement_extends_already_queued_proposal() {
+    let t = setup();
+    let id = pass_and_queue(&t);
+    let queued_at = t.env.ledger().sequence();
+    assert_eq!(t.contract.get_proposal(&id).eta_ledger, queued_at);
+
+    t.contract.set_execution_delay(&t.admin, &MIN_ACTIVE_TIMELOCK_LEDGERS);
+    t.contract.disable_veto_power();
+
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t.env, MIN_ACTIVE_TIMELOCK_LEDGERS - 1);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t.env, 1);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+/// Raising the delay after queueing applies the new delay from the queue
+/// ledger (fail-closed), while an unchanged policy keeps the original eta.
+#[test]
+fn test_delay_increase_after_queue_extends_timelock() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &10);
+    let id = pass_and_queue(&t);
+    t.contract.set_execution_delay(&t.admin, &50);
+
+    advance_ledgers(&t.env, 49);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t.env, 1);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+/// Upgrade path: a proposal stored by a pre-#982 build has no policy snapshot.
+/// It is queued under the current policy and gets a snapshot at that point.
+#[test]
+fn test_legacy_proposal_without_snapshot_is_queued_under_current_policy() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &30);
+    let id = create_fee_proposal(&t);
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .remove(&StorageKey::ProposalTimelockPolicy(id));
+    });
+    assert!(t.contract.get_proposal_timelock_policy(&id).is_none());
+
+    t.contract.cast_vote(&t.proposer, &id, &true);
+    t.contract.cast_vote(&t.voter_a, &id, &true);
+    let mut ledger = t.env.ledger().get();
+    ledger.timestamp = t.contract.get_proposal(&id).voting_end + 1;
+    t.env.ledger().set(ledger);
+    t.contract.execute_proposal(&id);
+
+    let p = t.contract.get_proposal_timelock_policy(&id).unwrap();
+    assert!(p.queued);
+    assert_eq!(p.applied_delay, 30);
+    assert_eq!(
+        t.contract.get_proposal(&id).eta_ledger,
+        t.env.ledger().sequence() + 30
+    );
+}
+
+/// Upgrade path: a proposal already `Passed` under a pre-#982 build (no
+/// snapshot, unknown queue ledger) fails closed to `eta_ledger + delay`.
+#[test]
+fn test_legacy_queued_proposal_fails_closed_to_eta_plus_delay() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &20);
+    let id = pass_and_queue(&t);
+    let eta = t.contract.get_proposal(&id).eta_ledger;
+    t.env.as_contract(&t.contract.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .remove(&StorageKey::ProposalTimelockPolicy(id));
+    });
+
+    advance_ledgers(&t.env, eta - t.env.ledger().sequence() + 19);
+    assert_eq!(
+        t.contract.try_execute_proposal(&id),
+        Err(Ok(GovernanceError::TimelockNotExpired))
+    );
+    advance_ledgers(&t.env, 1);
+    t.contract.execute_proposal(&id);
+    assert_eq!(t.contract.get_proposal(&id).status, ProposalStatus::Executed);
+}
+
+#[test]
+fn test_policy_update_emits_event() {
+    let t = setup();
+    t.contract.set_execution_delay(&t.admin, &100);
+    let events = t.env.events().all();
+    let found = events
+        .events()
+        .iter()
+        .any(|e| std::format!("{:?}", e).contains("timelock_policy_updated"));
+    assert!(found, "TimelockPolicyUpdated event should be emitted");
 }

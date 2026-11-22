@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Invoice-Liquidity-Network/ILN-Smart-Contract/security/advisories/new
+    about: Report privately through a GitHub Security Advisory. Never describe a vulnerability in a public issue — see SECURITY.md.

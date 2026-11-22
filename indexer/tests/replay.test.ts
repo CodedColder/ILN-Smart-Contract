@@ -7,10 +7,15 @@ import type {
   HorizonTransactionRecord,
 } from '../src/ingestion/eventListener.js';
 import { runReplay } from '../src/ingestion/replay.js';
+import {
+  CONTRACT,
+  fundedEvent,
+  makeHorizonFixture,
+  paidEvent,
+  submittedEvent,
+} from './horizonFixture.js';
 
 type DB = Database.Database;
-
-const CONTRACT = 'CDEMOCONTRACT';
 
 function createTestDb(): DB {
   const db = new Database(':memory:');
@@ -18,103 +23,6 @@ function createTestDb(): DB {
   db.pragma('foreign_keys = ON');
   initializeSchema(db);
   return db;
-}
-
-function makeTx(ledger: number, hash: string): HorizonTransactionRecord {
-  return {
-    hash,
-    ledger,
-    created_at: new Date(Date.UTC(2026, 7, 26, ledger % 24)).toISOString(),
-    paging_token: String(1200000000 + ledger),
-    result_meta_xdr: 'unused-by-injected-decoder',
-  };
-}
-
-interface FakeEventSpec {
-  ledger: number;
-  hash: string;
-  events: DecodedContractEvent[];
-}
-
-/**
- * Builds an injectable decode function + Horizon JSON page fetcher from a
- * compact fixture, so tests avoid crafting XDR transaction meta by hand.
- */
-function makeHorizonFixture(specs: FakeEventSpec[], contractId: string) {
-  const records = specs.map((spec) => ({
-    ...makeTx(spec.ledger, spec.hash),
-    _links: {},
-  }));
-
-  const decodedByHash = new Map(specs.map((s) => [s.hash, s.events]));
-
-  const fetchImpl = (async (url: any) => {
-    const parsed = new URL(String(url));
-    const cursor = Number(parsed.searchParams.get('cursor') || 0);
-    const limit = Number(parsed.searchParams.get('limit') || 200);
-    const eligible = records.filter((r) => r.ledger > cursor && r.ledger <= limit ? true : r.ledger > cursor);
-
-    // Simulate a single page containing everything after the cursor.
-    const pageRecords = eligible.slice(0, limit);
-    const hasMore = eligible.length > pageRecords.length;
-
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        _embedded: { records: hasMore ? pageRecords : eligible },
-        _links: hasMore
-          ? { next: { href: `${parsed.origin}/transactions?cursor=${pageRecords[pageRecords.length - 1].paging_token}&order=asc&limit=${limit}` } }
-          : {},
-      }),
-    } as Response;
-  }) as typeof fetch;
-
-  const decodeTransactionEvents = (record: HorizonTransactionRecord): DecodedContractEvent[] =>
-    decodedByHash.get(record.hash) ?? [];
-
-  return { fetchImpl, decodeTransactionEvents };
-}
-
-function submittedEvent(invoiceId: number, amount: string): DecodedContractEvent[] {
-  return [
-    {
-      contractId: CONTRACT,
-      rawEventType: 'submitted',
-      contractEventType: 'InvoiceSubmitted',
-      topics: ['submitted'],
-      data: { invoice_id: invoiceId, amount, token: 'USDC', status: 'Pending' },
-    },
-  ];
-}
-
-function fundedEvent(invoiceId: number, funder: string, amountFunded: string): DecodedContractEvent[] {
-  return [
-    {
-      contractId: CONTRACT,
-      rawEventType: 'funded',
-      contractEventType: 'InvoiceFunded',
-      topics: ['funded'],
-      data: {
-        invoice_id: invoiceId,
-        funder,
-        amount_funded: amountFunded,
-        status: 'Funded',
-      },
-    },
-  ];
-}
-
-function paidEvent(invoiceId: number, amountPaid: string): DecodedContractEvent[] {
-  return [
-    {
-      contractId: CONTRACT,
-      rawEventType: 'paid',
-      contractEventType: 'InvoicePaid',
-      topics: ['paid'],
-      data: { invoice_id: invoiceId, amount_paid: amountPaid, status: 'Paid', lp: 'G-LP' },
-    },
-  ];
 }
 
 describe('indexer checkpoint replay', () => {
@@ -231,7 +139,7 @@ describe('indexer checkpoint replay', () => {
     expect(statuses.status).toBe('Funded');
   });
 
-  it('continues past transactions that fail to process and reports them', async () => {
+  it('continues past undecodable transactions only when asked, and reports the range incomplete', async () => {
     const failingDecode = (record: HorizonTransactionRecord): DecodedContractEvent[] => {
       if (record.hash === 'tx-bad') {
         throw new Error('simulated decoder failure');
@@ -268,11 +176,14 @@ describe('indexer checkpoint replay', () => {
       fromLedger: 5,
       toLedger: 20,
       logger,
+      continueOnError: true,
     });
 
     expect(result.failedTransactions).toBe(1);
-    // Both transactions were attempted — the listener logs-and-continues on
-    // per-transaction failures, so the good one still lands.
+    expect(result.failedTransactionHashes).toEqual(['tx-bad']);
+    expect(result.complete).toBe(false);
+    // Both transactions were attempted — in continue-on-error mode the
+    // listener logs-and-continues on decode failures, so the good one lands.
     expect(result.transactionsProcessed).toBe(2);
     expect(errors.length).toBeGreaterThan(0);
     const invoice = db.prepare(`SELECT id FROM invoices WHERE id = 3`).get() as { id: number } | undefined;

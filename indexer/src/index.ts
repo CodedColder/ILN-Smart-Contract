@@ -10,6 +10,7 @@ import { createHorizonLedgerHeaderSource } from './ingestion/ledgerHeaders.js';
 import { LedgerReorgDetector } from './ingestion/reorgDetector.js';
 import type { ReorgDivergence } from './ingestion/reorgDetector.js';
 import { recoverFromReorg } from './ingestion/reorgRecovery.js';
+import { CatchupError, IngestionCatchup } from './ingestion/catchup.js';
 import { startReconciliationSchedule, createWebhookAlertDispatcher } from './reconciliation/consistencyJob.js';
 import { SorobanChainReader } from './reconciliation/chainReader.js';
 import { logger } from './lib/logger.js';
@@ -35,7 +36,11 @@ const chainReader = config.contractId
     })
   : undefined;
 
-const app = createApp(db, { apiKeys: config.apiKeys, chainReader });
+const app = createApp(db, {
+  apiKeys: config.apiKeys,
+  ...(chainReader ? { chainReader } : {}),
+  ...(config.trustProxy !== undefined ? { trustProxy: config.trustProxy } : {}),
+});
 const eventRepository = createSqlEventRepository(db);
 
 // Reorg handling (Issues #863/#864/#866): one header source (Horizon
@@ -69,7 +74,7 @@ const routeReorgAlert = async (divergence: ReorgDivergence): Promise<void> => {
   await alertRouter.route(alert);
 };
 
-const recoveryHook = async (divergence: ReorgDivergence): Promise<void> => {
+const recoverReorg = async (divergence: ReorgDivergence): Promise<void> => {
   await recoverFromReorg(divergence, {
     db,
     repository: eventRepository,
@@ -79,7 +84,65 @@ const recoveryHook = async (divergence: ReorgDivergence): Promise<void> => {
     lock: ingestionLock,
     logger,
   });
+};
+
+const recoveryHook = async (divergence: ReorgDivergence): Promise<void> => {
+  await recoverReorg(divergence);
   await routeReorgAlert(divergence);
+};
+
+/**
+ * Optional historical backfill (Issue #1163), run under the ingestion lease
+ * before live streaming starts. The range is [CATCHUP_FROM_LEDGER,
+ * CATCHUP_TO_LEDGER); without an explicit end it stops before the earliest
+ * ledger already indexed. A failed or partial catch-up is logged and left
+ * checkpointed for the next start — live streaming is not held hostage to it.
+ */
+const runHistoricalCatchup = async (signal: AbortSignal): Promise<void> => {
+  if (config.catchupFromLedger === undefined) {
+    return;
+  }
+  const earliestIndexed = (
+    db.prepare('SELECT MIN(ledger) AS ledger FROM events').get() as { ledger: number | null }
+  ).ledger;
+  const toLedger = config.catchupToLedger ?? earliestIndexed ?? undefined;
+  if (toLedger === undefined) {
+    logger.warn(
+      'CATCHUP_FROM_LEDGER is set but nothing is indexed yet and CATCHUP_TO_LEDGER is unset; skipping catch-up'
+    );
+    return;
+  }
+
+  const catchup = new IngestionCatchup({
+    repository: eventRepository,
+    horizonUrl: config.horizonUrl,
+    contractAddress: config.contractId,
+    batchSize: config.catchupBatchSize,
+    signal,
+    logger,
+    reorgDetector: new LedgerReorgDetector({
+      db,
+      source: ledgerHeaderSource,
+      logger,
+      // Backfill walks below already-indexed ledgers by design; hash and
+      // parent-hash verification still apply.
+      strictSequence: false,
+    }),
+  });
+  try {
+    await catchup.executeCatchup({ fromLedger: config.catchupFromLedger, toLedger });
+  } catch (error) {
+    if (error instanceof CatchupError) {
+      logger.error('historical catch-up incomplete; will resume from checkpoint on next start', {
+        kind: error.kind,
+        resumeFromLedger: error.resumeFromLedger,
+        missingRanges: error.missingRanges,
+        error: error.message,
+      });
+      return;
+    }
+    throw error;
+  }
 };
 
 const eventListener = createEventListener({
@@ -105,6 +168,7 @@ if (config.contractId) {
         const stopListener = () => eventListener.stop();
         signal.addEventListener('abort', stopListener, { once: true });
         try {
+          await runHistoricalCatchup(signal);
           await eventListener.start();
         } finally {
           signal.removeEventListener('abort', stopListener);

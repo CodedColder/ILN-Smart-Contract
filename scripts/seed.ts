@@ -237,6 +237,10 @@ async function main() {
       await invokeContract(server, CONTRACT_ID, "get_invoice_count", [], admin);
       console.log("  Contract already initialized.");
     } catch {
+      // Issue #1162: `initialize` requires the admin to authorize the call, so
+      // the admin argument below MUST be the same key that signs the
+      // transaction (accounts[0]). A different administrator must run this
+      // initialization itself — a deployer/test key cannot authorize for it.
       await invokeContract(server, CONTRACT_ID, "initialize", [
         Address.fromString(admin.publicKey()).toScVal(),
         Address.fromString(TOKENS.USDC).toScVal(),
