@@ -4585,3 +4585,5 @@ mod tests_dispute_transitions;
 mod tests_cancel_expire_accounting;
 // Issue #1174: adversarial fund-queue race coverage
 mod tests_fund_queue_races;
+// Issue #1175: LP-position transfer ownership & balance-change audit
+mod tests_lp_position_transfer;
